@@ -43,3 +43,6 @@ COLLABORATION_RULES.md
 /site/
 /.venv-docs/
 __pycache__/
+
+# UI build tooling
+ui/node_modules/

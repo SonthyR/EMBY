@@ -234,18 +234,31 @@ func panelBodyReadDeadline(next http.Handler) http.Handler {
 func staticHandler(staticFS fs.FS) http.Handler {
 	fileServer := http.FileServer(http.FS(staticFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
 		path := r.URL.Path
+		// The Vite build under /app/assets/ uses content-hashed file names, so
+		// those files can be cached forever; everything else is revalidated.
+		if strings.HasPrefix(path, "/app/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
 		if path == "/" {
 			path = "/index.html"
 		}
-		f, err := staticFS.Open(strings.TrimPrefix(path, "/"))
-		if err == nil {
-			_ = f.Close()
-			fileServer.ServeHTTP(w, r)
-			return
+		// fs.FS paths never end in a slash; a directory is served through its
+		// index.html (http.FileServer handles that and the trailing-slash redirect).
+		name := strings.Trim(path, "/")
+		if info, err := fs.Stat(staticFS, name); err == nil {
+			if !info.IsDir() {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+			if _, err := fs.Stat(staticFS, name+"/index.html"); err == nil {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
 		}
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
