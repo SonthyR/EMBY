@@ -70,7 +70,7 @@ chmod 755 ./meridian
 
 ## 从源码构建
 
-需要 **Go 1.26.10 或更高版本**，无需前端打包。
+需要 **Go 1.26.11 或更高版本**，无需前端打包。
 
 ```bash
 git clone https://github.com/SonthyR/EMBY.git

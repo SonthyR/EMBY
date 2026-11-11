@@ -27,7 +27,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.
 
 ## 从源码构建与运行
 
-需要 Go 1.26.10 或更高版本。
+需要 Go 1.26.11 或更高版本。
 
 ```bash
 go build -trimpath -buildvcs=false -o yundu ./cmd/yundu

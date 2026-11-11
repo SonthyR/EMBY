@@ -114,7 +114,7 @@ docker compose pull && docker compose up -d
 
 Windows 使用 `meridian-windows-amd64.exe`，数据库路径按实际目录填写，并通过 Windows ACL 限制数据目录权限。
 
-源码构建需要 Go 1.26.10 或更高版本，无需 Node 或前端构建：
+源码构建需要 Go 1.26.11 或更高版本，无需 Node 或前端构建：
 
 ```bash
 git clone https://github.com/SonthyR/EMBY.git
