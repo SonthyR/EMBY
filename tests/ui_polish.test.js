@@ -45,7 +45,7 @@ test('upstream header rows reset fieldsets and retain an explicit action column'
 });
 
 test('frontend assets use the current application version to bust caches', () => {
-  const mainSource = fs.readFileSync(path.join(ROOT, 'cmd/meridian/main.go'), 'utf8');
+  const mainSource = fs.readFileSync(path.join(ROOT, 'cmd/yundu/main.go'), 'utf8');
   const version = mainSource.match(/var appVersion = "v([^"]+)"/)?.[1];
   assert.ok(version, 'application version is missing');
   const assets = [...indexSource.matchAll(/(?:src|href)="([^"]+)"/g)]
@@ -109,7 +109,7 @@ test('site modal introduces tabbed panels to avoid infinite vertical scrolling',
 });
 
 test('backend logout only clears the current device session cookie', () => {
-  const httpSource = fs.readFileSync(path.join(ROOT, 'cmd/meridian/app_http.go'), 'utf8');
+  const httpSource = fs.readFileSync(path.join(ROOT, 'cmd/yundu/app_http.go'), 'utf8');
   assert.match(httpSource, /func \(a \*App\) handleLogout/);
   assert.doesNotMatch(httpSource, /func \(a \*App\) handleLogout[\s\S]*InvalidateAllSessions/);
   assert.match(httpSource, /a\.clearSessionCookie\(w, r\)/);

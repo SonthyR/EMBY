@@ -1,4 +1,4 @@
-module meridian
+module yundu
 
 go 1.26.10
 

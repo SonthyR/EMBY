@@ -11,14 +11,14 @@
 ```bash
 git clone https://github.com/snnabb/Meridian.git
 cd Meridian
-go build -o meridian ./cmd/meridian
+go build -o yundu ./cmd/yundu
 go test ./...
 node --test tests/*.test.js
 ```
 
 ## 项目架构约定
 
-- **后端保持轻量**：可执行程序位于 `cmd/meridian/`，独立模块按现有职责文件组织，不引入不必要的包层级
+- **后端保持轻量**：可执行程序位于 `cmd/yundu/`，独立模块按现有职责文件组织，不引入不必要的包层级
 - **前端是原生 JS**：不使用框架，不引入构建工具。页面按文件拆分在 `web/static/js/pages/` 下
 - **SQLite 驱动名是 `sqlite`**（不是 `sqlite3`），不要更换驱动
 - **嵌入方式**：前端通过 `web/embed.go` 的 `go:embed` 指令嵌入二进制
@@ -29,7 +29,7 @@ node --test tests/*.test.js
 2. 从 `master` 分支创建你的特性分支；存在活动的 `beta` 测试分支时，针对该轮整合的问题也可基于 `beta` 提交
 3. 修改代码
 4. 确保 `go test ./...`、`go vet ./...` 和 `node --test tests/*.test.js` 通过
-5. 确保 `go build -trimpath -buildvcs=false -o meridian ./cmd/meridian` 能正常编译
+5. 确保 `go build -trimpath -buildvcs=false -o yundu ./cmd/yundu` 能正常编译
 6. 提交 PR，使用 [PR 模板](.github/PULL_REQUEST_TEMPLATE.md) 填写说明
 
 ## 测试版分支

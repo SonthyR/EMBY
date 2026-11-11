@@ -83,7 +83,7 @@ func (a *App) exportSiteData(format, mode string, siteID int64, opts siteExportO
 		writer.Flush()
 		return buffer.Bytes(), "meridian-sites.csv", "text/csv; charset=utf-8", writer.Error()
 	}
-	fmt.Fprintf(&buffer, "Meridian · 站点与账号备忘录\n共 %d 个站点\n", len(records))
+	fmt.Fprintf(&buffer, "云渡 · 站点与账号备忘录\n共 %d 个站点\n", len(records))
 	if opts.IncludeAccounts && !opts.IncludePasswords {
 		buffer.WriteString("密码：本次未导出\n")
 	}
@@ -153,7 +153,7 @@ func (a *App) renderAccountLines(site Site, mode string) string {
 	}
 	if mode == "proxy" || mode == "multi" {
 		for _, line := range a.siteProxyLines(site) {
-			writeLine("🔗 Meridian 反代线路", line)
+			writeLine("🔗 云渡反代线路", line)
 		}
 	}
 	return out.String()

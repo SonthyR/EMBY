@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"meridian/web"
+	"yundu/web"
 	"net"
 	"net/http"
 	"os"
@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.14.2"
+var appVersion = "v1.0.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -332,7 +332,7 @@ func main() {
 	}
 
 	log.Println("============================================================")
-	log.Printf("  Meridian - Emby reverse proxy management panel %s", appVersion)
+	log.Printf("  Yundu (云渡) - Emby sharing and reverse proxy panel %s", appVersion)
 	panelScheme := "http"
 	if panelTLSEnabled {
 		panelScheme = "https"
@@ -363,10 +363,10 @@ func main() {
 	restartRequested := false
 	select {
 	case <-sigCh:
-		log.Println("\nReceived shutdown signal, stopping Meridian...")
+		log.Println("\nReceived shutdown signal, stopping Yundu...")
 	case <-app.restartCh:
 		restartRequested = true
-		log.Println("\nPanel restart requested, stopping Meridian...")
+		log.Println("\nPanel restart requested, stopping Yundu...")
 	case err := <-serveErrors:
 		log.Fatalf("server failed: %v", err)
 	}
@@ -395,7 +395,7 @@ func main() {
 	pm.GracefulShutdown(finalProxyCtx)
 	finalProxyCancel()
 
-	log.Println("Meridian stopped cleanly")
+	log.Println("Yundu stopped cleanly")
 	if restartRequested {
 		db.Close()
 		os.Exit(75)

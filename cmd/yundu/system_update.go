@@ -18,7 +18,10 @@ import (
 	"time"
 )
 
-const releaseAPI = "https://api.github.com/repos/snnabb/Meridian/releases/latest"
+// releaseRepo is the GitHub "owner/name" that publishes Yundu releases. Empty
+// disables the in-panel update check, so a build never upgrades itself to a
+// different project's binary.
+const releaseRepo = ""
 
 var stableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 var comparableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$`)
@@ -67,7 +70,7 @@ func fetchUpdateRelease(ctx context.Context, client *http.Client, endpoint, curr
 		return result, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "Meridian/"+appVersion)
+	req.Header.Set("User-Agent", "Yundu/"+appVersion)
 	resp, err := client.Do(req)
 	if err != nil {
 		return result, errors.New("无法连接 GitHub，请稍后重试")
@@ -87,7 +90,7 @@ func fetchUpdateRelease(ctx context.Context, client *http.Client, endpoint, curr
 		return result, errors.New("版本信息无效")
 	}
 	result.Latest = release.Tag
-	result.URL = "https://github.com/snnabb/Meridian/releases/tag/" + release.Tag
+	result.URL = "https://github.com/" + releaseRepo + "/releases/tag/" + release.Tag
 	result.Notes = release.Body
 	result.Available = versionNewer(release.Tag, current)
 	return result, nil
@@ -166,7 +169,11 @@ func (a *App) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	release, err := fetchUpdateRelease(ctx, &http.Client{Timeout: 10 * time.Second}, releaseAPI, appVersion)
+	if releaseRepo == "" {
+		a.jsonErr(w, http.StatusServiceUnavailable, "尚未配置更新源，请手动替换新版本程序")
+		return
+	}
+	release, err := fetchUpdateRelease(ctx, &http.Client{Timeout: 10 * time.Second}, "https://api.github.com/repos/"+releaseRepo+"/releases/latest", appVersion)
 	if err != nil {
 		a.jsonErr(w, 502, err.Error())
 		return

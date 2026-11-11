@@ -73,7 +73,7 @@ const Router = {
     const title = document.getElementById('app-page-title');
     const icon = document.getElementById('app-page-icon');
     if (title) title.textContent = meta;
-    document.title = `${meta} — Meridian`;
+    document.title = `${meta} — 云渡`;
     if (icon && hash === 'account') {
       icon.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>';
     } else if (icon && activeNav && typeof activeNav.querySelector === 'function') {

@@ -176,7 +176,7 @@ func TestClientExportGroupsAccountsAndLabelsLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, want := range []string{"1. light", "账号 1", "账号 2", "用户名：first", "登录密码：test-secret", "提前 7 天提醒一次", "🌐 原线路", "🔗 Meridian 反代线路"} {
+	for _, want := range []string{"1. light", "账号 1", "账号 2", "用户名：first", "登录密码：test-secret", "提前 7 天提醒一次", "🌐 原线路", "🔗 云渡反代线路"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %s", want, text)
 		}

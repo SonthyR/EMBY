@@ -1173,7 +1173,7 @@ func newShareLogoutFunc(transport http.RoundTripper, target *url.URL, policy UAH
 			return err
 		}
 		request.Header.Set("X-Emby-Token", token)
-		request.Header.Set("X-Emby-Authorization", fmt.Sprintf(`MediaBrowser Client="Meridian", Device="Meridian", DeviceId="meridian-share", Version="%s", Token="%s"`, appVersion, token))
+		request.Header.Set("X-Emby-Authorization", fmt.Sprintf(`MediaBrowser Client="Yundu", Device="Yundu", DeviceId="yundu-share", Version="%s", Token="%s"`, appVersion, token))
 		applyUAHeaderPolicy(request.Header, policy)
 		headers.apply(request.Header, &endpoint)
 		response, err := (&http.Client{Transport: transport, Timeout: shareLogoutTimeout}).Do(request)

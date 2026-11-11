@@ -185,7 +185,7 @@ func TestReleaseCheckRejectsUnexpectedVersions(t *testing.T) {
 				t.Fatalf("result=%+v err=%v", release, err)
 			}
 			if test.ok {
-				if !strings.HasPrefix(release.URL, "https://github.com/snnabb/Meridian/releases/tag/") {
+				if !strings.HasPrefix(release.URL, "https://github.com/"+releaseRepo+"/releases/tag/") {
 					t.Fatal("untrusted release URL")
 				}
 				if release.Available != (test.tag == "v1.13.0") {

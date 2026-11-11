@@ -14,7 +14,7 @@ type telegramCommand struct {
 
 func meridianTelegramCommands() []telegramCommand {
 	return []telegramCommand{
-		{"start", "打开 Meridian 管理面板"},
+		{"start", "打开云渡管理面板"},
 		{"menu", "返回主菜单"},
 		{"sites", "站点管理"},
 		{"add", "添加站点"},

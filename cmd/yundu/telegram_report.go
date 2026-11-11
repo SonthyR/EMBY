@@ -471,7 +471,7 @@ func formatTelegramBytes(value int64) string {
 
 func buildTelegramReportMessage(stats telegramReportStats) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "📊 Meridian 日报\n统计时间：%s\n\n", stats.GeneratedAt.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&b, "📊 云渡日报\n统计时间：%s\n\n", stats.GeneratedAt.Format("2006-01-02 15:04"))
 	fmt.Fprintf(&b, "✨ 今日概览\n• 独立客户端：%d\n• 活跃高峰：%d 个客户端/分钟\n• 请求总数：%d 次\n• 视频请求：%d 次\n• 媒体库节点：%d 个（启用 %d 个）\n\n", stats.UniqueClients, stats.ActivePeak, stats.Requests, stats.VideoRequests, stats.SiteCount, stats.RunningSiteCount)
 	fmt.Fprintf(&b, "🌐 流量统计\n• 今日：%s\n• 近 7 日：%s\n• 近 30 日：%s\n• 历史累计：%s\n\n", formatTelegramBytes(stats.TodayTraffic), formatTelegramBytes(stats.SevenDayTraffic), formatTelegramBytes(stats.ThirtyDayTraffic), formatTelegramBytes(stats.HistoryTraffic))
 	b.WriteString("🔥 今日请求量 TOP 5\n")

@@ -143,7 +143,7 @@ func (b *telegramBot) run(ctx context.Context) {
 		var updates []telegramUpdate
 		var err error
 		if !commandsReady {
-			b.app.setTelegramStatus(b.settings.Revision, "connecting", "正在同步 Meridian 命令菜单")
+			b.app.setTelegramStatus(b.settings.Revision, "connecting", "正在同步云渡命令菜单")
 			err = b.syncCommands(ctx)
 			commandsReady = err == nil
 		}
@@ -167,7 +167,7 @@ func (b *telegramBot) run(ctx context.Context) {
 			continue
 		}
 		backoff = time.Second
-		b.app.setTelegramStatus(b.settings.Revision, "online", "已连接，Meridian 命令已同步；私聊发送 /start 即可操作")
+		b.app.setTelegramStatus(b.settings.Revision, "online", "已连接，云渡命令已同步；私聊发送 /start 即可操作")
 		if offset < 0 {
 			offset = 0
 			for _, u := range updates {

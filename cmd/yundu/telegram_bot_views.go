@@ -25,7 +25,7 @@ func (b *telegramBot) home(ctx context.Context, id int64) error {
 	if b.settings.PublicURL != "" {
 		keys = append(keys, []telegramButton{{Text: "打开面板", URL: b.settings.PublicURL}})
 	}
-	return b.send(ctx, id, "👋 Meridian 管理\n\n今天想处理点什么？选一个入口，我带你继续。\n随时发送 /cancel 可以取消当前操作。", keys)
+	return b.send(ctx, id, "👋 云渡管理\n\n今天想处理点什么？选一个入口，我带你继续。\n随时发送 /cancel 可以取消当前操作。", keys)
 }
 func (b *telegramBot) report(ctx context.Context, id int64) error {
 	b.app.pm.FlushTraffic()
@@ -44,7 +44,7 @@ func (b *telegramBot) overview(ctx context.Context, id int64) error {
 	if snap.BillingMode == trafficBillingModeOutbound {
 		billing = "仅出站流量"
 	}
-	return b.send(ctx, id, fmt.Sprintf("📊 Meridian 运行概览\n\n站点：%d 个，运行 %d 个\n本周期：%s\n累计：%s\n计费方式：%s\n运行时间：%s", snap.TotalSites, snap.RunningSites, formatTelegramBytes(snap.MonthlyTraffic), formatTelegramBytes(snap.TotalTraffic), billing, (time.Duration(snap.UptimeSeconds)*time.Second).Round(time.Minute)), telegramBackKeyboard())
+	return b.send(ctx, id, fmt.Sprintf("📊 云渡运行概览\n\n站点：%d 个，运行 %d 个\n本周期：%s\n累计：%s\n计费方式：%s\n运行时间：%s", snap.TotalSites, snap.RunningSites, formatTelegramBytes(snap.MonthlyTraffic), formatTelegramBytes(snap.TotalTraffic), billing, (time.Duration(snap.UptimeSeconds)*time.Second).Round(time.Minute)), telegramBackKeyboard())
 }
 func (b *telegramBot) listSites(ctx context.Context, id int64, action string, page int) error {
 	delete(b.sessions, id)

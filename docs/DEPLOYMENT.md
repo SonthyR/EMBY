@@ -119,7 +119,7 @@ Windows 使用 `meridian-windows-amd64.exe`，数据库路径按实际目录填�
 ```bash
 git clone https://github.com/snnabb/Meridian.git
 cd Meridian
-go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
+go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 ```
 
 ## 关键配置

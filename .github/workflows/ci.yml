@@ -76,17 +76,17 @@ jobs:
       - name: Build
         run: |
           if [[ "$GITHUB_REF" == refs/heads/beta ]]; then
-            base_version=$(sed -n 's/^var appVersion = "\([^"]*\)"$/\1/p' cmd/meridian/main.go)
+            base_version=$(sed -n 's/^var appVersion = "\([^"]*\)"$/\1/p' cmd/yundu/main.go)
             test -n "$base_version"
             version="${base_version}-beta.${GITHUB_SHA:0:7}"
             CGO_ENABLED=0 go build -trimpath -buildvcs=false \
               -ldflags="-s -w -X main.appVersion=${version}" \
-              -o meridian-linux-amd64 ./cmd/meridian
+              -o meridian-linux-amd64 ./cmd/yundu
             test "$(./meridian-linux-amd64 --version)" = "$version"
             printf '%s\n' "$version" > BETA_VERSION
             sha256sum meridian-linux-amd64 > SHA256SUMS
           else
-            go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
+            go build -trimpath -buildvcs=false -o meridian ./cmd/yundu
           fi
 
       - name: Upload beta binary

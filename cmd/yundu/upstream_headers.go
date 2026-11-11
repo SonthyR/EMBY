@@ -58,17 +58,17 @@ func normalizeUpstreamHeaderName(value string) (string, error) {
 	name := http.CanonicalHeaderKey(value)
 	lower := strings.ToLower(name)
 	if isManagedForwardingHeaderName(lower) {
-		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+		return "", fmt.Errorf("upstream header %s is managed by Yundu and cannot be overridden", name)
 	}
 	switch lower {
 	case "authorization", "connection", "content-length", "cookie", "host",
 		"keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection",
 		"te", "trailer", "transfer-encoding", "upgrade", "user-agent",
 		"x-emby-authorization", "x-emby-token", "x-mediabrowser-token":
-		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+		return "", fmt.Errorf("upstream header %s is managed by Yundu and cannot be overridden", name)
 	}
 	if strings.HasPrefix(lower, "sec-websocket-") {
-		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+		return "", fmt.Errorf("upstream header %s is managed by Yundu and cannot be overridden", name)
 	}
 	return name, nil
 }

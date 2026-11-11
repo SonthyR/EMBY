@@ -304,7 +304,7 @@ func validateDynamicResolvedIPs(ips []net.IP) ([]net.IP, error) {
 	return validated, nil
 }
 
-var errDynamicSelfTarget = errors.New("dynamic target refers to Meridian or a local interface")
+var errDynamicSelfTarget = errors.New("dynamic target refers to Yundu or a local interface")
 
 type dynamicInterfaceAddrsFunc func() ([]net.Addr, error)
 
@@ -418,7 +418,7 @@ func (p *dynamicSelfTargetPolicy) validateNormalizedTarget(target *url.URL) erro
 		return fmt.Errorf("validate dynamic self-target authority: %w", err)
 	}
 	if _, denied := p.deniedHosts[host]; denied {
-		return fmt.Errorf("%w: authority host %s is served by Meridian", errDynamicSelfTarget, host)
+		return fmt.Errorf("%w: authority host %s is served by Yundu", errDynamicSelfTarget, host)
 	}
 	if _, ok := dynamicEffectivePort(target); !ok {
 		return fmt.Errorf("validate dynamic self-target authority: target has no effective port")

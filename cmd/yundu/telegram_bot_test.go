@@ -163,7 +163,7 @@ func TestTelegramBotRejectsUnauthorizedAndGroupUpdates(t *testing.T) {
 		t.Fatalf("unauthorized updates caused effects: %v", f.calls)
 	}
 	tgText(t, b, "/start")
-	if !strings.Contains(f.lastText(), "Meridian 管理") {
+	if !strings.Contains(f.lastText(), "云渡管理") {
 		t.Fatal(f.lastText())
 	}
 }
@@ -245,7 +245,7 @@ func TestTelegramBotAddEditReadToggleDeleteAndDuplicateConfirmation(t *testing.T
 		}
 	}
 	tgText(t, b, "/report")
-	if !strings.Contains(f.lastText(), "Meridian 日报") {
+	if !strings.Contains(f.lastText(), "云渡日报") {
 		t.Fatal(f.lastText())
 	}
 	tgHandle(t, b, testTelegramCallback(101, fmt.Sprintf("site:%d:toggle", site.ID)))

@@ -167,7 +167,7 @@ func openBackup(payload []byte, password string) ([]byte, error) {
 	}
 	minimum := len(backupMagic) + backupSaltBytes + 1
 	if len(payload) < minimum || string(payload[:len(backupMagic)]) != backupMagic {
-		return nil, errors.New("不是有效的 Meridian 备份文件")
+		return nil, errors.New("不是有效的云渡备份文件")
 	}
 	saltStart := len(backupMagic)
 	salt := payload[saltStart : saltStart+backupSaltBytes]
@@ -1129,7 +1129,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	file, _, err := r.FormFile("backup")
 	if err != nil {
-		a.jsonErr(w, http.StatusBadRequest, "请选择 Meridian 备份文件")
+		a.jsonErr(w, http.StatusBadRequest, "请选择云渡备份文件")
 		return
 	}
 	defer file.Close()
@@ -1219,7 +1219,7 @@ func (a *App) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.clearSessionCookie(w, r)
-	message := "备份已通过校验，Meridian 正在重启并应用恢复数据"
+	message := "备份已通过校验，云渡正在重启并应用恢复数据"
 	if resetIngressCount > 0 {
 		message += fmt.Sprintf("；%d 个站点的原入口不适用于当前服务器，已保留站点、清空入口并停用，请恢复后编辑入口再启用", resetIngressCount)
 	}
