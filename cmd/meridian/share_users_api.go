@@ -34,6 +34,7 @@ type ShareUser struct {
 	Status       string               `json:"status"`
 	SessionCount int                  `json:"session_count"`
 	MaxDevices   int                  `json:"max_devices"`
+	SpeedLimit   int                  `json:"speed_limit"`
 	ResetDay     int                  `json:"traffic_reset_day"`
 	NextResetAt  string               `json:"next_reset_at,omitempty"`
 	PortalPath   string               `json:"portal_path"`
@@ -57,6 +58,7 @@ type ShareUserInput struct {
 	ExpiresAt    string               `json:"expires_at"`
 	TrafficQuota int64                `json:"traffic_quota"`
 	MaxDevices   int                  `json:"max_devices"`
+	SpeedLimit   int                  `json:"speed_limit"`
 	ResetDay     int                  `json:"traffic_reset_day"`
 	Sites        []ShareUserSiteInput `json:"sites"`
 }
@@ -81,8 +83,8 @@ func (d *DB) getShareUserByPortalToken(token string) (*storedShareUser, error) {
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
-	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, portal_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
-		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.portalToken, &item.CreatedAt, &item.UpdatedAt)
+	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
+		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +182,9 @@ func (a *App) normalizeShareUserInput(input ShareUserInput, creating bool) (Shar
 	if input.MaxDevices < 0 || input.MaxDevices > 100 {
 		return input, errors.New("同时在线设备数应为 0–100，0 表示不限")
 	}
+	if input.SpeedLimit < 0 || input.SpeedLimit > 100000 {
+		return input, errors.New("限速应为 0–100000 Mbps，0 表示不限")
+	}
 	if input.ResetDay < 0 || input.ResetDay > 28 {
 		return input, errors.New("流量重置日应为 1–28，0 表示不自动重置")
 	}
@@ -233,8 +238,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, note, enabled, expires_at, traffic_quota, max_devices, traffic_reset_day, traffic_reset_period, portal_token) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Username, string(hash), cipher, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.ResetDay, resetPeriod, portalToken)
+		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Username, string(hash), cipher, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				return 0, errors.New("用户名已存在")
@@ -253,8 +258,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 			}
 			enabled = current != 0
 		}
-		result, err := tx.Exec(`UPDATE share_users SET username=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-			input.Username, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.ResetDay, resetPeriod, input.ResetDay, id)
+		result, err := tx.Exec(`UPDATE share_users SET username=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, speed_limit=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+			input.Username, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, input.ResetDay, id)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				return 0, errors.New("用户名已存在")
@@ -372,6 +377,9 @@ func (a *App) shareUserText(item *storedShareUser) (string, error) {
 	}
 	if view.MaxDevices > 0 {
 		builder.WriteString(fmt.Sprintf("同时在线设备：最多 %d 台\n", view.MaxDevices))
+	}
+	if view.SpeedLimit > 0 {
+		builder.WriteString(fmt.Sprintf("限速：%d Mbps\n", view.SpeedLimit))
 	}
 	builder.WriteString("服务器地址：\n")
 	for _, assigned := range view.Sites {

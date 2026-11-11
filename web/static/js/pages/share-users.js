@@ -92,6 +92,7 @@ function renderShareUserRows(users) {
         <div><dt>到期</dt><dd>${esc(shareExpiryLabel(user.expires_at))}</dd></div>
         <div><dt>流量</dt><dd>${esc(shareFormatBytes(user.traffic_used))} / ${esc(quota)}${Number(user.traffic_quota) > 0 ? `<span class="share-usage-bar"><span style="width:${percent}%"></span></span>` : ''}</dd></div>
         <div><dt>在线设备</dt><dd>${Number(user.session_count) || 0}${Number(user.max_devices) > 0 ? ` / 最多 ${Number(user.max_devices)}` : ''}</dd></div>
+        ${Number(user.speed_limit) > 0 ? `<div><dt>限速</dt><dd>${Number(user.speed_limit)} Mbps</dd></div>` : ''}
         ${user.next_reset_at ? `<div><dt>下次流量重置</dt><dd>${esc(user.next_reset_at)}</dd></div>` : ''}
       </dl>
       <div class="share-user-sites">${sites || '<span class="form-help">未分配站点</span>'}</div>
@@ -164,6 +165,11 @@ async function openShareUserForm(user) {
           <input class="form-input" id="share-max-devices" type="number" min="0" max="100" step="1" value="${user && Number(user.max_devices) > 0 ? Number(user.max_devices) : ''}" placeholder="不限">
           <div class="form-help">超出时自动踢掉最久没用的设备，留空或 0 表示不限。</div></div>
       </div>
+      <div class="share-form-grid">
+        <div class="form-group"><label for="share-speed">限速（Mbps）</label>
+          <input class="form-input" id="share-speed" type="number" min="0" max="100000" step="1" value="${user && Number(user.speed_limit) > 0 ? Number(user.speed_limit) : ''}" placeholder="不限">
+          <div class="form-help">这个账号所有设备合计的下载速度上限，留空或 0 表示不限。1080p 约需 10–20，4K 约需 40–80。</div></div>
+      </div>
       <label class="share-site-check"><input type="checkbox" id="share-enabled" ${!user || user.enabled ? 'checked' : ''}> 启用</label>
       <div class="form-group"><label>可用站点与源站账号</label>
         <div class="share-site-list">${siteRows.join('') || '<p class="form-help">还没有站点。</p>'}</div></div>
@@ -184,6 +190,9 @@ async function openShareUserForm(user) {
     const devicesValue = document.getElementById('share-max-devices').value.trim();
     const maxDevices = devicesValue === '' ? 0 : Number(devicesValue);
     if (!Number.isInteger(maxDevices) || maxDevices < 0 || maxDevices > 100) return Toast.error('同时在线设备数应为 0–100');
+    const speedValue = document.getElementById('share-speed').value.trim();
+    const speedLimit = speedValue === '' ? 0 : Number(speedValue);
+    if (!Number.isInteger(speedLimit) || speedLimit < 0 || speedLimit > 100000) return Toast.error('限速应为 0–100000 的整数');
     const sites = [];
     document.querySelectorAll('[data-share-site]').forEach(box => {
       if (!box.checked) return;
@@ -200,6 +209,7 @@ async function openShareUserForm(user) {
       expires_at: document.getElementById('share-expires').value,
       traffic_quota: Math.round(quota * SHARE_GB),
       max_devices: maxDevices,
+      speed_limit: speedLimit,
       traffic_reset_day: Number(document.getElementById('share-reset-day').value) || 0,
       sites,
     };
@@ -248,7 +258,7 @@ async function openShareUserMore(user) {
           await API.updateShareUser(user.id, {
             username: user.username, password: '', note: user.note || '', enabled: !user.enabled,
             expires_at: user.expires_at || '', traffic_quota: Number(user.traffic_quota) || 0,
-            max_devices: Number(user.max_devices) || 0, traffic_reset_day: Number(user.traffic_reset_day) || 0,
+            max_devices: Number(user.max_devices) || 0, speed_limit: Number(user.speed_limit) || 0, traffic_reset_day: Number(user.traffic_reset_day) || 0,
             sites: (user.sites || []).map(site => ({ site_id: site.site_id, site_account_id: site.site_account_id || 0 })),
           });
           Toast.success(user.enabled ? '已停用，登录中的设备会被踢下线' : '已启用');

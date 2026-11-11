@@ -97,6 +97,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_users", "traffic_reset_day", "ALTER TABLE share_users ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "traffic_reset_period", "ALTER TABLE share_users ADD COLUMN traffic_reset_period TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "portal_token", "ALTER TABLE share_users ADD COLUMN portal_token TEXT NOT NULL DEFAULT ''"},
+		{"share_users", "speed_limit", "ALTER TABLE share_users ADD COLUMN speed_limit INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
@@ -160,6 +161,8 @@ type shareUserState struct {
 	quota         int64
 	persistedUsed int64
 	maxDevices    int
+	speedLimit    int               // Mbps, 0 = unlimited
+	limiter       *shareRateLimiter // nil when unlimited
 	resetDay      int
 	resetPeriod   string
 	sites         map[int64]int64 // site ID -> preferred site_account ID (0 = first usable)
@@ -176,16 +179,19 @@ type shareUserRuntime struct {
 	db *DB
 	pm *ProxyManager
 
-	mu        sync.RWMutex
-	users     map[int64]*shareUserState
-	byName    map[string]int64
-	sessions  map[string]shareSessionEntry
-	revoked   map[string]int64 // token hash -> site ID
-	lastSeen  map[string]time.Time
-	failures  map[string]*shareLoginFailure
-	revoking  map[int64]bool
-	flushMu   sync.Mutex
-	loadError error
+	mu       sync.RWMutex
+	users    map[int64]*shareUserState
+	byName   map[string]int64
+	sessions map[string]shareSessionEntry
+	revoked  map[string]int64 // token hash -> site ID
+	lastSeen map[string]time.Time
+	failures map[string]*shareLoginFailure
+	revoking map[int64]bool
+	flushMu  sync.Mutex
+
+	capMu        sync.Mutex
+	capabilities map[string]shareCapabilityOwner
+	loadError    error
 }
 
 func newShareUserRuntime(db *DB, pm *ProxyManager) *shareUserRuntime {
@@ -244,9 +250,10 @@ func (rt *shareUserRuntime) reload() error {
 		enabled                 bool
 		quota, used             int64
 		maxDevices, resetDay    int
+		speedLimit              int
 		resetPeriod             string
 	}
-	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, traffic_reset_period FROM share_users`)
+	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, traffic_reset_period, speed_limit FROM share_users`)
 	if err != nil {
 		return err
 	}
@@ -254,7 +261,7 @@ func (rt *shareUserRuntime) reload() error {
 	for rows.Next() {
 		var item row
 		var enabled int
-		if err := rows.Scan(&item.id, &item.username, &item.hash, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.resetDay, &item.resetPeriod); err != nil {
+		if err := rows.Scan(&item.id, &item.username, &item.hash, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.resetDay, &item.resetPeriod, &item.speedLimit); err != nil {
 			rows.Close()
 			return err
 		}
@@ -348,6 +355,15 @@ func (rt *shareUserRuntime) reload() error {
 		state.quota = item.quota
 		state.persistedUsed = item.used
 		state.maxDevices = item.maxDevices
+		state.speedLimit = item.speedLimit
+		if item.speedLimit > 0 {
+			if state.limiter == nil {
+				state.limiter = &shareRateLimiter{}
+			}
+			state.limiter.setRate(item.speedLimit)
+		} else {
+			state.limiter = nil
+		}
 		state.resetDay = item.resetDay
 		state.resetPeriod = item.resetPeriod
 		state.sites = assignments[item.id]
@@ -606,9 +622,6 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 		return rt.interceptLogin(w, r, site, clientIP)
 	}
 	tokens := embyRequestTokens(r)
-	if len(tokens) == 0 {
-		return r, nil, nil, false
-	}
 	now := time.Now()
 	for _, token := range tokens {
 		hash := shareTokenHash(token)
@@ -644,6 +657,24 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 			rt.mu.Lock()
 			rt.lastSeen[hash] = now
 			rt.mu.Unlock()
+		}
+		return r, nil, state, false
+	}
+	// Dynamic playback routes carry no Emby token; attribute them through the
+	// capability handed to the share user earlier.
+	if userID, ok := rt.capabilityOwner(r.URL.Path, site.ID); ok {
+		rt.mu.RLock()
+		state := rt.users[userID]
+		reason := state.blockReasonLocked(now)
+		if reason == "" {
+			if _, allowed := state.sites[site.ID]; !allowed {
+				reason = "site"
+			}
+		}
+		rt.mu.RUnlock()
+		if reason != "" {
+			writeShareJSONError(w, http.StatusUnauthorized, shareBlockMessage(reason))
+			return r, nil, nil, true
 		}
 		return r, nil, state, false
 	}

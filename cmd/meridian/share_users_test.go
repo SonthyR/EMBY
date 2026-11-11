@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -387,6 +388,60 @@ func TestSharePortalShowsStatusWithoutPassword(t *testing.T) {
 	app.handleSharePortal(recorder, httptest.NewRequest(http.MethodGet, "/share/00000000000000000000000000000000", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("unknown token status = %d", recorder.Code)
+	}
+}
+
+func TestShareRateLimiterThrottlesSharedBudget(t *testing.T) {
+	limiter := &shareRateLimiter{}
+	limiter.setRate(8) // 1,000,000 bytes per second
+	ctx := context.Background()
+	start := time.Now()
+	// The burst allowance covers the first 0.5 s; 1.5 MB more needs ~1 s.
+	for i := 0; i < 20; i++ {
+		if err := limiter.wait(ctx, 100_000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	if elapsed < 1300*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("2 MB at 1 MB/s took %s", elapsed)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := limiter.wait(cancelled, 5_000_000); err == nil {
+		t.Fatal("wait ignored a cancelled context")
+	}
+}
+
+func TestShareCapabilityAttributionAndLimitWriter(t *testing.T) {
+	app := newTestApp(t)
+	rt := app.pm.shares
+	rt.rememberCapabilities(`{"DirectStreamUrl":"/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4"}`, 7, 3)
+	if user, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4", 3); !ok || user != 7 {
+		t.Fatalf("capability owner = %d, %v", user, ok)
+	}
+	if user, ok := rt.capabilityOwner("/emby/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 3); !ok || user != 7 {
+		t.Fatalf("emby-prefixed capability owner = %d, %v", user, ok)
+	}
+	if _, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 4); ok {
+		t.Fatal("capability matched on another site")
+	}
+
+	state := &shareUserState{id: 9, limiter: &shareRateLimiter{}}
+	state.limiter.setRate(8)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/Items", nil)
+	writer := rt.wrapWriter(recorder, request, state, 5)
+	writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	writer.WriteHeader(http.StatusOK)
+	// Split a capability across two writes to exercise the carried tail.
+	_, _ = writer.Write([]byte("#EXTM3U\n/_meridian/d/ZyXwVuTsRqPo"))
+	_, _ = writer.Write([]byte("NmLkJi987/seg.ts\n"))
+	if user, ok := rt.capabilityOwner("/_meridian/d/ZyXwVuTsRqPoNmLkJi987/seg.ts", 5); !ok || user != 9 {
+		t.Fatalf("split capability owner = %d, %v", user, ok)
+	}
+	if !strings.Contains(recorder.Body.String(), "seg.ts") {
+		t.Fatalf("limited writer lost data: %q", recorder.Body.String())
 	}
 }
 

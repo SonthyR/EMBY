@@ -32,6 +32,7 @@ type sharePortalView struct {
 	NextReset    string
 	Devices      int
 	MaxDevices   int
+	SpeedLimit   int
 	Sites        []sharePortalSite
 	GeneratedAt  string
 	StatusIsGood bool
@@ -76,6 +77,7 @@ h2 { font-size:15px; font-weight:600; margin:0 0 8px; }
 <div class="row"><span class="label">到期时间</span><span class="value">{{.ExpiresAt}}{{if .DaysLeft}}（{{.DaysLeft}}）{{end}}</span></div>
 <div class="row"><span class="label">已用流量</span><span class="value">{{.Used}}{{if .HasQuota}} / {{.Quota}}{{end}}</span></div>
 {{if .NextReset}}<div class="row"><span class="label">下次流量重置</span><span class="value">{{.NextReset}}</span></div>{{end}}
+{{if .SpeedLimit}}<div class="row"><span class="label">限速</span><span class="value">{{.SpeedLimit}} Mbps</span></div>{{end}}
 <div class="row"><span class="label">在线设备</span><span class="value">{{.Devices}}{{if .MaxDevices}} / 最多 {{.MaxDevices}} 台{{end}}</span></div>
 {{if .HasQuota}}<div class="bar"><span style="width:{{.Percent}}%"></span></div>{{end}}
 </section>
@@ -118,6 +120,7 @@ func (a *App) handleSharePortal(w http.ResponseWriter, r *http.Request) {
 		HasQuota:    view.TrafficQuota > 0,
 		Devices:     view.SessionCount,
 		MaxDevices:  view.MaxDevices,
+		SpeedLimit:  view.SpeedLimit,
 		NextReset:   view.NextResetAt,
 		GeneratedAt: now.Format("2006-01-02 15:04"),
 	}
