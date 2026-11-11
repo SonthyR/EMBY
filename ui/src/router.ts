@@ -10,7 +10,7 @@ export interface NavMeta {
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/share' },
   { path: '/dashboard', component: () => import('@/views/LegacyView.vue'), meta: { title: '仪表盘', nav: 'main', icon: 'dashboard', mobile: true, legacy: 'dashboard' } },
-  { path: '/sites', component: () => import('@/views/LegacyView.vue'), meta: { title: '站点', nav: 'main', icon: 'sites', mobile: true, legacy: 'sites' } },
+  { path: '/sites', component: () => import('@/views/SitesView.vue'), meta: { title: '站点', nav: 'main', icon: 'sites', mobile: true } },
   { path: '/share', component: () => import('@/views/ShareUsersView.vue'), meta: { title: '分享账号', nav: 'main', icon: 'share', mobile: true } },
   { path: '/logs', component: () => import('@/views/LegacyView.vue'), meta: { title: '日志', nav: 'main', icon: 'logs', legacy: 'request-logs' } },
   { path: '/settings', component: () => import('@/views/LegacyView.vue'), meta: { title: '设置', nav: 'manage', icon: 'settings', mobile: true, legacy: 'global-settings' } },

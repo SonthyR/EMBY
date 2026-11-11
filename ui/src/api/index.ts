@@ -14,9 +14,95 @@ export const authApi = {
   logout: () => api.post<{ logged_out: boolean }>('/api/auth/logout'),
 }
 
+export interface IngressCapabilities {
+  panel_tls_enabled?: boolean
+  site_listener_scheme?: string
+  domain_prefix_port?: number
+  app_version?: string
+  [key: string]: unknown
+}
+
+export interface AccountReminderRow {
+  site_id: number
+  site_name: string
+  account: SiteAccount & { reminder_days?: number | null }
+  days_left: number
+  status: string
+  reminder_enabled: boolean
+}
+
+export interface ReminderRecord {
+  account_id: number
+  site_name: string
+  account_name: string
+  expires_at: string
+  reminder_days: number
+  status: 'sent' | 'failed'
+  error?: string
+  attempted_at: string
+  sent_at?: string
+  action?: string
+}
+
+export interface ImportPreviewItem {
+  index: number
+  name: string
+  target_url: string
+  account_count: number
+  duplicate_names: string[]
+  action: 'new' | 'update' | 'skip'
+  ingress_mode: string
+  path_prefix?: string
+  public_host?: string
+  listen_port: number
+  error?: string
+}
+
+export interface ImportPreview {
+  items: ImportPreviewItem[]
+  valid: boolean
+  preview_token: string
+}
+
+export interface ImportResult {
+  created_sites: number
+  updated_sites: number
+  skipped_sites: number
+  failed_sites: number
+  items: { name: string; error?: string }[]
+}
+
 export const sitesApi = {
   list: () => api.get<Site[]>('/api/sites'),
+  capabilities: () => api.get<IngressCapabilities>('/api/ingress-capabilities'),
   accounts: (siteId: number) => api.get<SiteAccount[]>(`/api/sites/${id(siteId)}/accounts`),
+  toggle: (siteId: number) => api.post<{ enabled: boolean }>(`/api/sites/${id(siteId)}/toggle`),
+  remove: (siteId: number) => api.del<unknown>(`/api/sites/${id(siteId)}`),
+  reorder: (siteIds: number[]) => api.put<unknown>('/api/sites/reorder', { site_ids: siteIds }),
+  diag: (siteId: number) => api.get<any>(`/api/sites/${id(siteId)}/diag`),
+  reminders: (status = '') => api.get<AccountReminderRow[]>('/api/account-reminders' + (status ? `?status=${encodeURIComponent(status)}` : '')),
+  reminderHistory: () => api.get<ReminderRecord[]>('/api/account-reminders/history'),
+  reminderAction: (record: ReminderRecord, action: 'handled' | 'ignored' | 'snoozed') =>
+    api.post<unknown>('/api/account-reminders/actions', { account_id: record.account_id, expires_at: record.expires_at, reminder_days: record.reminder_days, action }),
+  importPreview: (format: string, data: string, duplicateAction: string, actions: Record<string, string>) =>
+    api.post<ImportPreview>('/api/site-data/import', { format, data, preview: true, duplicate_action: duplicateAction, actions }),
+  importConfirm: (format: string, data: string, duplicateAction: string, actions: Record<string, string>, previewToken: string) =>
+    api.post<ImportResult>('/api/site-data/import', { format, data, duplicate_action: duplicateAction, actions, preview_token: previewToken }),
+  async export(format: string, mode: string, includeAccounts: boolean, includePasswords: boolean): Promise<Blob> {
+    const query = new URLSearchParams({ format, include_accounts: String(includeAccounts), include_passwords: String(includePasswords) })
+    if (mode) query.set('line_mode', mode)
+    const response = await fetch('/api/site-data/export?' + query.toString(), { credentials: 'same-origin' })
+    if (!response.ok) {
+      let message = '导出失败'
+      try {
+        message = (await response.json()).error || message
+      } catch {
+        /* keep default */
+      }
+      throw new Error(message)
+    }
+    return response.blob()
+  },
 }
 
 export const shareApi = {

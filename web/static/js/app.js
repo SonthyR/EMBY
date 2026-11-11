@@ -539,7 +539,17 @@
       appBootstrapped = true;
     }
 
-    Router.resolve();
+    // Deep links from the new UI: #sites/edit/<id> and #sites/new open the
+    // legacy site editor directly while that form is being rebuilt.
+    const deepLink = location.hash.match(/^#sites\/(?:edit\/(\d+)|(new))$/);
+    if (deepLink) {
+      history.replaceState(null, '', '#sites');
+      Router.resolve();
+      if (deepLink[1] && typeof window.editSiteAction === 'function') window.editSiteAction(Number(deepLink[1]));
+      else if (deepLink[2] && typeof showSiteModal === 'function') showSiteModal();
+    } else {
+      Router.resolve();
+    }
     startDashboardRefresh();
     document.body.classList.remove('auth-checking');
   }
