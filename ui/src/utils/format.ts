@@ -10,7 +10,7 @@ export function formatBytes(value: number | undefined | null): string {
     size /= 1024
     unit++
   }
-  if (unit === 0) return `${bytes} B`
+  if (unit === 0) return `${Math.round(bytes)} B`
   return `${size >= 100 ? size.toFixed(0) : size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unit]}`
 }
 

@@ -72,6 +72,56 @@ export interface ImportResult {
   items: { name: string; error?: string }[]
 }
 
+export interface SiteTraffic {
+  id: number
+  name: string
+  running: boolean
+  traffic_quota: number
+  traffic_used: number
+  monthly_traffic: number
+  requests: number
+}
+export interface TrafficSnapshot {
+  total_sites: number
+  running_sites: number
+  total_traffic: number
+  monthly_traffic: number
+  billing_mode: string
+  traffic_reset_day: number
+  total_requests: number
+  uptime_seconds: number
+  live_sites: SiteTraffic[]
+}
+export interface TrendPoint {
+  timestamp_ms: number
+  traffic_bytes: number
+  bytes_in: number
+  bytes_out: number
+  requests: number
+  download_bps: number
+  upload_bps: number
+}
+export interface TrendResponse {
+  range: string
+  bucket_seconds: number
+  points: TrendPoint[]
+}
+export interface DashboardInsights {
+  log_healthy: boolean
+  latest_log_ms: number
+  log_count_today: number
+  dropped_logs: number
+  schedule_enabled: boolean
+  schedule_label: string
+  hourly_requests: number[]
+}
+
+export const dashboardApi = {
+  snapshot: () => api.get<TrafficSnapshot>('/api/dashboard'),
+  insights: () => api.get<DashboardInsights>('/api/dashboard-insights'),
+  trends: (siteId: string, range: string) => api.get<TrendResponse>(`/api/dashboard-trends?site_id=${encodeURIComponent(siteId)}&range=${encodeURIComponent(range)}`),
+}
+
 export const sitesApi = {
   list: () => api.get<Site[]>('/api/sites'),
   capabilities: () => api.get<IngressCapabilities>('/api/ingress-capabilities'),

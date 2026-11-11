@@ -17,6 +17,15 @@ export default defineConfig({
     target: 'es2020',
     cssCodeSplit: true,
     chunkSizeWarningLimit: 400,
+    rollupOptions: {
+      output: {
+        // go:embed skips files whose names start with "_" or ".", so keep
+        // every emitted chunk name alphanumeric at the start.
+        chunkFileNames: info => `assets/${(info.name || 'chunk').replace(/^[_.]+/, '')}-[hash].js`,
+        entryFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: info => `assets/${(info.names?.[0] || 'asset').replace(/^[_.]+/, '').replace(/\.[^.]+$/, '')}-[hash][extname]`,
+      },
+    },
   },
   server: {
     port: 5173,

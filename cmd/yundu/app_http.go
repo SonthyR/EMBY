@@ -260,6 +260,12 @@ func staticHandler(staticFS fs.FS) http.Handler {
 				return
 			}
 		}
+		// A missing build asset must fail as 404: answering with index.html
+		// would make the browser reject it as a script with the wrong type.
+		if strings.HasPrefix(path, "/app/assets/") {
+			http.NotFound(w, r)
+			return
+		}
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
