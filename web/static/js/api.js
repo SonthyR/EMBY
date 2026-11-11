@@ -281,6 +281,16 @@ const API = {
   exportSiteData(format, mode, options = {}) { const query = 'format=' + encodeURIComponent(format || 'json') + (mode ? '&line_mode=' + encodeURIComponent(mode) : '') + '&include_accounts=' + (options.include_accounts !== false) + '&include_passwords=' + (options.include_passwords === true); return fetch('/api/site-data/export?' + query, { credentials: 'same-origin' }).then(async response => { if (!response.ok) { let body = {}; try { body = await response.json(); } catch (_) {} throw new Error(body.error || '导出失败'); } return response.blob(); }); },
   importSiteData(format, data, options = {}) { return this.request('POST', '/api/site-data/import', { format, data, ...options }); },
   parseSiteMessage(text) { return this.request('POST', '/api/site-data/parse-message', { text }); },
+  // Share users
+  listShareUsers() { return this.request('GET', '/api/share-users'); },
+  createShareUser(data) { return this.request('POST', '/api/share-users', data); },
+  getShareUser(id) { return this.request('GET', '/api/share-users/' + encodeURIComponent(id)); },
+  updateShareUser(id, data) { return this.request('PUT', '/api/share-users/' + encodeURIComponent(id), data); },
+  deleteShareUser(id) { return this.request('DELETE', '/api/share-users/' + encodeURIComponent(id)); },
+  getShareUserText(id) { return this.request('GET', '/api/share-users/' + encodeURIComponent(id) + '/text'); },
+  kickShareUser(id) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/kick', {}); },
+  resetShareUserTraffic(id) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/reset-traffic', {}); },
+  renewShareUser(id, days) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/renew', { days }); },
   testUpstream(targetURL) { return this.request('POST', '/api/upstream-test', { target_url: targetURL }); },
 
   // Traffic

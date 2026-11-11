@@ -63,6 +63,7 @@ type ProxyInstance struct {
 	progress             *progressCoalescer
 	pingCache            *pingCache
 	imageCache           *imageCacheSite
+	shareLogout          func(context.Context, string) error
 }
 
 type ProxyManager struct {
@@ -88,6 +89,7 @@ type ProxyManager struct {
 	siteTLSConfig           *tls.Config
 	progressRuntime         *progressGlobalRuntime
 	imageCacheRuntime       *imageCacheRuntime
+	shares                  *shareUserRuntime
 }
 
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
@@ -278,6 +280,9 @@ func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 		database:          db,
 	}
 	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
+	if db != nil {
+		pm.shares = newShareUserRuntime(db, pm)
+	}
 	return pm
 }
 

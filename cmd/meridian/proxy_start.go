@@ -152,6 +152,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
 	proxyTransport.MaxIdleConnsPerHost = 32
 	inst.transport = proxyTransport
+	inst.shareLogout = newShareLogoutFunc(proxyTransport, target, policy, configuredHeaders)
 	baseTransport := http.RoundTripper(proxyTransport)
 	if pingCacheState != nil {
 		baseTransport = &pingCacheTransport{base: baseTransport, cache: pingCacheState}
@@ -359,6 +360,18 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		defer trafficMeter.finish(time.Now())
 		r = r.WithContext(context.WithValue(r.Context(), requestTrafficMeterContextKey{}, trafficMeter))
 
+		// Share users: sign-in swap, token checks and per-user metering.
+		var shareLogin *shareLoginPending
+		if pm.shares != nil {
+			var shareUser *shareUserState
+			var handled bool
+			r, shareLogin, shareUser, handled = pm.shares.intercept(w, r, site, requestLogEntry.ClientIP)
+			if handled {
+				return
+			}
+			trafficMeter.setShareUser(shareUser)
+		}
+
 		if site.TrafficQuota > 0 {
 			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
 			if usageErr != nil {
@@ -485,6 +498,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		} else {
 			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 		}
+		var shareCapture *shareLoginCapture
+		if shareLogin != nil {
+			shareCapture = newShareLoginCapture(rw)
+			rw = shareCapture
+		}
 		finalProxy := http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 			proxy.ServeHTTP(responseWriter, request)
 		})
@@ -496,9 +514,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			})
 		}
 		if inst.progress != nil && inst.progress.ServeHTTP(rw, r, finalProxy) {
+			if shareCapture != nil {
+				shareCapture.finish(shareLogin)
+			}
 			return
 		}
 		finalProxy.ServeHTTP(rw, r)
+		if shareCapture != nil {
+			shareCapture.finish(shareLogin)
+		}
 	})
 
 	inst.handler = handler

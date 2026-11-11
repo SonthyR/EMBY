@@ -24,6 +24,17 @@ type requestTrafficMeter struct {
 	localOut      int64
 	streaming     bool
 	finished      bool
+	share         *shareUserState
+}
+
+// setShareUser attributes this request's bytes to a share user as well.
+func (m *requestTrafficMeter) setShareUser(user *shareUserState) {
+	if m == nil || user == nil {
+		return
+	}
+	m.mu.Lock()
+	m.share = user
+	m.mu.Unlock()
 }
 
 func newRequestTrafficMeter(inst *ProxyInstance) *requestTrafficMeter {
@@ -91,6 +102,9 @@ func (m *requestTrafficMeter) add(bytesIn, bytesOut int64, at time.Time) {
 	defer m.mu.Unlock()
 	if m.finished {
 		return
+	}
+	if m.share != nil {
+		m.share.pending.Add(bytesIn + bytesOut)
 	}
 	if !m.streaming && minute == m.startedMinute {
 		m.inst.bytesIn.Add(bytesIn)

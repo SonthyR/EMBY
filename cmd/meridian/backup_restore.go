@@ -556,6 +556,9 @@ func reencryptRestoredSecrets(path string, oldJWT, oldCredentialKey, oldHeaderKe
 			}
 		}
 	}
+	if err := reencryptShareSecrets(tx, oldCredentialKey, newCredentialKey); err != nil {
+		return err
+	}
 	var telegramCiphertext string
 	err = tx.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {

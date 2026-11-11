@@ -5,6 +5,7 @@ const Router = {
   pageMeta: {
     dashboard: '仪表盘',
     sites: '站点管理',
+    'share-users': '分享账号',
     'request-logs': '日志记录',
     'telegram-report': 'Telegram Bot',
     'settings-tls': 'TLS 设置',

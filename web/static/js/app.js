@@ -517,6 +517,7 @@
       Router.register('dashboard', renderDashboard);
       Router.register('sites', renderSites);
       Router.register('request-logs', renderRequestLogs);
+  Router.register('share-users', renderShareUsers);
       Router.register('telegram-report', renderTelegramReport);
       Router.register('settings-tls', renderTLSSettings);
       Router.register('global-settings', renderGlobalSettings);

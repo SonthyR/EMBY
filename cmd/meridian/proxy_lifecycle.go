@@ -101,6 +101,7 @@ func (pm *ProxyManager) FlushTraffic() {
 			log.Printf("[%s] failed to flush traffic: %v", inst.Site.Name, err)
 		}
 	}
+	pm.shares.flush()
 }
 
 // flushProxyTraffic persists inst's pending bytes and requests into the DB and

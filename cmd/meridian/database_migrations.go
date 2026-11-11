@@ -523,6 +523,9 @@ func (d *DB) migrateOnce() error {
 	if _, err := conn.ExecContext(ctx, "DROP INDEX IF EXISTS idx_traffic_site_hour"); err != nil {
 		return err
 	}
+	if err := ensureShareUserSchema(ctx, conn); err != nil {
+		return err
+	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err
