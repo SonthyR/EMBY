@@ -18,7 +18,7 @@ media.example.net → Nginx HTTPS → Meridian 站点代理 → Emby
 新安装可使用项目一键安装命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --port 9090 --domain panel.example.com --email admin@example.com -y
 ```
 

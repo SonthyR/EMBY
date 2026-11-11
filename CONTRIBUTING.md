@@ -9,7 +9,7 @@
 - 无 CGO 依赖（SQLite 使用纯 Go 实现 `modernc.org/sqlite`）
 
 ```bash
-git clone https://github.com/snnabb/Meridian.git
+git clone https://github.com/SonthyR/EMBY.git
 cd Meridian
 go build -o yundu ./cmd/yundu
 go test ./...

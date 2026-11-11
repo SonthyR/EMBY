@@ -5,7 +5,7 @@ set -euo pipefail
 # Install, update, TLS configuration, password reset and uninstall.
 # Backups and rollback remain internal safety mechanisms.
 
-REPO="${MERIDIAN_REPO:-snnabb/Meridian}"
+REPO="${MERIDIAN_REPO:-SonthyR/EMBY}"
 INSTALL_DIR="${MERIDIAN_INSTALL_DIR:-/usr/local/bin}"
 DATA_DIR="${MERIDIAN_DATA_DIR:-/opt/meridian}"
 BACKUP_DIR="${MERIDIAN_BACKUP_DIR:-/opt/meridian-backups}"
@@ -2206,7 +2206,7 @@ panel_updater_supported_install() {
     is_systemd || return 1
     [ "$INSTALL_DIR" = /usr/local/bin ] && [ "$DATA_DIR" = /opt/meridian ] \
         && [ "$SERVICE_FILE" = /etc/systemd/system/meridian.service ] \
-        && [ "$SERVICE_NAME" = meridian ] && [ "$REPO" = snnabb/Meridian ]
+        && [ "$SERVICE_NAME" = meridian ] && [ "$REPO" = SonthyR/EMBY ]
 }
 
 setup_panel_updater() {

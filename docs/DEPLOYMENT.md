@@ -1,28 +1,28 @@
 # 部署指南
 
-[返回首页](../README.md) · [完整 Wiki](https://github.com/snnabb/Meridian/wiki) · [使用指南](USAGE.md) · [安全说明](../SECURITY.md)
+[返回首页](../README.md) · [完整 Wiki](https://github.com/SonthyR/EMBY/wiki) · [使用指南](USAGE.md) · [安全说明](../SECURITY.md)
 
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh)
 ```
 
 交互菜单提供安装、更新、修改管理员密码、卸载和泛域名证书配置。首次安装默认端口 `9090`，已有安装保留当前端口。Linux systemd 使用独立非 root 账户；macOS 支持安装，但不自动配置域名。
 
 ```bash
 # 配置面板域名与 HTTPS
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --port 9090 --domain panel.example.com --email admin@example.com -y
 
 # 更新：校验下载、备份、健康检查，失败回滚
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) update
 
 # 重置管理员密码
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) password
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) password
 
 # 卸载并保留数据；只有 --purge 才删除数据
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) uninstall
 ```
 
 未配置域名时只监听 `127.0.0.1`。域名流程可配置 Nginx 与 HTTPS；安装器仅管理自己的面板代理，不修改站点回源或其他 Nginx 站点。安装完成后，使用显示的初始化令牌创建管理员，密码至少 6 个字符、最多 72 个 UTF-8 字节。
@@ -34,7 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 安装菜单可配置 Cloudflare DNS-01 泛域名证书，也可下载脚本后执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh -o install.sh
 bash install.sh tls --domain panel.example.com --wildcard '*.example.com' \
   --email admin@example.com --port 9090 --dns-token-file /root/cloudflare-token -y
 ```
@@ -61,7 +61,7 @@ chmod 600 .env
 ```yaml
 services:
   meridian:
-    image: ghcr.io/snnabb/meridian:latest
+    image: ghcr.io/sonthyr/yundu:latest
     user: "10001:10001"
     restart: unless-stopped
     read_only: true
@@ -106,7 +106,7 @@ docker compose pull && docker compose up -d
 
 ## Windows 与源码
 
-从 [Releases](https://github.com/snnabb/Meridian/releases/latest) 下载对应系统的程序。通过受保护的系统配置持久保存下表中的四个独立长期密钥及首次初始化令牌，然后运行：
+从 [Releases](https://github.com/SonthyR/EMBY/releases/latest) 下载对应系统的程序。通过受保护的系统配置持久保存下表中的四个独立长期密钥及首次初始化令牌，然后运行：
 
 ```bash
 ./meridian --port 9090 --db /data/meridian.db
@@ -117,7 +117,7 @@ Windows 使用 `meridian-windows-amd64.exe`，数据库路径按实际目录填�
 源码构建需要 Go 1.26.10 或更高版本，无需 Node 或前端构建：
 
 ```bash
-git clone https://github.com/snnabb/Meridian.git
+git clone https://github.com/SonthyR/EMBY.git
 cd Meridian
 go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 ```

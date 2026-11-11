@@ -2,9 +2,9 @@
 
 Meridian 是面向 Emby 的多站点管理与播放代理工具。本 Wiki 对应 **v1.14.2**，涵盖部署、日常使用与维护。
 
-[GitHub Wiki](https://github.com/snnabb/Meridian/wiki) · [文档站](https://snnabb.github.io/Meridian/index.html)
+[GitHub Wiki](https://github.com/SonthyR/EMBY/wiki) · [文档站](https://sonthyr.github.io/EMBY/index.html)
 
-![Meridian 仪表盘，虚构站点与示例数据](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/dashboard.webp)
+![Meridian 仪表盘，虚构站点与示例数据](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/dashboard.webp)
 
 ## 从这里开始
 
@@ -36,9 +36,9 @@ Meridian 是面向 Emby 的多站点管理与播放代理工具。本 Wiki 对�
 
 - [只读演示站](https://emby.qd.je)：账号 `demo`，密码 `MeridianDemo2026`。
 - [账号功能演示](https://emby.qd.je/test/)：体验账号备忘、提醒、开号识别、导入预览和文件导出。账号同为 `demo`，密码 `MeridianDemo2026`。
-- [下载正式版本](https://github.com/snnabb/Meridian/releases/latest)。
-- [查看更新记录](https://github.com/snnabb/Meridian/blob/master/CHANGELOG.md)。
-- [反馈问题](https://github.com/snnabb/Meridian/issues)。
+- [下载正式版本](https://github.com/SonthyR/EMBY/releases/latest)。
+- [查看更新记录](https://github.com/SonthyR/EMBY/blob/master/CHANGELOG.md)。
+- [反馈问题](https://github.com/SonthyR/EMBY/issues)。
 
 演示站、面板截图与 Telegram 操作示意使用虚构站点和示例数据。演示站不提供媒体播放，修改配置和发送消息已关闭。
 

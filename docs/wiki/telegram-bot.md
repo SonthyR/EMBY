@@ -2,7 +2,7 @@
 
 Bot 提供管理员私聊操作与独立的定时日报。两者共享 Token，但开关、权限和接收目标相互独立。
 
-![Telegram 管理设置，示例数据](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/telegram-settings.webp)
+![Telegram 管理设置，示例数据](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/telegram-settings.webp)
 
 ## 配置管理功能
 
@@ -39,7 +39,7 @@ Token 加密保存；再次打开设置时不显示原文，留空可保留已�
 
 启用管理后，Meridian 会配置相应命令菜单。常用操作也可用消息中的按钮完成。
 
-![Telegram Bot 操作示意](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/telegram-bot.webp)
+![Telegram Bot 操作示意](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/telegram-bot.webp)
 
 上图依据实际菜单绘制，站点、数据与会话是模拟内容。
 

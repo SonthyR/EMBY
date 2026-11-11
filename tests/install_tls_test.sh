@@ -314,7 +314,7 @@ reset_fixture
     if panel_updater_supported_install; then echo 'custom installation unexpectedly enabled the standard updater' >&2; exit 1; fi
     assert_standard_updater_layout() {
         local INSTALL_DIR=/usr/local/bin DATA_DIR=/opt/meridian
-        local SERVICE_FILE=/etc/systemd/system/meridian.service SERVICE_NAME=meridian REPO=snnabb/Meridian
+        local SERVICE_FILE=/etc/systemd/system/meridian.service SERVICE_NAME=meridian REPO=SonthyR/EMBY
         panel_updater_supported_install
         REPO=example/fork
         if panel_updater_supported_install; then exit 1; fi
@@ -359,7 +359,7 @@ reset_fixture
         source <(cat "${REPO_ROOT}/install.sh")
         eval "$fixture_functions"
         download() {
-            [ "$1" = https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh ] \
+            [ "$1" = https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh ] \
                 || { echo 'streamed repair requested an obsolete installer' >&2; return 1; }
             cp "${REPO_ROOT}/install.sh" "$2"
             printf 'downloaded\n' > "${TEST_ROOT}/streamed-installer-downloaded"

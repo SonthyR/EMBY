@@ -4,7 +4,7 @@
 
 升级回滚还会用到安装器自己的整目录快照。两种备份用途不同：`.mrbak` 是跨部署的数据逻辑备份；安装器的 `meridian-pre-*.tar.gz` 是某次更新前的文件级快照，适合把数据库恢复到旧程序能够读取的精确状态。
 
-![加密备份与恢复](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/backup.webp)
+![加密备份与恢复](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/backup.webp)
 
 ## 备份包含什么
 

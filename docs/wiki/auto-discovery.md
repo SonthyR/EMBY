@@ -66,6 +66,6 @@ Safe 的空规则表示允许符合网络校验的公网 DNS 域名，且仍只�
 
 自动发现会验证全部 DNS 回答并固定校验后的连接目标，要求有效的 HTTPS 证书，不转发管理会话或把固定上游 Header 带到任意跨域目标。
 
-复杂的清单、DRM、第三方 Header 或特殊客户端仍可能不兼容。没有受支持的安全回退时，请求会失败，而不是直接放行原始目标。完整协议与容量边界见项目的 [安全策略](https://github.com/snnabb/Meridian/blob/master/SECURITY.md)。
+复杂的清单、DRM、第三方 Header 或特殊客户端仍可能不兼容。没有受支持的安全回退时，请求会失败，而不是直接放行原始目标。完整协议与容量边界见项目的 [安全策略](https://github.com/SonthyR/EMBY/blob/master/SECURITY.md)。
 
 已知且受信任的回源可考虑 [手动填写](playback-modes.md)，而不是通过提高兼容级别绕过网络校验。

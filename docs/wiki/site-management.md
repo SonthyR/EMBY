@@ -2,7 +2,7 @@
 
 “站点管理”用于配置 Emby 主地址、对外入口、播放回源和流量策略。每个站点独立启停与统计。
 
-![站点列表，虚构站点](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/sites.webp)
+![站点列表，虚构站点](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/sites.webp)
 
 ## 添加站点
 
@@ -30,7 +30,7 @@
 
 按需配置 UA、真实客户端 IP、自定义 Header、缓存、流量额度和单连接限速。普通接入可先保留默认值，详见 [高级策略](advanced-settings.md)。
 
-![添加与编辑站点](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/site-editor.webp)
+![添加与编辑站点](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/site-editor.webp)
 
 ## 账号备忘录与数据迁移
 

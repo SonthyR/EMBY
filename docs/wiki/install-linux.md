@@ -5,7 +5,7 @@
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh)
 ```
 
 交互菜单提供安装、更新、修改管理员密码、卸载、泛域名证书和本机反向代理配置。安装过程会检查平台、依赖与端口，并下载对应正式版本。
@@ -15,7 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 也可直接执行，Token 会在提示时隐藏输入：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --wildcard '*.example.com' --email admin@example.com --port 9090
 ```
 
@@ -26,7 +26,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 非交互安装可从受保护的文件读取 Token：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --wildcard '*.example.com' --email admin@example.com --port 9090 \
   --dns-token-file /root/cloudflare-token -y
 ```
@@ -38,7 +38,7 @@ Token 文件只供管理员读取，例如权限设为 `600`；Token 需有目�
 只需要单独面板域名、由 Nginx 管理 HTTPS 时：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --port 9090 --domain panel.example.com --email admin@example.com -y
 ```
 
@@ -49,7 +49,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 没有域名或已有外部反向代理时：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install \
   --port 9090 -y
 ```
 
@@ -95,7 +95,7 @@ sudo journalctl -u meridian -n 100 --no-pager
 首次安装可按上方步骤直接申请。已有 Meridian 时，菜单的“配置泛域名证书”或 `tls` 命令同样使用 Cloudflare DNS-01：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh -o install.sh
 bash install.sh tls --domain panel.example.com --wildcard '*.example.com' \
   --email admin@example.com --port 9090 --dns-token-file /root/cloudflare-token -y
 ```
@@ -122,13 +122,13 @@ Token 文件只能由管理员读取。授予目标 Zone 的 Zone Read 与 DNS E
 
 ```bash
 # 更新正式版本，包含下载校验、备份和健康检查
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) update
 
 # 离线重置管理员密码
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) password
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) password
 
 # 卸载服务并保留数据
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) uninstall
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) uninstall
 ```
 
 只有显式使用 `--purge` 才删除数据。重置密码会轮换会话密钥，使旧登录失效。

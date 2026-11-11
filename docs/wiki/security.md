@@ -52,10 +52,10 @@ Meridian 管理员可以修改全部站点、凭据、证书和备份。它目�
 
 正式 Release 提供校验文件与签名，安装器在替换程序前验证下载。更新代理使用受保护的本机 socket 和固定安装器，不赋予面板任意 root 命令执行接口。
 
-安全修复面向最新版本。详细的协议、预算、平台边界与已知限制见 [项目安全策略](https://github.com/snnabb/Meridian/blob/master/SECURITY.md)。
+安全修复面向最新版本。详细的协议、预算、平台边界与已知限制见 [项目安全策略](https://github.com/SonthyR/EMBY/blob/master/SECURITY.md)。
 
 ## 报告问题
 
-普通功能问题可提交 [Issue](https://github.com/snnabb/Meridian/issues)，先删除真实域名、IP、令牌、媒体链接与备份内容。
+普通功能问题可提交 [Issue](https://github.com/SonthyR/EMBY/issues)，先删除真实域名、IP、令牌、媒体链接与备份内容。
 
-安全漏洞不要公开发 Issue。使用 [GitHub Security Advisory](https://github.com/snnabb/Meridian/security/advisories/new) 私下报告。
+安全漏洞不要公开发 Issue。使用 [GitHub Security Advisory](https://github.com/SonthyR/EMBY/security/advisories/new) 私下报告。

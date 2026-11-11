@@ -34,7 +34,7 @@ TRUSTED_PROXY_CIDRS=
 如果仍使用尚未包含此默认行为的旧版程序，或已有自定义 CIDR 未包含本机地址，可在安装器菜单选择“配置本机反向代理”，或执行兼容命令：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) proxy --local
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) proxy --local
 ```
 
 命令会在现有 `TRUSTED_PROXY_CIDRS` 中补充 `127.0.0.1/32,::1/128`，保留其他代理范围（原值为 `none` 时改为这两个地址），备份 `.env` 后重启并检查 Meridian，失败则恢复原配置。域名、监听端口、证书、数据库和自定义 Nginx 配置不由此命令改写。重启会短暂中断现有连接。

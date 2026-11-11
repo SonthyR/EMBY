@@ -21,7 +21,7 @@ import (
 // releaseRepo is the GitHub "owner/name" that publishes Yundu releases. Empty
 // disables the in-panel update check, so a build never upgrades itself to a
 // different project's binary.
-const releaseRepo = ""
+const releaseRepo = "SonthyR/EMBY"
 
 var stableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 var comparableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$`)

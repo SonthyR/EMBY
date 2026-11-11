@@ -2,7 +2,7 @@
 
 客户端故障优先看“请求日志”，服务启动和监听故障再看系统运行日志。
 
-![请求日志，示例数据](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/request-logs.webp)
+![请求日志，示例数据](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/request-logs.webp)
 
 ## 请求日志
 

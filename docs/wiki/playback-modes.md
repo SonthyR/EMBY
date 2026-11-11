@@ -2,7 +2,7 @@
 
 在“站点编辑 → 播放设置”中选择回源模式。先确保主地址、入口与 Emby 登录正常，再调整播放策略。
 
-![播放设置](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/playback.webp)
+![播放设置](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/playback.webp)
 
 ## 三种模式对比
 

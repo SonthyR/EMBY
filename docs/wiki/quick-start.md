@@ -7,7 +7,7 @@
 准备一台可访问上游 Emby 的服务器。需要 HTTPS 域名时，先把 `panel.example.com` 解析到服务器，并按安装器提示开放证书申请与访问所需的端口。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh)
 ```
 
 选择“安装”，填写面板端口，按提示配置域名。默认内部端口为 `9090`；通过安装器配置 Nginx 后，通常从 `https://panel.example.com` 访问。

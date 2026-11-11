@@ -4,7 +4,7 @@
 
 ## 升级到 v1.14.2
 
-v1.14.2 包含泛域名 HTTPS 安装、Nginx 回源 SNI、同机反代真实 IP 和 Go 1.26.10 安全更新。v1.14.0 / v1.14.1 用户可按原部署方式升级，保留数据库、环境、密钥与证书；Docker 固定镜像使用 `ghcr.io/snnabb/meridian:v1.14.2`。
+v1.14.2 包含泛域名 HTTPS 安装、Nginx 回源 SNI、同机反代真实 IP 和 Go 1.26.10 安全更新。v1.14.0 / v1.14.1 用户可按原部署方式升级，保留数据库、环境、密钥与证书；Docker 固定镜像使用 `ghcr.io/sonthyr/yundu:v1.14.2`。
 
 同机 Nginx / 宝塔覆盖设置 `X-Real-IP $remote_addr` 后，`TRUSTED_PROXY_CIDRS` 未设置或留空的安装只需升级程序，即会信任 `127.0.0.1` 和 `::1` 并记录真实 IP。已有自定义 CIDR 不会自动扩展，`none` 可关闭信任；跨容器的 1Panel / Docker 和远程代理仍须配置实际来源，见[手动反代与真实 IP](reverse-proxy.md#manual-proxy-client-ip)。
 
@@ -14,7 +14,7 @@ v1.14.2 包含泛域名 HTTPS 安装、Nginx 回源 SNI、同机反代真实 IP 
 
 v1.14.1 将已验证的测试分支改进纳入正式版：网页与 Telegram 续期预设、自定义天数、账号状态筛选、续期历史、提醒处理与发送记录，以及仅显示日期的到期日。账号到期时间在数据库、API 和 JSON 中仍保留完整精度；显示变化不会重写已有时间。
 
-标准 systemd 安装已配置更新代理时，可在面板检查新版本并升级。Docker 将固定镜像改为 `ghcr.io/snnabb/meridian:v1.14.1`，拉取后重建容器；使用 `latest` 时同样需要拉取并重建。继续使用原数据卷、环境配置和持久密钥。
+标准 systemd 安装已配置更新代理时，可在面板检查新版本并升级。Docker 将固定镜像改为 `ghcr.io/sonthyr/yundu:v1.14.1`，拉取后重建容器；使用 `latest` 时同样需要拉取并重建。继续使用原数据卷、环境配置和持久密钥。
 
 启动时自动补齐续期与提醒记录所需数据表，已有站点、账号和提醒配置保留。更新前保存完整部署备份，更新后核对账号到期日、续期记录及 Telegram 设置。需要回退时，按[回滚说明](#rollback)同时恢复更新前的程序、数据库与配置。原生 HTTPS 的旧安装仍需先按下面的旧组件修复步骤刷新安装器。
 
@@ -54,7 +54,7 @@ v1.14.1 将已验证的测试分支改进纳入正式版：网页与 Telegram �
 先在服务器执行下面的命令。已有安装的 `install -y` 保留当前程序版本、域名、证书和数据，只补齐安装配置并更新组件；不要附加 `--domain`、`--port` 或 `--no-domain`：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install -y
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) install -y
 ```
 
 完成后回到“全局设置 → 版本更新”，检查更新并点击“更新并重启”。修复后的安装器使用程序自带的本机健康检查，读取实际端口和数据库中的域名，并校验证书，兼容 HTTP 与原生 HTTPS。
@@ -64,7 +64,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 新版安装器在首次安装、升级和检查到已是最新版时，都会配置或修复面板更新服务。旧标准安装没有更新代理时，在服务器运行一次：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update -y
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) update -y
 ```
 
 这次操作会保留配置并补装更新服务，之后可直接在面板更新。仅修复更新组件时也可使用 `install -y`。自定义服务名、账户、目录和 Docker 不应强行启用标准更新代理。
@@ -72,7 +72,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 ## 安装器更新
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) update
 ```
 
 不要在同一部署上同时运行多个更新任务。更新时正在播放的连接可能中断，选择空闲时间执行。
@@ -152,7 +152,7 @@ sudo systemctl status meridian --no-pager -l
 标准 Linux 部署使用：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) password
+bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) password
 ```
 
 其他部署先停止服务，再通过标准输入执行离线命令：

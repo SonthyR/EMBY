@@ -1,8 +1,8 @@
 site_name: Meridian Wiki
 site_description: Meridian v1.14.2 安装、站点管理、播放与维护指南
-site_url: https://snnabb.github.io/Meridian/
-repo_url: https://github.com/snnabb/Meridian
-repo_name: snnabb/Meridian
+site_url: https://sonthyr.github.io/EMBY/
+repo_url: https://github.com/SonthyR/EMBY
+repo_name: SonthyR/EMBY
 edit_uri: edit/master/docs/wiki/
 docs_dir: docs/wiki
 site_dir: site
@@ -93,4 +93,4 @@ extra_css:
 
 extra:
   generator: false
-  homepage: https://snnabb.github.io/Meridian/index.html
+  homepage: https://sonthyr.github.io/EMBY/index.html

@@ -4,7 +4,7 @@ Meridian 是单个程序，内嵌前端并使用 SQLite。运行预编译版本�
 
 ## 下载程序
 
-在 [Releases](https://github.com/snnabb/Meridian/releases/latest) 下载对应平台：
+在 [Releases](https://github.com/SonthyR/EMBY/releases/latest) 下载对应平台：
 
 | 平台 | 文件 |
 | --- | --- |
@@ -73,7 +73,7 @@ chmod 755 ./meridian
 需要 **Go 1.26.10 或更高版本**，无需前端打包。
 
 ```bash
-git clone https://github.com/snnabb/Meridian.git
+git clone https://github.com/SonthyR/EMBY.git
 cd Meridian
 go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
 ```
@@ -93,7 +93,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false \
 
 存在活动测试分支时，Linux x86-64 可直接获取已构建的测试程序：
 
-1. 登录 GitHub，打开 [beta 分支的 CI 运行](https://github.com/snnabb/Meridian/actions/workflows/ci.yml?query=branch%3Abeta)，选择最新成功的运行。
+1. 登录 GitHub，打开 [beta 分支的 CI 运行](https://github.com/SonthyR/EMBY/actions/workflows/ci.yml?query=branch%3Abeta)，选择最新成功的运行。
 2. 在运行页面底部的 Artifacts 下载 `meridian-beta-linux-amd64-提交号`，解压得到 `meridian-linux-amd64`、`BETA_VERSION` 和 `SHA256SUMS`。产物保留 14 天。
 3. 在解压目录运行 `sha256sum -c SHA256SUMS`，然后执行 `chmod 755 meridian-linux-amd64` 和 `./meridian-linux-amd64 --version`，确认与 `BETA_VERSION` 一致；再按上方手工运行方法配置测试实例。
 

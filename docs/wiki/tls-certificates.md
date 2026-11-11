@@ -8,7 +8,7 @@ Meridian 支持原生 HTTPS，也可以放在已有 HTTPS 网关后面。此页�
 
 只填写 `--domain panel.example.com` 时使用 Nginx + Certbot 的 HTTPS，网页原生证书功能仍显示外部代理管理。已有安装可通过安装器的 `tls` 命令启用原生泛域名证书并保留受管理的 Nginx 面板入口；先检查正在使用的协议和端口，以及安装器的签发结果。
 
-![TLS 设置](https://raw.githubusercontent.com/snnabb/Meridian/v1.13.0/docs/images/tls.webp)
+![TLS 设置](https://raw.githubusercontent.com/SonthyR/EMBY/v1.13.0/docs/images/tls.webp)
 
 ## 先确定域名与端口
 

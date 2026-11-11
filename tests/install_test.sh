@@ -83,7 +83,7 @@ assert_not_contains() {
     fi
 }
 
-assert_eq 'snnabb/Meridian' "$REPO" 'default repository owner'
+assert_eq 'SonthyR/EMBY' "$REPO" 'default repository owner'
 assert_eq 'v2.6.4' "$COSIGN_VERSION" 'pinned cosign bootstrap version'
 
 # An updater service does not inherit Meridian's .env. Native HTTPS health
@@ -187,7 +187,7 @@ COSIGN
     COSIGN_BIN="${signed_dir}/cosign"
     download() { printf 'bundle\n' > "$2"; }
     verify_release_signature v9.9.9 "${signed_dir}/SHA256SUMS" "${signed_dir}/SHA256SUMS.bundle"
-    assert_contains "$cosign_log" '--certificate-identity https://github.com/snnabb/Meridian/.github/workflows/release.yml@refs/tags/v9.9.9'
+    assert_contains "$cosign_log" '--certificate-identity https://github.com/SonthyR/EMBY/.github/workflows/release.yml@refs/tags/v9.9.9'
     assert_not_contains "$cosign_log" '--certificate-identity-regexp'
 )
 
