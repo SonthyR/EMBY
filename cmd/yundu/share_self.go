@@ -192,12 +192,13 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		view.Note = ""
+		origin := a.shareTextOrigin(r)
 		for _, assigned := range view.Sites {
 			site, err := a.db.GetSite(assigned.SiteID)
 			if err != nil || !site.Enabled {
 				continue
 			}
-			view.Servers = append(view.Servers, shareSelfSite{Name: site.Name, Addresses: a.siteProxyLines(*site)})
+			view.Servers = append(view.Servers, shareSelfSite{Name: site.Name, Addresses: a.siteProxyLinesFrom(*site, origin)})
 		}
 		for i := range view.Sites {
 			view.Sites[i].SiteAccountID = 0
