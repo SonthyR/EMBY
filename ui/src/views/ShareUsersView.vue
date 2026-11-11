@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Plus, Search, Users, Activity, MonitorSmartphone, HardDriveDownload } from '@lucide/vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Plus, Search, Copy } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
-import ShareUserCard from '@/components/share/ShareUserCard.vue'
+import UiProgress from '@/components/ui/UiProgress.vue'
+import PageHeader from '@/components/ui/PageHeader.vue'
 import ShareUserForm from '@/components/share/ShareUserForm.vue'
-import ShareUserManage from '@/components/share/ShareUserManage.vue'
+import ShareUserDetail from '@/components/share/ShareUserDetail.vue'
 import ShareTextDialog from '@/components/share/ShareTextDialog.vue'
 import { shareApi, sitesApi, type ShareStatus, type ShareUser, type Site } from '@/api'
-import { copyText, formatBytes } from '@/utils/format'
+import { copyText, daysUntil, dateOnly, formatBytes } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
-import { STATUS_LABEL } from '@/components/share/shareStatus'
+import { STATUS_LABEL, STATUS_TONE } from '@/components/share/shareStatus'
 
+const route = useRoute()
+const router = useRouter()
 const users = ref<ShareUser[]>([])
 const sites = ref<Site[]>([])
 const loading = ref(true)
@@ -20,11 +24,12 @@ const filter = ref<'all' | ShareStatus>('all')
 
 const formOpen = ref(false)
 const editing = ref<ShareUser | null>(null)
-const manageOpen = ref(false)
-const managing = ref<ShareUser | null>(null)
+const selectedId = ref<number | null>(null)
 const textOpen = ref(false)
 const shareText = ref('')
 const justCreated = ref(false)
+
+const selected = computed(() => users.value.find(u => u.id === selectedId.value) || null)
 
 async function load(silent = false) {
   if (!silent) loading.value = true
@@ -40,33 +45,57 @@ async function load(silent = false) {
   }
 }
 
+function onKey(event: KeyboardEvent) {
+  const target = event.target as HTMLElement
+  if (event.key.toLowerCase() !== 'n' || event.metaKey || event.ctrlKey || event.altKey) return
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || document.querySelector('[role="dialog"]')) return
+  event.preventDefault()
+  openCreate()
+}
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   load()
-  // Usage and online devices change while friends watch; refresh quietly.
-  timer = setInterval(() => {
-    if (document.visibilityState === 'visible' && !formOpen.value) load(true)
-  }, 15000)
+  document.addEventListener('keydown', onKey)
+  timer = setInterval(() => document.visibilityState === 'visible' && !formOpen.value && load(true), 15000)
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(timer)
+  document.removeEventListener('keydown', onKey)
+})
+watch(
+  () => route.query.new,
+  value => {
+    if (value) {
+      openCreate()
+      router.replace({ query: {} })
+    }
+  },
+  { immediate: true },
+)
 
 const counts = computed(() => {
   const result: Record<string, number> = { all: users.value.length, active: 0, disabled: 0, expired: 0, quota: 0 }
   for (const user of users.value) result[user.status]++
   return result
 })
-const stats = computed(() => ({
-  online: users.value.reduce((sum, u) => sum + (u.session_count || 0), 0),
-  traffic: users.value.reduce((sum, u) => sum + (u.traffic_used || 0), 0),
-}))
+const online = computed(() => users.value.reduce((sum, u) => sum + (u.session_count || 0), 0))
+const traffic = computed(() => users.value.reduce((sum, u) => sum + (u.traffic_used || 0), 0))
 const visible = computed(() => {
   const q = query.value.trim().toLowerCase()
   return users.value.filter(user => {
     if (filter.value !== 'all' && user.status !== filter.value) return false
-    if (!q) return true
-    return [user.username, user.note, ...user.sites.map(s => s.site_name || '')].some(v => (v || '').toLowerCase().includes(q))
+    return !q || [user.username, user.note, ...user.sites.map(s => s.site_name || '')].some(v => (v || '').toLowerCase().includes(q))
   })
 })
+
+function expiryText(user: ShareUser) {
+  if (!user.expires_at) return { text: '永久', tone: '' }
+  const days = daysUntil(user.expires_at)
+  if (days === null) return { text: dateOnly(user.expires_at), tone: '' }
+  if (days < 0) return { text: '已过期', tone: 'bad' }
+  if (days === 0) return { text: '今天到期', tone: 'warn' }
+  return { text: `${days} 天`, tone: days <= 7 ? 'warn' : '' }
+}
 
 function openCreate() {
   editing.value = null
@@ -75,10 +104,6 @@ function openCreate() {
 function openEdit(user: ShareUser) {
   editing.value = user
   formOpen.value = true
-}
-function openManage(user: ShareUser) {
-  managing.value = user
-  manageOpen.value = true
 }
 
 async function onSaved(user: ShareUser, created: boolean) {
@@ -90,17 +115,14 @@ async function onSaved(user: ShareUser, created: boolean) {
       justCreated.value = true
       textOpen.value = true
     } catch {
-      toast.success('分享账号已创建')
+      toast.success('已创建')
     }
-  } else {
-    toast.success('已保存')
-  }
+  } else toast.success('已保存')
 }
-
 async function copyShare(user: ShareUser) {
   try {
     const { text } = await shareApi.text(user.id)
-    if (await copyText(text)) toast.success('分享信息已复制，可以直接发给朋友')
+    if (await copyText(text)) toast.success('分享信息已复制')
     else {
       shareText.value = text
       justCreated.value = false
@@ -110,15 +132,14 @@ async function copyShare(user: ShareUser) {
     toast.error(errorMessage(error))
   }
 }
-
 async function copyPortal(user: ShareUser) {
   const link = user.portal_url || (user.portal_path ? location.origin + user.portal_path : '')
   if (!link) return toast.error('暂无查询链接')
-  if (await copyText(link)) toast.success('查询链接已复制，朋友打开就能看到到期和流量')
+  if (await copyText(link)) toast.success('查询链接已复制')
   else toast.error('复制失败：' + link)
 }
 
-const filters: { key: 'all' | ShareStatus; label: string }[] = [
+const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
   { key: 'all', label: '全部' },
   { key: 'active', label: STATUS_LABEL.active },
   { key: 'quota', label: STATUS_LABEL.quota },
@@ -128,165 +149,169 @@ const filters: { key: 'all' | ShareStatus; label: string }[] = [
 </script>
 
 <template>
-  <div class="page">
-    <section class="stats">
-      <div class="stat"><Users /><div><strong>{{ counts.all }}</strong><span>分享账号</span></div></div>
-      <div class="stat"><Activity /><div><strong>{{ counts.active }}</strong><span>正常使用</span></div></div>
-      <div class="stat"><MonitorSmartphone /><div><strong>{{ stats.online }}</strong><span>在线设备</span></div></div>
-      <div class="stat"><HardDriveDownload /><div><strong>{{ formatBytes(stats.traffic) }}</strong><span>本周期流量</span></div></div>
-    </section>
+  <div>
+    <PageHeader title="分享账号" description="给朋友发放登录账号，服务器会用你的源站账号代为登录。">
+      <UiButton variant="primary" @click="openCreate"><Plus />新建<kbd class="kbd-on-inverse">N</kbd></UiButton>
+    </PageHeader>
 
-    <section class="toolbar">
-      <div class="search">
-        <Search />
-        <input v-model="query" class="input" type="search" placeholder="搜索用户名、备注或站点" aria-label="搜索分享账号" />
-      </div>
-      <div class="filters" role="tablist" aria-label="按状态筛选">
-        <button
-          v-for="f in filters"
-          :key="f.key"
-          type="button"
-          role="tab"
-          :aria-selected="filter === f.key"
-          :class="{ active: filter === f.key }"
-          @click="filter = f.key"
-        >
-          {{ f.label }}<span v-if="counts[f.key]" class="count">{{ counts[f.key] }}</span>
+    <dl class="stats">
+      <div><dt>账号</dt><dd class="num">{{ counts.all }}</dd></div>
+      <div><dt>正常</dt><dd class="num">{{ counts.active }}</dd></div>
+      <div><dt>在线设备</dt><dd class="num">{{ online }}</dd></div>
+      <div><dt>本周期流量</dt><dd class="num">{{ formatBytes(traffic) }}</dd></div>
+    </dl>
+
+    <div class="toolbar">
+      <nav class="tabs" aria-label="按状态筛选">
+        <button v-for="f in FILTERS" :key="f.key" type="button" :class="{ on: filter === f.key }" @click="filter = f.key">
+          {{ f.label }}<span v-if="counts[f.key]" class="n">{{ counts[f.key] }}</span>
         </button>
-      </div>
-      <UiButton variant="primary" class="create" @click="openCreate"><Plus />新建分享账号</UiButton>
-    </section>
+      </nav>
+      <label class="search">
+        <Search />
+        <input v-model="query" data-page-search type="search" placeholder="搜索" aria-label="搜索分享账号" />
+        <kbd>/</kbd>
+      </label>
+    </div>
 
-    <div v-if="loading" class="grid">
-      <div v-for="n in 3" :key="n" class="skeleton" />
+    <div v-if="loading" class="table">
+      <div v-for="n in 4" :key="n" class="row skeleton"><span /></div>
     </div>
     <div v-else-if="loadError" class="empty">
       <p>{{ loadError }}</p>
       <UiButton @click="load()">重试</UiButton>
     </div>
     <div v-else-if="!users.length" class="empty">
-      <Users class="big" />
       <h2>还没有分享账号</h2>
-      <p>给朋友建一个账号，他用这个账号在 Emby 客户端登录就能看片。服务器会替他登录源站，你的源站账号密码不会给出去。</p>
-      <UiButton variant="primary" @click="openCreate"><Plus />新建第一个分享账号</UiButton>
+      <p>新建一个账号发给朋友，他就能在 Emby 客户端里登录你的服务器。</p>
+      <UiButton variant="primary" @click="openCreate"><Plus />新建分享账号</UiButton>
     </div>
-    <div v-else-if="!visible.length" class="empty small">
-      <p>没有符合条件的分享账号。</p>
+    <div v-else class="table" role="table" aria-label="分享账号列表">
+      <div class="row head" role="row">
+        <span role="columnheader">账号</span>
+        <span role="columnheader">状态</span>
+        <span role="columnheader">流量</span>
+        <span role="columnheader">剩余</span>
+        <span role="columnheader">设备</span>
+        <span role="columnheader" class="sr-only">操作</span>
+      </div>
+      <TransitionGroup name="list">
+        <div
+          v-for="user in visible"
+          :key="user.id"
+          class="row item"
+          :class="{ active: selectedId === user.id, dim: user.status !== 'active' }"
+          role="row"
+          tabindex="0"
+          @click="selectedId = user.id"
+          @keydown.enter="selectedId = user.id"
+        >
+          <span class="who" role="cell">
+            <span class="name">{{ user.username }}</span>
+            <span class="sub">{{ user.note || user.sites.map(s => s.site_name).join('、') }}</span>
+          </span>
+          <span class="status" role="cell"><span class="dot" :class="STATUS_TONE[user.status]" />{{ STATUS_LABEL[user.status] }}</span>
+          <span class="traffic" role="cell">
+            <span class="num">{{ formatBytes(user.traffic_used) }}<span class="faint"> / {{ user.traffic_quota ? formatBytes(user.traffic_quota) : '∞' }}</span></span>
+            <UiProgress v-if="user.traffic_quota" :value="user.traffic_used" :max="user.traffic_quota" />
+          </span>
+          <span class="num expiry" role="cell" :class="expiryText(user).tone">{{ expiryText(user).text }}</span>
+          <span class="num devices" role="cell">{{ user.session_count }}<span class="faint">{{ user.max_devices ? ` / ${user.max_devices}` : '' }}</span></span>
+          <span class="act" role="cell">
+            <UiButton variant="ghost" size="sm" icon aria-label="复制分享信息" title="复制分享信息" @click.stop="copyShare(user)"><Copy /></UiButton>
+          </span>
+          <span class="mobile-meta" aria-hidden="true">
+            {{ formatBytes(user.traffic_used) }}{{ user.traffic_quota ? ' / ' + formatBytes(user.traffic_quota) : '' }} · {{ expiryText(user).text }} · {{ user.session_count }} 台在线
+          </span>
+        </div>
+      </TransitionGroup>
+      <p v-if="!visible.length" class="none">没有符合条件的账号</p>
     </div>
-    <TransitionGroup v-else name="list" tag="div" class="grid">
-      <ShareUserCard
-        v-for="user in visible"
-        :key="user.id"
-        :user="user"
-        @edit="openEdit(user)"
-        @manage="openManage(user)"
-        @copy-share="copyShare(user)"
-        @copy-portal="copyPortal(user)"
-      />
-    </TransitionGroup>
 
     <button type="button" class="fab" aria-label="新建分享账号" @click="openCreate"><Plus /></button>
 
-    <ShareUserForm :open="formOpen" :user="editing" :sites="sites" @close="formOpen = false" @saved="onSaved" />
-    <ShareUserManage
-      :open="manageOpen"
-      :user="managing"
-      @close="manageOpen = false"
+    <ShareUserDetail
+      :open="!!selected && !formOpen"
+      :user="selected"
+      @close="selectedId = null"
+      @edit="selected && openEdit(selected)"
       @changed="load(true)"
       @deleted="
         () => {
-          manageOpen = false
+          selectedId = null
           load(true)
         }
       "
+      @copy-share="selected && copyShare(selected)"
+      @copy-portal="selected && copyPortal(selected)"
     />
+    <ShareUserForm :open="formOpen" :user="editing" :sites="sites" @close="formOpen = false" @saved="onSaved" />
     <ShareTextDialog :open="textOpen" :text="shareText" :created="justCreated" @close="textOpen = false" />
   </div>
 </template>
 
 <style scoped>
-.page { display: flex; flex-direction: column; gap: 18px; position: relative; }
-.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.stat {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-}
-.stat > svg { width: 20px; height: 20px; padding: 8px; box-sizing: content-box; border-radius: 10px; background: var(--accent-soft); color: var(--accent); }
-.stat div { display: flex; flex-direction: column; min-width: 0; }
-.stat strong { font-size: 19px; font-weight: 600; white-space: nowrap; }
-.stat span { font-size: 12px; color: var(--text-3); }
-.toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.search { position: relative; flex: 1 1 240px; max-width: 360px; }
-.search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--text-3); }
-.search .input { padding-left: 34px; }
-.filters { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow-x: auto; scrollbar-width: none; }
-.filters::-webkit-scrollbar { display: none; }
-.filters button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 13px;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: all var(--dur) var(--ease);
-}
-.filters button.active { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
-.count { font-size: 11px; padding: 0 6px; border-radius: 999px; background: var(--surface-hover); color: var(--text-3); }
-.filters button.active .count { background: var(--accent); color: var(--on-accent); }
-.create { margin-left: auto; }
-.grid { position: relative; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-.skeleton { height: 290px; border-radius: var(--radius-lg); background: linear-gradient(90deg, var(--surface) 0%, var(--surface-hover) 50%, var(--surface) 100%); background-size: 200% 100%; animation: shimmer 1.2s infinite linear; }
-@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-.empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  padding: 56px 20px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-lg);
-  text-align: center;
-}
-.empty.small { padding: 32px 20px; }
-.empty .big { width: 40px; height: 40px; color: var(--accent); }
-.empty h2 { margin: 6px 0 0; font-size: 18px; }
-.empty p { max-width: 440px; margin: 0; color: var(--text-2); line-height: 1.7; }
+.kbd-on-inverse { margin-left: 4px; border-color: color-mix(in srgb, var(--inverse-text) 25%, transparent); color: color-mix(in srgb, var(--inverse-text) 60%, transparent); }
+.stats { display: flex; gap: 48px; margin: 0 0 32px; }
+.stats div { display: flex; flex-direction: column; gap: 2px; }
+.stats dt { font-size: 12.5px; color: var(--text-3); }
+.stats dd { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); }
+.tabs { display: flex; gap: 22px; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; white-space: nowrap; cursor: pointer; transition: color var(--dur) var(--ease); }
+.tabs button:hover { color: var(--text-2); }
+.tabs button.on { color: var(--text); }
+.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.n { font-size: 11.5px; color: var(--text-3); }
+.search { display: flex; align-items: center; gap: 8px; width: 220px; height: 30px; padding: 0 8px; border-radius: var(--radius-sm); color: var(--text-3); transition: background var(--dur) var(--ease); }
+.search:focus-within { background: var(--surface-hover); }
+.search svg { width: 14px; height: 14px; }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13.5px; color: var(--text); }
+.search input::placeholder { color: var(--text-3); }
+
+.table { position: relative; }
+.row { display: grid; grid-template-columns: minmax(0, 2.2fr) 100px minmax(0, 1.6fr) 90px 70px 40px; align-items: center; gap: 16px; padding: 0 12px; }
+.row.head { height: 38px; font-size: 12px; color: var(--text-3); }
+.row.item { height: 60px; margin: 0 -12px; padding: 0 24px; border-radius: var(--radius); cursor: pointer; outline: none; transition: background var(--dur) var(--ease); }
+.row.item + .row.item { box-shadow: inset 0 1px 0 var(--border); }
+.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-hover); box-shadow: none; }
+.row.item:hover + .row.item, .row.item.active + .row.item { box-shadow: none; }
+.row.dim .who .name { color: var(--text-2); }
+.who { display: flex; flex-direction: column; min-width: 0; }
+.name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub { font-size: 12.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.traffic { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.expiry, .devices { font-size: 13px; }
+.expiry.warn { color: var(--warn); }
+.expiry.bad { color: var(--bad); }
+.act { opacity: 0; transition: opacity var(--dur) var(--ease); }
+.row.item:hover .act, .row.item.active .act, .row.item:focus-within .act { opacity: 1; }
+.mobile-meta { display: none; }
+.skeleton { height: 60px; }
+.skeleton span { grid-column: 1 / -1; height: 14px; width: 40%; border-radius: 4px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+.none { padding: 32px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; text-align: center; }
+.empty h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.empty p { max-width: 380px; margin: 0 0 8px; color: var(--text-2); }
 .fab { display: none; }
 
-@media (max-width: 960px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 860px) {
-  .create { display: none; }
-  .search { max-width: none; flex-basis: 100%; }
-  .filters { width: 100%; }
-  .grid { grid-template-columns: minmax(0, 1fr); }
-  .fab {
-    position: fixed;
-    right: 18px;
-    bottom: calc(80px + env(safe-area-inset-bottom));
-    z-index: 25;
-    display: grid;
-    place-items: center;
-    width: 54px;
-    height: 54px;
-    border: 0;
-    border-radius: 18px;
-    background: var(--accent-strong);
-    color: var(--on-accent);
-    box-shadow: 0 8px 24px rgba(40, 80, 200, 0.4);
-    cursor: pointer;
-  }
-  .fab svg { width: 24px; height: 24px; }
-  .stat { padding: 12px; }
-  .stat > svg { display: none; }
+  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; margin-bottom: 24px; }
+  .toolbar { flex-direction: column-reverse; align-items: stretch; gap: 8px; }
+  .search { width: 100%; height: 36px; background: var(--surface-hover); }
+  .search kbd { display: none; }
+  .row.head { display: none; }
+  .row.item { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'who status' 'meta meta'; height: auto; gap: 4px 12px; padding: 13px 16px; margin: 0 -16px; border-radius: 0; }
+  .who { grid-area: who; }
+  .status { grid-area: status; }
+  .traffic, .expiry, .devices, .act { display: none; }
+  .who .sub { display: none; }
+  .mobile-meta { grid-area: meta; display: block; font-size: 12.5px; color: var(--text-3); }
+  .fab { position: fixed; right: 18px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 25; display: grid; place-items: center; width: 52px; height: 52px; border: 0; border-radius: 50%; background: var(--inverse-bg); color: var(--inverse-text); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3); cursor: pointer; }
+  .fab svg { width: 22px; height: 22px; }
 }
 </style>

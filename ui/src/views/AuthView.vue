@@ -112,25 +112,15 @@ async function submit() {
   place-items: center;
   min-height: 100vh;
   padding: 24px 16px;
-  background:
-    radial-gradient(900px 500px at 15% -10%, var(--accent-soft), transparent 60%),
-    radial-gradient(700px 400px at 110% 110%, var(--good-soft), transparent 60%),
-    var(--bg);
+  background: var(--bg);
 }
-.card {
-  width: min(400px, 100%);
-  padding: 28px 26px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  box-shadow: var(--shadow);
-}
-.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
-.brand img { width: 40px; height: 40px; }
-.brand h1 { margin: 0; font-size: 22px; letter-spacing: 0.06em; }
-.brand p { margin: 0; color: var(--text-3); font-size: 13px; }
-.form { display: flex; flex-direction: column; gap: 14px; }
-.form h2 { margin: 0 0 2px; font-size: 16px; font-weight: 600; }
+.card { width: min(360px, 100%); }
+.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 36px; }
+.brand img { width: 30px; height: 30px; }
+.brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.04em; }
+.brand p { margin: 0; color: var(--text-3); font-size: 12.5px; }
+.form { display: flex; flex-direction: column; gap: 16px; }
+.form h2 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -0.025em; }
 .secret { position: relative; }
 .secret .input { padding-right: 42px; }
 .eye {

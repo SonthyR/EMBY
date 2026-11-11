@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import logo from '@/assets/logo.svg'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { LogOut, Moon, Sun, SunMoon } from '@lucide/vue'
+import { LogOut, Moon, Sun, SunMoon, Search } from '@lucide/vue'
+import logo from '@/assets/logo.svg'
 import NavIcon from '@/components/NavIcon.vue'
+import CommandPalette from '@/components/CommandPalette.vue'
 import { navRoutes, type NavMeta } from '@/router'
 import { logout, session } from '@/stores/session'
 import { cycleTheme, themeMode } from '@/stores/theme'
+import { commandOpen } from '@/stores/command'
 
 const route = useRoute()
 const meta = computed(() => route.meta as unknown as NavMeta)
@@ -14,7 +16,7 @@ const mainNav = navRoutes.filter(r => (r.meta as unknown as NavMeta).nav === 'ma
 const manageNav = navRoutes.filter(r => (r.meta as unknown as NavMeta).nav === 'manage')
 const mobileNav = navRoutes.filter(r => (r.meta as unknown as NavMeta).mobile)
 const themeLabel = computed(() => ({ system: '跟随系统', light: '浅色', dark: '深色' })[themeMode.value])
-const version = 'v1.0.0'
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
 </script>
 
 <template>
@@ -22,47 +24,43 @@ const version = 'v1.0.0'
     <aside class="sidebar">
       <div class="brand">
         <img :src="logo" alt="" />
-        <div>
-          <strong>云渡</strong>
-          <small>{{ version }}</small>
-        </div>
+        <span>云渡</span>
       </div>
+      <button type="button" class="search" @click="commandOpen = true">
+        <Search />
+        <span>搜索或跳转</span>
+        <kbd>{{ isMac ? '⌘' : 'Ctrl' }}</kbd><kbd>K</kbd>
+      </button>
       <nav aria-label="主导航">
-        <p class="section">服务</p>
-        <RouterLink v-for="item in mainNav" :key="item.path" :to="item.path" class="nav-link">
+        <RouterLink v-for="item in mainNav" :key="item.path" :to="item.path" class="link">
           <NavIcon :name="(item.meta as any).icon" />
           <span>{{ (item.meta as any).title }}</span>
         </RouterLink>
         <p class="section">管理</p>
-        <RouterLink v-for="item in manageNav" :key="item.path" :to="item.path" class="nav-link">
+        <RouterLink v-for="item in manageNav" :key="item.path" :to="item.path" class="link">
           <NavIcon :name="(item.meta as any).icon" />
           <span>{{ (item.meta as any).title }}</span>
         </RouterLink>
       </nav>
-      <div class="sidebar-foot">
-        <button class="nav-link" type="button" :title="`主题：${themeLabel}`" @click="cycleTheme">
-          <SunMoon v-if="themeMode === 'system'" /><Sun v-else-if="themeMode === 'light'" /><Moon v-else />
-          <span>主题：{{ themeLabel }}</span>
-        </button>
-        <RouterLink to="/account" class="nav-link account">
+      <div class="foot">
+        <RouterLink to="/account" class="user">
           <span class="avatar">{{ (session.username || 'A').slice(0, 1).toUpperCase() }}</span>
-          <span class="who">{{ session.username || '管理员' }}</span>
+          <span class="name">{{ session.username || '管理员' }}</span>
         </RouterLink>
-        <button class="nav-link" type="button" @click="logout"><LogOut /><span>退出登录</span></button>
+        <button type="button" class="icon" :title="`主题：${themeLabel}`" :aria-label="`主题：${themeLabel}`" @click="cycleTheme">
+          <SunMoon v-if="themeMode === 'system'" /><Sun v-else-if="themeMode === 'light'" /><Moon v-else />
+        </button>
+        <button type="button" class="icon" title="退出登录" aria-label="退出登录" @click="logout"><LogOut /></button>
       </div>
     </aside>
 
     <div class="main">
-      <header class="topbar">
-        <h1>{{ meta.title }}</h1>
-        <div class="top-actions">
-          <button class="icon-btn mobile-only" type="button" :aria-label="`主题：${themeLabel}`" @click="cycleTheme">
-            <SunMoon v-if="themeMode === 'system'" /><Sun v-else-if="themeMode === 'light'" /><Moon v-else />
-          </button>
-          <RouterLink to="/account" class="icon-btn mobile-only" aria-label="账户">
-            <span class="avatar sm">{{ (session.username || 'A').slice(0, 1).toUpperCase() }}</span>
-          </RouterLink>
-        </div>
+      <header class="mobile-bar">
+        <span class="mobile-title"><img :src="logo" alt="" />云渡</span>
+        <button type="button" class="icon" aria-label="搜索" @click="commandOpen = true"><Search /></button>
+        <button type="button" class="icon" :aria-label="`主题：${themeLabel}`" @click="cycleTheme">
+          <SunMoon v-if="themeMode === 'system'" /><Sun v-else-if="themeMode === 'light'" /><Moon v-else />
+        </button>
       </header>
       <main class="content">
         <RouterView v-slot="{ Component }">
@@ -79,6 +77,7 @@ const version = 'v1.0.0'
         <span>{{ (item.meta as any).title }}</span>
       </RouterLink>
     </nav>
+    <CommandPalette />
   </div>
 </template>
 
@@ -89,87 +88,77 @@ const version = 'v1.0.0'
   top: 0;
   display: flex;
   flex-direction: column;
-  flex: 0 0 232px;
+  flex: 0 0 228px;
   height: 100vh;
-  padding: 18px 12px;
+  padding: 16px 12px 12px;
   border-right: 1px solid var(--border);
-  background: var(--bg-elev);
 }
-.brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; }
-.brand img { width: 30px; height: 30px; }
-.brand strong { display: block; font-size: 17px; letter-spacing: 0.04em; }
-.brand small { color: var(--text-3); font-size: 11px; }
-.section { margin: 14px 10px 6px; font-size: 11px; color: var(--text-3); letter-spacing: 0.08em; }
-.nav-link {
+.brand { display: flex; align-items: center; gap: 9px; padding: 4px 8px 16px; font-weight: 600; font-size: 15px; letter-spacing: 0.02em; }
+.brand img { width: 22px; height: 22px; }
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  margin: 0 0 14px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease);
+}
+.search:hover { border-color: var(--border-strong); }
+.search svg { width: 14px; height: 14px; }
+.search span { flex: 1; text-align: left; }
+.section { margin: 18px 8px 6px; font-size: 12px; color: var(--text-3); }
+.link {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: 100%;
-  min-height: 38px;
-  padding: 0 10px;
-  border: 0;
+  height: 32px;
+  padding: 0 8px;
   border-radius: var(--radius-sm);
-  background: transparent;
   color: var(--text-2);
-  font-size: 14px;
-  text-align: left;
-  cursor: pointer;
+  font-size: 13.5px;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.nav-link :deep(svg) { width: 18px; height: 18px; flex: 0 0 18px; }
-.nav-link:hover { background: var(--surface-hover); color: var(--text); }
-.nav-link.router-link-active { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
-.sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: 2px; padding-top: 12px; border-top: 1px solid var(--border); }
-.avatar {
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 600;
-}
-.avatar.sm { width: 28px; height: 28px; }
-.who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link :deep(svg) { width: 16px; height: 16px; stroke-width: 1.7; }
+.link:hover { background: var(--surface-hover); color: var(--text); }
+.link.router-link-active { background: var(--surface-hover); color: var(--text); font-weight: 500; }
+.foot { margin-top: auto; display: flex; align-items: center; gap: 2px; padding-top: 10px; border-top: 1px solid var(--border); }
+.user { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 6px; border-radius: var(--radius-sm); }
+.user:hover { background: var(--surface-hover); }
+.avatar { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--inverse-bg); color: var(--inverse-text); font-size: 11px; font-weight: 600; }
+.name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.icon { display: grid; place-items: center; width: 30px; height: 30px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; }
+.icon:hover { background: var(--surface-hover); color: var(--text); }
+.icon :deep(svg) { width: 16px; height: 16px; stroke-width: 1.7; }
 
-.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.topbar {
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 60px;
-  padding: 0 28px;
-  background: color-mix(in srgb, var(--bg) 85%, transparent);
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--border);
-}
-.topbar h1 { margin: 0; font-size: 18px; font-weight: 600; }
-.top-actions { display: flex; gap: 6px; }
-.icon-btn {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-2);
-  cursor: pointer;
-}
-.icon-btn :deep(svg) { width: 19px; height: 19px; }
-.content { flex: 1; width: 100%; max-width: 1280px; margin: 0 auto; padding: 24px 28px 48px; }
-.mobile-only, .tabbar { display: none; }
+.main { flex: 1; min-width: 0; }
+.content { max-width: 1120px; margin: 0 auto; padding: 44px 40px 64px; }
+.mobile-bar, .tabbar { display: none; }
 
 @media (max-width: 860px) {
   .sidebar { display: none; }
-  .topbar { height: 54px; padding: 0 16px; padding-top: env(safe-area-inset-top); }
-  .mobile-only { display: grid; }
-  .content { padding: 16px 16px calc(84px + env(safe-area-inset-bottom)); }
+  .mobile-bar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 50px;
+    padding: env(safe-area-inset-top) 10px 0 18px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(1.4) blur(14px);
+    border-bottom: 1px solid var(--border);
+  }
+  .mobile-title { flex: 1; display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; letter-spacing: 0.02em; }
+  .mobile-title img { width: 20px; height: 20px; }
+  .content { padding: 20px 16px calc(88px + env(safe-area-inset-bottom)); }
   .tabbar {
     position: fixed;
     left: 0;
@@ -177,23 +166,13 @@ const version = 'v1.0.0'
     bottom: 0;
     z-index: 30;
     display: flex;
-    padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
-    background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-    backdrop-filter: blur(12px);
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(1.4) blur(14px);
     border-top: 1px solid var(--border);
   }
-  .tab {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    padding: 6px 0;
-    border-radius: var(--radius-sm);
-    color: var(--text-3);
-    font-size: 11px;
-  }
-  .tab :deep(svg) { width: 21px; height: 21px; }
-  .tab.router-link-active { color: var(--accent); }
+  .tab { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 5px 0; color: var(--text-3); font-size: 10.5px; }
+  .tab :deep(svg) { width: 20px; height: 20px; stroke-width: 1.6; }
+  .tab.router-link-active { color: var(--text); }
 }
 </style>

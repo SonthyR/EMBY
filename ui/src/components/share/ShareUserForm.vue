@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { Dices } from '@lucide/vue'
-import UiDialog from '@/components/ui/UiDialog.vue'
+import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
@@ -32,7 +32,6 @@ const editing = computed(() => !!props.user)
 function usable(siteId: number) {
   return (accounts[siteId] || []).filter(a => a.password || a.password_configured)
 }
-
 async function loadAccounts() {
   await Promise.all(
     props.sites.map(async site => {
@@ -73,25 +72,16 @@ watch(
 )
 
 function setExpiry(days: number | null) {
-  if (days === null) {
-    form.expires = ''
-    return
-  }
+  if (days === null) return (form.expires = '')
   const base = form.expires && new Date(form.expires + 'T00:00:00') > new Date() ? new Date(form.expires + 'T00:00:00') : new Date()
   base.setDate(base.getDate() + days)
   form.expires = `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, '0')}-${String(base.getDate()).padStart(2, '0')}`
 }
-
 function randomPassword() {
   const alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  const values = crypto.getRandomValues(new Uint32Array(10))
-  form.password = Array.from(values, v => alphabet[v % alphabet.length]).join('')
+  form.password = Array.from(crypto.getRandomValues(new Uint32Array(10)), v => alphabet[v % alphabet.length]).join('')
 }
-
-function toInt(value: string | number) {
-  const text = String(value).trim()
-  return text === '' ? 0 : Number(text)
-}
+const toInt = (value: string | number) => (String(value).trim() === '' ? 0 : Number(String(value).trim()))
 
 function validate(): ShareUserInput | null {
   for (const key of Object.keys(errors)) delete errors[key]
@@ -138,72 +128,66 @@ async function save() {
 </script>
 
 <template>
-  <UiDialog :open="open" :title="editing ? '编辑分享账号' : '新建分享账号'" :width="620" :dismissible="!saving" @close="emit('close')">
+  <UiDrawer :open="open" :title="editing ? '编辑分享账号' : '新建分享账号'" :subtitle="editing ? user?.username : '朋友会用这个账号登录 Emby 客户端'" :width="520" :dismissible="!saving" @close="emit('close')">
     <form class="form" novalidate @submit.prevent="save">
-      <section>
-        <h3>登录信息</h3>
-        <div class="grid">
-          <UiField label="用户名" for="su-name" :error="errors.username" help="朋友在 Emby 客户端里填的用户名。">
-            <input id="su-name" v-model="form.username" class="input" maxlength="64" autocapitalize="none" spellcheck="false" autocomplete="off" :autofocus="!editing" />
-          </UiField>
-          <UiField label="密码" for="su-pass" :error="errors.password" :help="editing ? '不修改请留空；修改后已登录设备会掉线。' : '留空自动生成。'">
-            <div class="with-btn">
-              <input id="su-pass" v-model="form.password" class="input mono" maxlength="72" autocapitalize="none" spellcheck="false" autocomplete="off" :placeholder="editing ? '不修改' : '自动生成'" />
-              <UiButton size="sm" variant="ghost" aria-label="随机生成密码" title="随机生成" @click="randomPassword"><Dices /></UiButton>
-            </div>
-          </UiField>
-        </div>
-      </section>
-
-      <section>
-        <h3>有效期与流量</h3>
-        <UiField label="到期日期" for="su-exp" help="留空表示永久有效。">
-          <div class="expiry">
-            <input id="su-exp" v-model="form.expires" class="input" type="date" />
-            <div class="chips">
-              <button type="button" @click="setExpiry(30)">+30 天</button>
-              <button type="button" @click="setExpiry(90)">+90 天</button>
-              <button type="button" @click="setExpiry(365)">+1 年</button>
-              <button type="button" @click="setExpiry(null)">永久</button>
-            </div>
+      <fieldset>
+        <legend>登录</legend>
+        <UiField label="用户名" for="su-name" :error="errors.username">
+          <input id="su-name" v-model="form.username" class="input" maxlength="64" autocapitalize="none" spellcheck="false" autocomplete="off" :autofocus="!editing" />
+        </UiField>
+        <UiField label="密码" for="su-pass" :error="errors.password" :help="editing ? '留空则不修改。修改后已登录的设备会掉线。' : '留空会自动生成。'">
+          <div class="with-btn">
+            <input id="su-pass" v-model="form.password" class="input mono" maxlength="72" autocapitalize="none" spellcheck="false" autocomplete="off" :placeholder="editing ? '不修改' : '自动生成'" />
+            <UiButton icon aria-label="随机生成密码" title="随机生成" @click="randomPassword"><Dices /></UiButton>
           </div>
         </UiField>
+      </fieldset>
+
+      <fieldset>
+        <legend>有效期</legend>
+        <UiField label="到期日期" for="su-exp" help="留空表示永久有效。">
+          <input id="su-exp" v-model="form.expires" class="input" type="date" />
+          <div class="chips">
+            <button type="button" @click="setExpiry(30)">+ 30 天</button>
+            <button type="button" @click="setExpiry(90)">+ 90 天</button>
+            <button type="button" @click="setExpiry(365)">+ 1 年</button>
+            <button type="button" @click="setExpiry(null)">永久</button>
+          </div>
+        </UiField>
+      </fieldset>
+
+      <fieldset>
+        <legend>额度与限制</legend>
         <div class="grid">
-          <UiField label="流量额度（GB）" for="su-quota" :error="errors.quota" help="上下行合计，留空不限。">
-            <input id="su-quota" v-model="form.quotaGB" class="input" type="number" min="0" step="0.01" placeholder="不限" inputmode="decimal" />
+          <UiField label="流量额度" for="su-quota" :error="errors.quota" help="GB，上下行合计">
+            <input id="su-quota" v-model="form.quotaGB" class="input num" type="number" min="0" step="0.01" placeholder="不限" inputmode="decimal" />
           </UiField>
-          <UiField label="每月自动重置" for="su-reset" help="到这天自动把已用流量清零。">
+          <UiField label="每月重置" for="su-reset" help="到这天清零已用流量">
             <select id="su-reset" v-model.number="form.resetDay" class="select">
-              <option :value="0">不自动重置</option>
+              <option :value="0">不重置</option>
               <option v-for="day in 28" :key="day" :value="day">每月 {{ day }} 日</option>
             </select>
           </UiField>
-        </div>
-      </section>
-
-      <section>
-        <h3>使用限制</h3>
-        <div class="grid">
-          <UiField label="同时在线设备" for="su-dev" :error="errors.devices" help="超出时踢掉最久没用的设备。">
-            <input id="su-dev" v-model="form.maxDevices" class="input" type="number" min="0" max="100" step="1" placeholder="不限" inputmode="numeric" />
+          <UiField label="同时在线" for="su-dev" :error="errors.devices" help="台；超出时踢掉最久没用的">
+            <input id="su-dev" v-model="form.maxDevices" class="input num" type="number" min="0" max="100" step="1" placeholder="不限" inputmode="numeric" />
           </UiField>
-          <UiField label="限速（Mbps）" for="su-speed" :error="errors.speed" help="所有设备合计。1080p 约 10–20，4K 约 40–80。">
-            <input id="su-speed" v-model="form.speed" class="input" type="number" min="0" step="1" placeholder="不限" inputmode="numeric" />
+          <UiField label="限速" for="su-speed" :error="errors.speed" help="Mbps，所有设备合计">
+            <input id="su-speed" v-model="form.speed" class="input num" type="number" min="0" step="1" placeholder="不限" inputmode="numeric" />
           </UiField>
         </div>
-      </section>
+      </fieldset>
 
-      <section>
-        <h3>可用站点</h3>
-        <p v-if="!sites.length" class="faint">还没有站点，请先在“站点”里添加。</p>
+      <fieldset>
+        <legend>可用站点</legend>
+        <p v-if="!sites.length" class="faint">还没有站点。</p>
         <div class="sites">
-          <div v-for="site in sites" :key="site.id" class="site" :class="{ on: selected[site.id]?.on }">
-            <label class="site-check">
+          <div v-for="site in sites" :key="site.id" class="site">
+            <label class="check">
               <input v-model="selected[site.id].on" type="checkbox" />
-              <span>{{ site.name }}</span>
-              <small v-if="!site.enabled" class="faint">已停用</small>
+              <span class="site-name">{{ site.name }}</span>
+              <span v-if="!site.enabled" class="faint">已停用</span>
             </label>
-            <select v-if="selected[site.id]?.on" v-model.number="selected[site.id].account" class="select" :disabled="!usable(site.id).length" aria-label="代登用的源站账号">
+            <select v-if="selected[site.id]?.on" v-model.number="selected[site.id].account" class="select compact" :disabled="!usable(site.id).length" aria-label="代登用的源站账号">
               <option :value="0">自动选择源站账号</option>
               <option v-for="account in usable(site.id)" :key="account.id" :value="account.id">{{ account.account_name || account.username }}</option>
             </select>
@@ -211,51 +195,43 @@ async function save() {
           </div>
         </div>
         <p v-if="errors.sites" class="err">{{ errors.sites }}</p>
-      </section>
+      </fieldset>
 
-      <section class="last">
+      <fieldset>
+        <legend>其他</legend>
         <UiField label="备注" for="su-note">
           <input id="su-note" v-model="form.note" class="input" maxlength="1000" placeholder="比如朋友的名字" />
         </UiField>
-        <UiSwitch v-model="form.enabled" label="启用这个账号" />
-      </section>
+        <UiSwitch v-model="form.enabled" label="启用" description="关闭后无法登录，在线设备会立即断开" />
+      </fieldset>
       <button type="submit" hidden />
     </form>
     <template #footer>
       <UiButton :disabled="saving" @click="emit('close')">取消</UiButton>
-      <UiButton variant="primary" :loading="saving" @click="save">{{ editing ? '保存' : '创建' }}</UiButton>
+      <UiButton variant="primary" :loading="saving" @click="save">{{ editing ? '保存更改' : '创建账号' }}</UiButton>
     </template>
-  </UiDialog>
+  </UiDrawer>
 </template>
 
 <style scoped>
-.form { display: flex; flex-direction: column; gap: 22px; }
-section { display: flex; flex-direction: column; gap: 12px; }
-h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-3); letter-spacing: 0.04em; }
-.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.form { display: flex; flex-direction: column; gap: 4px; }
+fieldset { display: flex; flex-direction: column; gap: 14px; margin: 0; padding: 18px 0; border: 0; border-bottom: 1px solid var(--border); min-width: 0; }
+fieldset:first-of-type { padding-top: 0; }
+fieldset:last-of-type { border-bottom: 0; }
+legend { float: left; width: 100%; margin-bottom: 14px; padding: 0; font-size: 12px; font-weight: 500; color: var(--text-3); }
+legend + * { clear: both; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 14px; }
 .with-btn { display: flex; gap: 6px; }
-.expiry { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.expiry .input { width: 180px; flex: 0 0 auto; }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chips button {
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-2);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all var(--dur) var(--ease);
-}
-.chips button:hover { border-color: var(--accent); color: var(--accent); }
-.sites { display: flex; flex-direction: column; gap: 8px; }
-.site { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
-.site.on { border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); background: var(--accent-soft); }
-.site-check { display: flex; align-items: center; gap: 10px; cursor: pointer; }
-.warn { margin: 0; font-size: 12px; color: var(--warn); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.chips button { height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-2); font-size: 12px; cursor: pointer; transition: all var(--dur) var(--ease); }
+.chips button:hover { border-color: var(--border-strong); color: var(--text); }
+.sites { display: flex; flex-direction: column; }
+.site { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.site:last-child { border-bottom: 0; }
+.check { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; }
+.site-name { flex: 1; }
+.select.compact { height: 32px; font-size: 13px; margin-left: 25px; width: calc(100% - 25px); }
+.warn { margin: 0 0 0 25px; font-size: 12px; color: var(--warn); }
 .err { margin: 0; font-size: 12px; color: var(--bad); }
-.last { gap: 16px; }
-@media (max-width: 640px) {
-  .grid { grid-template-columns: minmax(0, 1fr); }
-  .expiry .input { width: 100%; }
-}
+@media (max-width: 520px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

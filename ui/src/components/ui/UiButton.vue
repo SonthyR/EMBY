@@ -7,6 +7,7 @@ withDefaults(
     disabled?: boolean
     type?: 'button' | 'submit'
     block?: boolean
+    icon?: boolean
   }>(),
   { variant: 'secondary', size: 'md', type: 'button' },
 )
@@ -16,8 +17,9 @@ withDefaults(
   <button
     :type="type"
     class="btn"
-    :class="[`btn-${variant}`, `btn-${size}`, { 'btn-block': block, 'is-loading': loading }]"
+    :class="[`btn-${variant}`, `btn-${size}`, { 'btn-block': block, 'btn-icon': icon }]"
     :disabled="disabled || loading"
+    :aria-busy="loading || undefined"
   >
     <span v-if="loading" class="spinner" aria-hidden="true" />
     <slot />
@@ -33,32 +35,27 @@ withDefaults(
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   font-weight: 500;
+  letter-spacing: -0.005em;
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
-  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), transform 80ms var(--ease);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), opacity var(--dur) var(--ease);
 }
-.btn:active:not(:disabled) { transform: scale(0.97); }
-.btn:disabled { opacity: 0.55; cursor: not-allowed; }
-.btn-md { min-height: 38px; padding: 0 14px; font-size: 14px; }
-.btn-sm { min-height: 32px; padding: 0 10px; font-size: 13px; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-md { height: 34px; padding: 0 13px; font-size: 13.5px; }
+.btn-sm { height: 28px; padding: 0 9px; font-size: 13px; border-radius: var(--radius-xs); }
+.btn-icon.btn-md { width: 34px; padding: 0; }
+.btn-icon.btn-sm { width: 28px; padding: 0; }
 .btn-block { width: 100%; }
-.btn :deep(svg) { width: 16px; height: 16px; flex: 0 0 16px; }
-.btn-primary { background: var(--accent-strong); color: var(--on-accent); }
-.btn-primary:hover:not(:disabled) { background: var(--accent); }
-.btn-secondary { background: var(--surface-2); border-color: var(--border); color: var(--text); }
-.btn-secondary:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--border-strong); }
+.btn :deep(svg) { width: 15px; height: 15px; flex: 0 0 15px; stroke-width: 1.8; }
+.btn-primary { background: var(--inverse-bg); color: var(--inverse-text); }
+.btn-primary:hover:not(:disabled) { opacity: 0.88; }
+.btn-secondary { background: transparent; border-color: var(--border-strong); color: var(--text); }
+.btn-secondary:hover:not(:disabled) { background: var(--surface-hover); }
 .btn-ghost { background: transparent; color: var(--text-2); }
 .btn-ghost:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
-.btn-danger { background: var(--bad-soft); color: var(--bad); }
-.btn-danger:hover:not(:disabled) { background: var(--bad); color: #fff; }
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid currentColor;
-  border-right-color: transparent;
-  border-radius: 50%;
-  animation: spin 700ms linear infinite;
-}
+.btn-danger { background: transparent; border-color: color-mix(in srgb, var(--bad) 40%, transparent); color: var(--bad); }
+.btn-danger:hover:not(:disabled) { background: var(--bad-soft); }
+.spinner { width: 13px; height: 13px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 700ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>

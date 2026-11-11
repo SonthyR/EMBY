@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 const props = defineProps<{ value: number; max: number }>()
 const percent = computed(() => (props.max > 0 ? Math.min(100, Math.max(0, (props.value / props.max) * 100)) : 0))
-const tone = computed(() => (percent.value >= 100 ? 'bad' : percent.value >= 80 ? 'warn' : 'accent'))
+const tone = computed(() => (percent.value >= 100 ? 'bad' : percent.value >= 85 ? 'warn' : 'normal'))
 </script>
 
 <template>
@@ -12,9 +12,9 @@ const tone = computed(() => (percent.value >= 100 ? 'bad' : percent.value >= 80 
 </template>
 
 <style scoped>
-.progress { height: 6px; border-radius: 999px; background: var(--surface-hover); overflow: hidden; }
-span { display: block; height: 100%; border-radius: inherit; transition: width 400ms var(--ease); }
-.accent { background: var(--accent); }
+.progress { height: 3px; border-radius: 999px; background: var(--border); overflow: hidden; }
+span { display: block; height: 100%; border-radius: inherit; transition: width 500ms var(--ease); }
+.normal { background: var(--text-2); }
 .warn { background: var(--warn); }
 .bad { background: var(--bad); }
 </style>
