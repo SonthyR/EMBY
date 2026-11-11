@@ -6,6 +6,7 @@ import UiSwitch from '@/components/ui/UiSwitch.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import TlsSettings from '@/components/settings/TlsSettings.vue'
 import TelegramSettings from '@/components/settings/TelegramSettings.vue'
+import UpdateSettings from '@/components/settings/UpdateSettings.vue'
 import { api, sitesApi } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -17,6 +18,7 @@ const SECTIONS = [
   { key: 'backup', label: '备份与恢复' },
   { key: 'tls', label: '面板地址与证书' },
   { key: 'telegram', label: 'Telegram 机器人' },
+  { key: 'update', label: '版本更新' },
 ]
 const section = ref('general')
 const settings = ref<Settings | null>(null)
@@ -223,6 +225,7 @@ async function doRestore() {
 
         <TlsSettings v-if="section === 'tls'" />
         <TelegramSettings v-if="section === 'telegram'" />
+        <UpdateSettings v-if="section === 'update'" />
 
         <p v-if="!settings && (section === 'general' || section === 'logs')" class="faint">正在读取…</p>
       </div>
