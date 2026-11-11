@@ -51,7 +51,20 @@ function areaPath(values: number[]) {
   if (!values.length) return ''
   return `${linePath(values)}L${x(values.length - 1).toFixed(1)},${pad.top + innerH.value}L${x(0).toFixed(1)},${pad.top + innerH.value}Z`
 }
-const ticks = computed(() => [0, 0.25, 0.5, 0.75, 1].map(f => ({ value: max.value * f, y: y(max.value * f) })))
+const hasData = computed(() => props.series.some(s => s.values.some(v => v > 0)))
+const ticks = computed(() => {
+  if (!hasData.value) return [{ value: 0, y: y(0) }]
+  // Drop ticks whose label would repeat a neighbour (tiny ranges round alike).
+  const seen = new Set<string>()
+  return [0, 0.5, 1]
+    .map(f => ({ value: max.value * f, y: y(max.value * f) }))
+    .filter(t => {
+      const label = fmt(t.value)
+      if (seen.has(label)) return false
+      seen.add(label)
+      return true
+    })
+})
 const xTicks = computed(() => {
   const n = count.value
   if (n < 2) return []
@@ -83,8 +96,8 @@ const tip = computed(() => {
     <svg :width="width" :height="height" role="img" aria-label="流量趋势图">
       <defs>
         <linearGradient v-for="(s, k) in series" :id="`g${k}`" :key="k" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" :stop-color="s.color" stop-opacity="0.28" />
-          <stop offset="100%" :stop-color="s.color" stop-opacity="0" />
+          <stop offset="0%" :style="{ stopColor: s.color, stopOpacity: 0.18 }" />
+          <stop offset="100%" :style="{ stopColor: s.color, stopOpacity: 0 }" />
         </linearGradient>
       </defs>
       <g class="grid">
@@ -96,11 +109,11 @@ const tip = computed(() => {
       </g>
       <g v-for="(s, k) in series" :key="s.name">
         <path :d="areaPath(s.values)" :fill="`url(#g${k})`" />
-        <path :d="linePath(s.values)" fill="none" :stroke="s.color" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+        <path :d="linePath(s.values)" fill="none" :style="{ stroke: s.color }" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" />
       </g>
       <g v-if="hover !== null">
         <line class="cursor" :x1="x(hover)" :x2="x(hover)" :y1="pad.top" :y2="pad.top + innerH" />
-        <circle v-for="s in series" :key="s.name" :cx="x(hover)" :cy="y(s.values[hover] || 0)" r="4" :fill="s.color" stroke="var(--surface)" stroke-width="2" />
+        <circle v-for="s in series" :key="s.name" :cx="x(hover)" :cy="y(s.values[hover] || 0)" r="3.5" :style="{ fill: s.color, stroke: 'var(--bg)' }" stroke-width="2" />
       </g>
     </svg>
     <div v-if="tip" class="tip" :style="{ left: tip.left + 'px' }">
