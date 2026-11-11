@@ -6,6 +6,7 @@ import UiMenu from '@/components/ui/UiMenu.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SiteDetail from '@/components/sites/SiteDetail.vue'
+import SiteEditor from '@/components/sites/SiteEditor.vue'
 import SiteImportDialog from '@/components/sites/SiteImportDialog.vue'
 import SiteExportDialog from '@/components/sites/SiteExportDialog.vue'
 import ReminderHistoryDialog from '@/components/sites/ReminderHistoryDialog.vue'
@@ -104,9 +105,16 @@ async function copyAddress(site: Site) {
   if (!value) return toast.error('这个站点还没有访问地址')
   if (await copyText(value)) toast.success('访问地址已复制')
 }
+const editorOpen = ref(false)
+const editingSite = ref<Site | null>(null)
 function edit(site?: Site) {
-  // The detailed site editor is still served by the previous panel.
-  location.href = site ? `/#sites/edit/${site.id}` : '/#sites/new'
+  editingSite.value = site || null
+  selectedId.value = null
+  editorOpen.value = true
+}
+function onEditorSaved() {
+  editorOpen.value = false
+  load(true)
 }
 function latencyText(site: Site) {
   const l = latency.value[site.id]
@@ -276,6 +284,7 @@ const menuItems = [
       @test="selected && test(selected)"
       @copy="selected && copyAddress(selected)"
     />
+    <SiteEditor :open="editorOpen" :site="editingSite" :capabilities="capabilities" @close="editorOpen = false" @saved="onEditorSaved" />
     <SiteImportDialog :open="importOpen" :format="importFormat" :data="importData" @close="importOpen = false" @imported="load(true)" />
     <SiteExportDialog :open="exportOpen" @close="exportOpen = false" />
     <ReminderHistoryDialog :open="historyOpen" @close="historyOpen = false" @changed="load(true)" />

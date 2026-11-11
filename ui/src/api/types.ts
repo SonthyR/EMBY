@@ -28,7 +28,10 @@ export interface SiteAccount {
   username: string
   password?: string
   password_configured?: boolean
+  security_password?: string
   expires_at: string
+  note?: string
+  reminder_days?: number | null
 }
 
 export interface ShareUserSite {
