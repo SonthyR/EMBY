@@ -37,8 +37,6 @@ type ShareUser struct {
 	SpeedLimit   int                  `json:"speed_limit"`
 	ResetDay     int                  `json:"traffic_reset_day"`
 	NextResetAt  string               `json:"next_reset_at,omitempty"`
-	PortalPath   string               `json:"portal_path"`
-	PortalURL    string               `json:"portal_url,omitempty"`
 	Sites        []ShareUserSite      `json:"sites"`
 	Sessions     []shareStoredSession `json:"sessions,omitempty"`
 	CreatedAt    string               `json:"created_at"`
@@ -73,13 +71,6 @@ func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
 	return d.getShareUserWhere(`id=?`, id)
 }
 
-func (d *DB) getShareUserByPortalToken(token string) (*storedShareUser, error) {
-	if len(token) != 32 {
-		return nil, sql.ErrNoRows
-	}
-	return d.getShareUserWhere(`portal_token=? AND portal_token<>''`, token)
-}
-
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
@@ -89,9 +80,6 @@ func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) 
 		return nil, err
 	}
 	item.Enabled = enabled != 0
-	if item.portalToken != "" {
-		item.PortalPath = "/share/" + item.portalToken
-	}
 	sites, err := d.shareUserSites(item.ID)
 	if err != nil {
 		return nil, err
@@ -154,6 +142,10 @@ func (a *App) normalizeShareUserInput(input ShareUserInput, creating bool) (Shar
 	input.ExpiresAt = strings.TrimSpace(input.ExpiresAt)
 	if !validShareUsername(input.Username) {
 		return input, errors.New("用户名需要 1–64 个字符，且不能包含空格")
+	}
+	var adminNamed int
+	if err := a.db.db.QueryRow(`SELECT COUNT(*) FROM users WHERE username=? COLLATE NOCASE`, input.Username).Scan(&adminNamed); err == nil && adminNamed > 0 {
+		return input, errors.New("不能和管理员用户名相同")
 	}
 	if input.Password != "" && (len([]rune(input.Password)) < 4 || len(input.Password) > 72) {
 		return input, errors.New("密码需要 4–72 个字符")
@@ -311,11 +303,6 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool) ShareUse
 			view.NextResetAt = next.Format("2006-01-02")
 		}
 	}
-	if view.PortalPath != "" {
-		if origin := a.sharePortalOrigin(); origin != "" {
-			view.PortalURL = origin + view.PortalPath
-		}
-	}
 	view.Status = "active"
 	switch {
 	case !view.Enabled:
@@ -396,8 +383,8 @@ func (a *App) shareUserText(item *storedShareUser) (string, error) {
 			builder.WriteString("- " + site.Name + "：" + line + "\n")
 		}
 	}
-	if view.PortalURL != "" {
-		builder.WriteString("自助查询（到期、流量、地址）：" + view.PortalURL + "\n")
+	if origin := a.sharePortalOrigin(); origin != "" {
+		builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "/app/\n")
 	}
 	builder.WriteString("在 Emby 客户端中添加服务器地址后，用上面的用户名和密码登录。")
 	return builder.String(), nil
@@ -573,25 +560,6 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.jsonOK(w, map[string]string{"text": text})
-	case "reset-portal":
-		if r.Method != http.MethodPost {
-			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		token, err := newSharePortalToken()
-		if err != nil {
-			a.jsonErr(w, http.StatusInternalServerError, "生成链接失败")
-			return
-		}
-		if _, err := a.db.db.Exec(`UPDATE share_users SET portal_token=? WHERE id=?`, token, id); err != nil {
-			a.jsonErr(w, http.StatusInternalServerError, "生成链接失败")
-			return
-		}
-		updated, _ := a.db.getShareUser(id)
-		if updated == nil {
-			updated = item
-		}
-		a.jsonOK(w, a.shareUserView(updated, true))
 	case "kick":
 		if r.Method != http.MethodPost {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")

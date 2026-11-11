@@ -132,12 +132,6 @@ async function copyShare(user: ShareUser) {
     toast.error(errorMessage(error))
   }
 }
-async function copyPortal(user: ShareUser) {
-  const link = user.portal_url || (user.portal_path ? location.origin + user.portal_path : '')
-  if (!link) return toast.error('暂无查询链接')
-  if (await copyText(link)) toast.success('查询链接已复制')
-  else toast.error('复制失败：' + link)
-}
 
 const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
   { key: 'all', label: '全部' },
@@ -243,7 +237,6 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
         }
       "
       @copy-share="selected && copyShare(selected)"
-      @copy-portal="selected && copyPortal(selected)"
     />
     <ShareUserForm :open="formOpen" :user="editing" :sites="sites" @close="formOpen = false" @saved="onSaved" />
     <ShareTextDialog :open="textOpen" :text="shareText" :created="justCreated" @close="textOpen = false" />

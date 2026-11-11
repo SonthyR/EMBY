@@ -122,6 +122,18 @@ export const dashboardApi = {
   trends: (siteId: string, range: string) => api.get<TrendResponse>(`/api/dashboard-trends?site_id=${encodeURIComponent(siteId)}&range=${encodeURIComponent(range)}`),
 }
 
+export interface MyAccount extends ShareUser {
+  servers: { name: string; addresses: string[] }[]
+}
+
+export const meApi = {
+  login: (username: string, password: string) => api.post<{ username: string; share_account: boolean }>('/api/me/login', { username, password }),
+  logout: () => api.post<{ logged_out: boolean }>('/api/me/logout'),
+  get: () => api.get<MyAccount>('/api/me'),
+  kick: () => api.post<{ revoked: number }>('/api/me/kick'),
+  password: (current: string, next: string) => api.post<{ changed: boolean }>('/api/me/password', { current_password: current, new_password: next }),
+}
+
 export const sitesApi = {
   list: () => api.get<Site[]>('/api/sites'),
   capabilities: () => api.get<IngressCapabilities>('/api/ingress-capabilities'),
@@ -164,7 +176,6 @@ export const shareApi = {
   text: (userId: number) => api.get<{ text: string }>(`/api/share-users/${id(userId)}/text`),
   kick: (userId: number) => api.post<{ revoked: number }>(`/api/share-users/${id(userId)}/kick`),
   resetTraffic: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-traffic`),
-  resetPortal: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-portal`),
   renew: (userId: number, days: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/renew`, { days }),
 }
 

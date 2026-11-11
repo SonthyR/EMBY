@@ -66,8 +66,6 @@ export interface ShareUser {
   speed_limit: number
   traffic_reset_day: number
   next_reset_at?: string
-  portal_path: string
-  portal_url?: string
   sites: ShareUserSite[]
   sessions?: ShareSession[]
   created_at: string

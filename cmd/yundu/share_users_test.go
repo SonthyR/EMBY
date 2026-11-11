@@ -360,34 +360,75 @@ func TestShareResetPeriodAndMonthlyReset(t *testing.T) {
 	}
 }
 
-func TestSharePortalShowsStatusWithoutPassword(t *testing.T) {
+func shareSelfRequest(method, path, body string, cookies []*http.Cookie) *http.Request {
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	request := httptest.NewRequest(method, "http://panel.test"+path, reader)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://panel.test")
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	return request
+}
+
+func TestShareSelfServiceLoginViewAndPasswordChange(t *testing.T) {
 	app := newTestApp(t)
 	fake := newFakeShareUpstream(t)
 	site, _ := startShareTestSite(t, app, fake.server.URL)
-	userID := createShareUserForTest(t, app, site.ID, 10*1024*1024*1024)
-	item, err := app.db.getShareUser(userID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(item.portalToken) != 32 {
-		t.Fatalf("portal token = %q", item.portalToken)
-	}
+	createShareUserForTest(t, app, site.ID, 10*1024*1024*1024)
+
 	recorder := httptest.NewRecorder()
-	app.handleSharePortal(recorder, httptest.NewRequest(http.MethodGet, "/share/"+item.portalToken, nil))
-	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK || !strings.Contains(body, "Friend") || !strings.Contains(body, "share-site") {
-		t.Fatalf("portal status=%d body=%s", recorder.Code, body)
-	}
-	if strings.Contains(body, "friend-pass") || strings.Contains(body, "real-pass") {
-		t.Fatal("portal leaked a password")
-	}
-	if csp := recorder.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
-		t.Fatalf("portal CSP = %q", csp)
+	app.handleShareSelfLogin(recorder, shareSelfRequest(http.MethodPost, "/api/me/login", `{"username":"nobody","password":"x"}`, nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown account status = %d", recorder.Code)
 	}
 	recorder = httptest.NewRecorder()
-	app.handleSharePortal(recorder, httptest.NewRequest(http.MethodGet, "/share/00000000000000000000000000000000", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("unknown token status = %d", recorder.Code)
+	app.handleShareSelfLogin(recorder, shareSelfRequest(http.MethodPost, "/api/me/login", `{"username":"friend","password":"wrong"}`, nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status = %d", recorder.Code)
+	}
+	recorder = httptest.NewRecorder()
+	app.handleShareSelfLogin(recorder, shareSelfRequest(http.MethodPost, "/api/me/login", `{"username":"FRIEND","password":"friend-pass"}`, nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("login status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	cookies := recorder.Result().Cookies()
+
+	// The share session must never pass the administrator middleware.
+	adminProbe := httptest.NewRecorder()
+	app.authMiddleware(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })(adminProbe, shareSelfRequest(http.MethodGet, "/api/share-users", "", cookies))
+	if adminProbe.Code != http.StatusUnauthorized {
+		t.Fatalf("share session reached admin API: %d", adminProbe.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	app.handleShareSelf(recorder, shareSelfRequest(http.MethodGet, "/api/me", "", cookies))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `"username":"Friend"`) || !strings.Contains(body, "share-site") {
+		t.Fatalf("me status=%d body=%s", recorder.Code, body)
+	}
+	if strings.Contains(body, "friend-pass") || strings.Contains(body, "real-pass") || strings.Contains(body, "real-user") {
+		t.Fatalf("self view leaked credentials: %s", body)
+	}
+
+	recorder = httptest.NewRecorder()
+	app.handleShareSelf(recorder, shareSelfRequest(http.MethodPost, "/api/me/password", `{"current_password":"friend-pass","new_password":"new-pass-1"}`, cookies))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("password change status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	fresh := recorder.Result().Cookies()
+	recorder = httptest.NewRecorder()
+	app.handleShareSelf(recorder, shareSelfRequest(http.MethodGet, "/api/me", "", cookies))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("old session after password change status = %d", recorder.Code)
+	}
+	recorder = httptest.NewRecorder()
+	app.handleShareSelf(recorder, shareSelfRequest(http.MethodGet, "/api/me", "", fresh))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("new session status = %d", recorder.Code)
 	}
 }
 

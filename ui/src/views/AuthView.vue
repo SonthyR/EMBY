@@ -73,6 +73,7 @@ async function submit() {
 
       <form v-else class="form" novalidate @submit.prevent="submit">
         <h2>{{ isSetup ? '创建管理员' : '登录' }}</h2>
+        <p v-if="!isSetup" class="lead">管理员和分享账号都在这里登录。</p>
         <UiField label="用户名" for="auth-user" :help="isSetup ? '1–64 字节，只能有一个管理员。' : ''">
           <input id="auth-user" v-model="form.username" class="input" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus />
         </UiField>
@@ -120,6 +121,7 @@ async function submit() {
 .brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.04em; }
 .brand p { margin: 0; color: var(--text-3); font-size: 12.5px; }
 .form { display: flex; flex-direction: column; gap: 16px; }
+.lead { margin: -8px 0 6px; color: var(--text-2); font-size: 13.5px; }
 .form h2 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -0.025em; }
 .secret { position: relative; }
 .secret .input { padding-right: 42px; }

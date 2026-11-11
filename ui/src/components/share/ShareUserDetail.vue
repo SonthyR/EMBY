@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Copy, Link, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight } from '@lucide/vue'
+import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
@@ -11,7 +11,7 @@ import { copyText, daysUntil, dateOnly, formatBytes, relativeTime } from '@/util
 import { STATUS_LABEL, STATUS_TONE } from './shareStatus'
 
 const props = defineProps<{ open: boolean; user: ShareUser | null }>()
-const emit = defineEmits<{ close: []; edit: []; changed: []; deleted: []; copyShare: []; copyPortal: [] }>()
+const emit = defineEmits<{ close: []; edit: []; changed: []; deleted: []; copyShare: [] }>()
 const detail = ref<ShareUser | null>(null)
 const busy = ref('')
 const reveal = ref(false)
@@ -60,9 +60,6 @@ async function resetTraffic() {
   if (await confirm({ title: '清零已用流量？', message: '本周期的已用流量会归零，额度重新计算。', confirmText: '清零' })) run('reset', () => shareApi.resetTraffic(detail.value!.id), '已清零')
 }
 const kick = () => run('kick', () => shareApi.kick(detail.value!.id), '已断开所有设备')
-async function resetPortal() {
-  if (await confirm({ title: '重置查询链接？', message: '旧链接会立即失效，需要把新链接重新发给朋友。', confirmText: '重置' })) run('portal', () => shareApi.resetPortal(detail.value!.id), '查询链接已重置')
-}
 async function remove() {
   const u = detail.value!
   if (!(await confirm({ title: `删除 ${u.username}？`, message: '在线设备会立刻断开。这个操作无法撤销。', confirmText: '删除', danger: true }))) return
@@ -94,7 +91,6 @@ async function copyPassword() {
     <template v-if="detail">
       <div class="primary-actions">
         <UiButton variant="primary" @click="emit('copyShare')"><Copy />复制分享信息</UiButton>
-        <UiButton @click="emit('copyPortal')"><Link />查询链接</UiButton>
         <UiButton icon aria-label="编辑" title="编辑" @click="emit('edit')"><Pencil /></UiButton>
       </div>
 
@@ -142,7 +138,6 @@ async function copyPassword() {
           <button type="button" :disabled="!!busy" @click="renew(365)">续期 1 年<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="resetTraffic">清零已用流量<ChevronRight /></button>
           <button type="button" :disabled="!!busy || !detail.session_count" @click="kick">断开所有设备<ChevronRight /></button>
-          <button type="button" :disabled="!!busy" @click="resetPortal">重置查询链接<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="toggle">{{ detail.enabled ? '停用账号' : '启用账号' }}<ChevronRight /></button>
           <button type="button" class="danger" :disabled="!!busy" @click="remove">删除账号<ChevronRight /></button>
         </div>

@@ -17,7 +17,7 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler) {
   onUnauthorized = handler
 }
 
-const AUTH_PATHS = ['/api/auth/login', '/api/auth/setup', '/api/auth/check']
+const AUTH_PATHS = ['/api/auth/login', '/api/auth/setup', '/api/auth/check', '/api/me/login']
 
 export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method, credentials: 'same-origin', headers: {} }
