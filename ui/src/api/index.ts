@@ -116,6 +116,34 @@ export interface DashboardInsights {
   hourly_requests: number[]
 }
 
+export interface RequestLog {
+  id: number
+  site_id: number
+  site_name: string
+  resource_category: string
+  status_code: number
+  client_ip: string
+  client_region: string
+  inbound_colo: string
+  outbound_colo: string
+  user_agent: string
+  upstream_user_agent: string
+  backend_address: string
+  method: string
+  path: string
+  recorded_at_ms: number
+}
+
+export const logsApi = {
+  list: (filter: Record<string, string | number>) => {
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries(filter)) if (value !== '' && value !== undefined) query.set(key, String(value))
+    return api.get<{ logs: RequestLog[]; dropped_logs: number }>('/api/request-logs?' + query.toString())
+  },
+  clear: () => api.del<unknown>('/api/request-logs'),
+  clearAssetCache: () => api.del<unknown>('/api/asset-cache'),
+}
+
 export const dashboardApi = {
   snapshot: () => api.get<TrafficSnapshot>('/api/dashboard'),
   insights: () => api.get<DashboardInsights>('/api/dashboard-insights'),
