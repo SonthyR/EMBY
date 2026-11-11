@@ -25,6 +25,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,8 +89,57 @@ CREATE TABLE IF NOT EXISTS share_revoked_tokens (
 const shareRevokedTokenRetention = 90 * 24 * time.Hour
 
 func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
-	_, err := conn.ExecContext(ctx, shareUserSchemaSQL)
+	if _, err := conn.ExecContext(ctx, shareUserSchemaSQL); err != nil {
+		return err
+	}
+	for _, column := range []struct{ table, name, sql string }{
+		{"share_users", "max_devices", "ALTER TABLE share_users ADD COLUMN max_devices INTEGER NOT NULL DEFAULT 0"},
+		{"share_users", "traffic_reset_day", "ALTER TABLE share_users ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 0"},
+		{"share_users", "traffic_reset_period", "ALTER TABLE share_users ADD COLUMN traffic_reset_period TEXT NOT NULL DEFAULT ''"},
+		{"share_users", "portal_token", "ALTER TABLE share_users ADD COLUMN portal_token TEXT NOT NULL DEFAULT ''"},
+		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+column.table+"') WHERE name=?", column.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, column.sql); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE share_users SET portal_token=lower(hex(randomblob(16))) WHERE portal_token=''"); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_portal ON share_users(portal_token) WHERE portal_token <> ''")
 	return err
+}
+
+func newSharePortalToken() (string, error) {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+// shareResetPeriod names the traffic cycle that contains now for a monthly
+// reset on day (1–28): the cycle starts on that day of the month.
+func shareResetPeriod(now time.Time, day int) (string, time.Time) {
+	if day < 1 || day > 28 {
+		return "", time.Time{}
+	}
+	start := time.Date(now.Year(), now.Month(), day, 0, 0, 0, 0, now.Location())
+	if now.Before(start) {
+		start = start.AddDate(0, -1, 0)
+	}
+	return start.Format("2006-01-02"), start.AddDate(0, 1, 0)
+}
+
+func (d *DB) shareLocation() *time.Location {
+	settings := d.currentSystemSettings()
+	return timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +159,9 @@ type shareUserState struct {
 	expiresAt     time.Time
 	quota         int64
 	persistedUsed int64
+	maxDevices    int
+	resetDay      int
+	resetPeriod   string
 	sites         map[int64]int64 // site ID -> preferred site_account ID (0 = first usable)
 
 	pending atomic.Int64 // bytes metered but not yet written to share_users.traffic_used
@@ -190,8 +243,10 @@ func (rt *shareUserRuntime) reload() error {
 		username, hash, expires string
 		enabled                 bool
 		quota, used             int64
+		maxDevices, resetDay    int
+		resetPeriod             string
 	}
-	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, enabled, expires_at, traffic_quota, traffic_used FROM share_users`)
+	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, traffic_reset_period FROM share_users`)
 	if err != nil {
 		return err
 	}
@@ -199,7 +254,7 @@ func (rt *shareUserRuntime) reload() error {
 	for rows.Next() {
 		var item row
 		var enabled int
-		if err := rows.Scan(&item.id, &item.username, &item.hash, &enabled, &item.expires, &item.quota, &item.used); err != nil {
+		if err := rows.Scan(&item.id, &item.username, &item.hash, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.resetDay, &item.resetPeriod); err != nil {
 			rows.Close()
 			return err
 		}
@@ -292,6 +347,9 @@ func (rt *shareUserRuntime) reload() error {
 		state.expiresAt = rt.db.shareExpiryTime(item.expires)
 		state.quota = item.quota
 		state.persistedUsed = item.used
+		state.maxDevices = item.maxDevices
+		state.resetDay = item.resetDay
+		state.resetPeriod = item.resetPeriod
 		state.sites = assignments[item.id]
 		if state.sites == nil {
 			state.sites = map[int64]int64{}
@@ -530,6 +588,7 @@ type shareLoginPending struct {
 	rt       *shareUserRuntime
 	user     *shareUserState
 	siteID   int64
+	deviceID string
 	device   string
 	client   string
 	clientIP string
@@ -708,7 +767,11 @@ func (rt *shareUserRuntime) interceptLogin(w http.ResponseWriter, r *http.Reques
 	if decoded, err := url.QueryUnescape(device); err == nil {
 		device = decoded
 	}
-	return r, &shareLoginPending{rt: rt, user: state, siteID: site.ID, device: truncateShareText(device, 128), client: truncateShareText(client, 128), clientIP: clientIP}, state, false
+	deviceID := embyRequestAuthorizationAttribute(r, "DeviceId")
+	if deviceID == "" {
+		deviceID = r.Header.Get("X-Emby-Device-Id")
+	}
+	return r, &shareLoginPending{rt: rt, user: state, siteID: site.ID, deviceID: truncateShareText(deviceID, 128), device: truncateShareText(device, 128), client: truncateShareText(client, 128), clientIP: clientIP}, state, false
 }
 
 func truncateShareText(value string, limit int) string {
@@ -826,8 +889,8 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 		return err
 	}
 	hash := shareTokenHash(token)
-	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, token_ciphertext, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, token_ciphertext=excluded.token_ciphertext, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
-		hash, pending.user.id, pending.siteID, ciphertext, pending.device, pending.client, pending.clientIP); err != nil {
+	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
+		hash, pending.user.id, pending.siteID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
 		return err
 	}
 	// Upstreams may hand the same token back to a device that signs in again.
@@ -838,8 +901,105 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	delete(rt.revoked, hash)
 	rt.sessions[hash] = shareSessionEntry{userID: pending.user.id, siteID: pending.siteID}
 	rt.lastSeen[hash] = time.Now()
+	maxDevices := pending.user.maxDevices
 	rt.mu.Unlock()
+	if err := rt.enforceDeviceLimit(pending.user.id, pending.siteID, hash, pending.deviceID, maxDevices); err != nil {
+		log.Printf("share user %d: device limit: %v", pending.user.id, err)
+	}
 	return nil
+}
+
+// enforceDeviceLimit drops the older token of a device that signed in again
+// and, when maxDevices > 0, signs out the least recently active devices so the
+// user keeps at most maxDevices. A device is identified by its Emby DeviceId,
+// or by its token when the client sent none; all of a device's sessions (one
+// per site) count once.
+func (rt *shareUserRuntime) enforceDeviceLimit(userID, siteID int64, keepHash, deviceID string, maxDevices int) error {
+	sessions, err := rt.listSessions(userID)
+	if err != nil {
+		return err
+	}
+	rt.mu.RLock()
+	for i := range sessions {
+		if at, ok := rt.lastSeen[sessions[i].TokenHash]; ok {
+			sessions[i].lastSeen = at
+		}
+	}
+	rt.mu.RUnlock()
+	key := func(session shareStoredSession) string {
+		if session.DeviceID != "" {
+			return "d:" + session.DeviceID
+		}
+		return "t:" + session.TokenHash
+	}
+	keepKey := "t:" + keepHash
+	if deviceID != "" {
+		keepKey = "d:" + deviceID
+	}
+	var stale []shareStoredSession
+	groups := make(map[string][]shareStoredSession)
+	latest := make(map[string]time.Time)
+	for _, session := range sessions {
+		if session.TokenHash == keepHash {
+			continue
+		}
+		k := key(session)
+		if k == keepKey && session.SiteID == siteID {
+			stale = append(stale, session)
+			continue
+		}
+		groups[k] = append(groups[k], session)
+		if session.lastSeen.After(latest[k]) {
+			latest[k] = session.lastSeen
+		}
+	}
+	for _, session := range stale {
+		if err := rt.revokeOne(session); err != nil {
+			return err
+		}
+	}
+	if maxDevices <= 0 {
+		return nil
+	}
+	others := make([]string, 0, len(groups))
+	for k := range groups {
+		if k != keepKey {
+			others = append(others, k)
+		}
+	}
+	allowed := maxDevices
+	if keepHash != "" {
+		allowed-- // the device that just signed in always stays
+	}
+	if len(others) <= allowed {
+		return nil
+	}
+	sort.Slice(others, func(i, j int) bool { return latest[others[i]].After(latest[others[j]]) })
+	for _, k := range others[allowed:] {
+		for _, session := range groups[k] {
+			if err := rt.revokeOne(session); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deviceCount counts a user's signed-in devices the same way as the limit.
+func (rt *shareUserRuntime) deviceCount(userID int64) int {
+	sessions, err := rt.listSessions(userID)
+	if err != nil {
+		return 0
+	}
+	seen := make(map[string]bool, len(sessions))
+	for _, session := range sessions {
+		k := "t:" + session.TokenHash
+		if session.DeviceID != "" {
+			k = "d:" + session.DeviceID
+		}
+		seen[k] = true
+	}
+	return len(seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,8 +1008,10 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 type shareStoredSession struct {
 	TokenHash  string `json:"-"`
 	ciphertext string
+	lastSeen   time.Time
 	SiteID     int64  `json:"site_id"`
 	SiteName   string `json:"site_name"`
+	DeviceID   string `json:"-"`
 	DeviceName string `json:"device_name"`
 	Client     string `json:"client"`
 	ClientIP   string `json:"client_ip"`
@@ -858,7 +1020,7 @@ type shareStoredSession struct {
 }
 
 func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, error) {
-	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_name, s.client, s.client_ip, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
+	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_id, s.device_name, s.client, s.client_ip, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -866,12 +1028,34 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	result := make([]shareStoredSession, 0)
 	for rows.Next() {
 		var item shareStoredSession
-		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceName, &item.Client, &item.ClientIP, &item.CreatedAt, &item.LastSeenAt); err != nil {
+		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.CreatedAt, &item.LastSeenAt); err != nil {
 			return nil, err
+		}
+		if parsed, err := time.Parse("2006-01-02 15:04:05", item.LastSeenAt); err == nil {
+			item.lastSeen = parsed
 		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+// revokeOne denylists one session's token, removes it and logs it out upstream.
+func (rt *shareUserRuntime) revokeOne(session shareStoredSession) error {
+	if _, err := rt.db.db.Exec(`INSERT INTO share_revoked_tokens(token_hash, site_id) VALUES(?,?) ON CONFLICT(token_hash) DO UPDATE SET site_id=excluded.site_id, revoked_at=CURRENT_TIMESTAMP`, session.TokenHash, session.SiteID); err != nil {
+		return err
+	}
+	if _, err := rt.db.db.Exec(`DELETE FROM share_user_sessions WHERE token_hash=?`, session.TokenHash); err != nil {
+		return err
+	}
+	rt.mu.Lock()
+	delete(rt.sessions, session.TokenHash)
+	delete(rt.lastSeen, session.TokenHash)
+	rt.revoked[session.TokenHash] = session.SiteID
+	rt.mu.Unlock()
+	if token, err := decryptSiteAccountSecret(session.ciphertext); err == nil && token != "" {
+		rt.logoutUpstream(session.SiteID, token)
+	}
+	return nil
 }
 
 // revokeSessions deletes the user's sessions (all sites when siteID is 0, or
@@ -895,21 +1079,10 @@ func (rt *shareUserRuntime) revokeSessions(userID int64, siteID int64, keepSites
 				continue
 			}
 		}
-		if _, err := rt.db.db.Exec(`INSERT INTO share_revoked_tokens(token_hash, site_id) VALUES(?,?) ON CONFLICT(token_hash) DO UPDATE SET site_id=excluded.site_id, revoked_at=CURRENT_TIMESTAMP`, session.TokenHash, session.SiteID); err != nil {
+		if err := rt.revokeOne(session); err != nil {
 			return removed, err
 		}
-		if _, err := rt.db.db.Exec(`DELETE FROM share_user_sessions WHERE token_hash=?`, session.TokenHash); err != nil {
-			return removed, err
-		}
-		rt.mu.Lock()
-		delete(rt.sessions, session.TokenHash)
-		delete(rt.lastSeen, session.TokenHash)
-		rt.revoked[session.TokenHash] = session.SiteID
-		rt.mu.Unlock()
 		removed++
-		if token, err := decryptSiteAccountSecret(session.ciphertext); err == nil && token != "" {
-			rt.logoutUpstream(session.SiteID, token)
-		}
 	}
 	return removed, nil
 }
@@ -1022,6 +1195,7 @@ func (rt *shareUserRuntime) flush() {
 	for hash, at := range touched {
 		_, _ = rt.db.db.Exec(`UPDATE share_user_sessions SET last_seen_at=? WHERE token_hash=?`, at.UTC().Format("2006-01-02 15:04:05"), hash)
 	}
+	rt.applyMonthlyResets(time.Now().In(rt.db.shareLocation()))
 	cutoff := time.Now().Add(-shareRevokedTokenRetention).UTC().Format("2006-01-02 15:04:05")
 	_, _ = rt.db.db.Exec(`DELETE FROM share_revoked_tokens WHERE revoked_at < ?`, cutoff)
 	if err := rt.reload(); err != nil {
@@ -1029,6 +1203,47 @@ func (rt *shareUserRuntime) flush() {
 		return
 	}
 	rt.enforce(time.Now())
+}
+
+// applyMonthlyResets clears the used traffic of users whose monthly cycle has
+// rolled over since the last reset. The caller holds flushMu.
+func (rt *shareUserRuntime) applyMonthlyResets(now time.Time) {
+	rows, err := rt.db.db.Query(`SELECT id, traffic_reset_day, traffic_reset_period FROM share_users WHERE traffic_reset_day > 0`)
+	if err != nil {
+		log.Printf("share users: monthly reset query: %v", err)
+		return
+	}
+	type due struct {
+		id     int64
+		period string
+	}
+	var resets []due
+	for rows.Next() {
+		var id int64
+		var day int
+		var period string
+		if err := rows.Scan(&id, &day, &period); err != nil {
+			continue
+		}
+		if current, _ := shareResetPeriod(now, day); current != "" && current != period {
+			resets = append(resets, due{id: id, period: current})
+		}
+	}
+	rows.Close()
+	for _, item := range resets {
+		if _, err := rt.db.db.Exec(`UPDATE share_users SET traffic_used=0, traffic_reset_period=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, item.period, item.id); err != nil {
+			log.Printf("share user %d: monthly reset: %v", item.id, err)
+			continue
+		}
+		rt.mu.Lock()
+		if state := rt.users[item.id]; state != nil {
+			state.pending.Store(0)
+			state.persistedUsed = 0
+			state.resetPeriod = item.period
+		}
+		rt.mu.Unlock()
+		log.Printf("share user %d: monthly traffic reset (%s)", item.id, item.period)
+	}
 }
 
 // enforce revokes the sessions of every user who is no longer allowed in.

@@ -290,6 +290,7 @@ const API = {
   getShareUserText(id) { return this.request('GET', '/api/share-users/' + encodeURIComponent(id) + '/text'); },
   kickShareUser(id) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/kick', {}); },
   resetShareUserTraffic(id) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/reset-traffic', {}); },
+  resetShareUserPortal(id) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/reset-portal', {}); },
   renewShareUser(id, days) { return this.request('POST', '/api/share-users/' + encodeURIComponent(id) + '/renew', { days }); },
   testUpstream(targetURL) { return this.request('POST', '/api/upstream-test', { target_url: targetURL }); },
 

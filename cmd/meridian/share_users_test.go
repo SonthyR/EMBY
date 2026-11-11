@@ -37,15 +37,20 @@ func newFakeShareUpstream(t *testing.T) *fakeShareUpstream {
 				http.Error(w, "bad credentials", http.StatusUnauthorized)
 				return
 			}
+			// One token per device, like Emby: DeviceId d1 keeps the legacy token.
+			token := "upstream-token-1"
+			if device := embyRequestAuthorizationAttribute(r, "DeviceId"); device != "" && device != "d1" {
+				token = "upstream-token-" + device
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"AccessToken":"upstream-token-1","User":{"Name":"real-user"}}`))
+			_, _ = w.Write([]byte(`{"AccessToken":"` + token + `","User":{"Name":"real-user"}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/Sessions/Logout":
 			fake.mu.Lock()
 			fake.loggedOut = append(fake.loggedOut, r.Header.Get("X-Emby-Token"))
 			fake.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/Items":
-			if r.Header.Get("X-Emby-Token") != "upstream-token-1" && r.URL.Query().Get("api_key") != "upstream-token-1" {
+			if !strings.HasPrefix(r.Header.Get("X-Emby-Token"), "upstream-token-") && !strings.HasPrefix(r.URL.Query().Get("api_key"), "upstream-token-") {
 				http.Error(w, "no token", http.StatusUnauthorized)
 				return
 			}
@@ -106,10 +111,15 @@ func createShareUserForTest(t *testing.T, app *App, siteID int64, quota int64) i
 
 func doShareLogin(t *testing.T, base, username, password string) (*http.Response, []byte) {
 	t.Helper()
+	return doShareLoginDevice(t, base, username, password, "d1")
+}
+
+func doShareLoginDevice(t *testing.T, base, username, password, device string) (*http.Response, []byte) {
+	t.Helper()
 	body := fmt.Sprintf(`{"Username":%q,"Pw":%q}`, username, password)
 	request, _ := http.NewRequest(http.MethodPost, base+"/Users/AuthenticateByName", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Test", Device="Phone", DeviceId="d1", Version="1"`)
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Test", Device="Phone", DeviceId="`+device+`", Version="1"`)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatalf("login request: %v", err)
@@ -121,8 +131,13 @@ func doShareLogin(t *testing.T, base, username, password string) (*http.Response
 
 func shareGetItems(t *testing.T, base string) int {
 	t.Helper()
+	return shareGetItemsWithToken(t, base, "upstream-token-1")
+}
+
+func shareGetItemsWithToken(t *testing.T, base, token string) int {
+	t.Helper()
 	request, _ := http.NewRequest(http.MethodGet, base+"/Items", nil)
-	request.Header.Set("X-Emby-Token", "upstream-token-1")
+	request.Header.Set("X-Emby-Token", token)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatalf("items request: %v", err)
@@ -245,6 +260,133 @@ func TestShareUserKickedTokenStaysRejectedLocally(t *testing.T) {
 	}
 	if status := shareGetItems(t, base); status != http.StatusOK {
 		t.Fatalf("re-issued token status = %d, want 200", status)
+	}
+}
+
+func TestShareUserDeviceLimitSignsOutLeastRecentDevice(t *testing.T) {
+	app := newTestApp(t)
+	fake := newFakeShareUpstream(t)
+	site, base := startShareTestSite(t, app, fake.server.URL)
+	userID := createShareUserForTest(t, app, site.ID, 0)
+	if _, err := app.db.db.Exec(`UPDATE share_users SET max_devices=2 WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	app.reloadShareUsers()
+	for _, device := range []string{"phone", "tv"} {
+		if response, body := doShareLoginDevice(t, base, "friend", "friend-pass", device); response.StatusCode != http.StatusOK {
+			t.Fatalf("login %s status = %d body=%s", device, response.StatusCode, body)
+		}
+	}
+	// Make the phone the most recently active device, then add a third.
+	if status := shareGetItemsWithToken(t, base, "upstream-token-phone"); status != http.StatusOK {
+		t.Fatalf("phone items status = %d", status)
+	}
+	app.pm.shares.mu.Lock()
+	app.pm.shares.lastSeen[shareTokenHash("upstream-token-tv")] = time.Now().Add(-time.Hour)
+	app.pm.shares.lastSeen[shareTokenHash("upstream-token-phone")] = time.Now()
+	app.pm.shares.mu.Unlock()
+	if response, body := doShareLoginDevice(t, base, "friend", "friend-pass", "pad"); response.StatusCode != http.StatusOK {
+		t.Fatalf("login pad status = %d body=%s", response.StatusCode, body)
+	}
+	if got := app.pm.shares.deviceCount(userID); got != 2 {
+		t.Fatalf("devices = %d, want 2", got)
+	}
+	if status := shareGetItemsWithToken(t, base, "upstream-token-tv"); status != http.StatusUnauthorized {
+		t.Fatalf("oldest device status = %d, want 401", status)
+	}
+	for _, token := range []string{"upstream-token-phone", "upstream-token-pad"} {
+		if status := shareGetItemsWithToken(t, base, token); status != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", token, status)
+		}
+	}
+	// Signing in again from the same device replaces its old session.
+	if response, _ := doShareLoginDevice(t, base, "friend", "friend-pass", "pad"); response.StatusCode != http.StatusOK {
+		t.Fatalf("pad re-login status = %d", response.StatusCode)
+	}
+	if got := app.pm.shares.deviceCount(userID); got != 2 {
+		t.Fatalf("devices after re-login = %d, want 2", got)
+	}
+}
+
+func TestShareResetPeriodAndMonthlyReset(t *testing.T) {
+	location := time.FixedZone("CST", 8*3600)
+	cases := []struct {
+		now          time.Time
+		day          int
+		period, next string
+	}{
+		{time.Date(2026, 11, 11, 9, 0, 0, 0, location), 1, "2026-11-01", "2026-12-01"},
+		{time.Date(2026, 11, 11, 9, 0, 0, 0, location), 15, "2026-10-15", "2026-11-15"},
+		{time.Date(2026, 1, 3, 9, 0, 0, 0, location), 5, "2025-12-05", "2026-01-05"},
+	}
+	for _, tc := range cases {
+		period, next := shareResetPeriod(tc.now, tc.day)
+		if period != tc.period || next.Format("2006-01-02") != tc.next {
+			t.Fatalf("shareResetPeriod(%s, %d) = %s, %s", tc.now, tc.day, period, next.Format("2006-01-02"))
+		}
+	}
+	if period, _ := shareResetPeriod(time.Now(), 0); period != "" {
+		t.Fatalf("disabled reset day returned %q", period)
+	}
+
+	app := newTestApp(t)
+	fake := newFakeShareUpstream(t)
+	site, _ := startShareTestSite(t, app, fake.server.URL)
+	userID := createShareUserForTest(t, app, site.ID, 0)
+	if _, err := app.db.db.Exec(`UPDATE share_users SET traffic_used=5000, traffic_reset_day=1, traffic_reset_period='2000-01-01' WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	app.reloadShareUsers()
+	app.pm.shares.flush()
+	var used int64
+	var period string
+	if err := app.db.db.QueryRow(`SELECT traffic_used, traffic_reset_period FROM share_users WHERE id=?`, userID).Scan(&used, &period); err != nil {
+		t.Fatal(err)
+	}
+	if used != 0 || period == "2000-01-01" {
+		t.Fatalf("after monthly reset used=%d period=%q", used, period)
+	}
+	// A second flush in the same cycle keeps new usage.
+	if _, err := app.db.db.Exec(`UPDATE share_users SET traffic_used=42 WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	app.pm.shares.flush()
+	if err := app.db.db.QueryRow(`SELECT traffic_used FROM share_users WHERE id=?`, userID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used != 42 {
+		t.Fatalf("usage reset twice in one cycle: %d", used)
+	}
+}
+
+func TestSharePortalShowsStatusWithoutPassword(t *testing.T) {
+	app := newTestApp(t)
+	fake := newFakeShareUpstream(t)
+	site, _ := startShareTestSite(t, app, fake.server.URL)
+	userID := createShareUserForTest(t, app, site.ID, 10*1024*1024*1024)
+	item, err := app.db.getShareUser(userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(item.portalToken) != 32 {
+		t.Fatalf("portal token = %q", item.portalToken)
+	}
+	recorder := httptest.NewRecorder()
+	app.handleSharePortal(recorder, httptest.NewRequest(http.MethodGet, "/share/"+item.portalToken, nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "Friend") || !strings.Contains(body, "share-site") {
+		t.Fatalf("portal status=%d body=%s", recorder.Code, body)
+	}
+	if strings.Contains(body, "friend-pass") || strings.Contains(body, "real-pass") {
+		t.Fatal("portal leaked a password")
+	}
+	if csp := recorder.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+		t.Fatalf("portal CSP = %q", csp)
+	}
+	recorder = httptest.NewRecorder()
+	app.handleSharePortal(recorder, httptest.NewRequest(http.MethodGet, "/share/00000000000000000000000000000000", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown token status = %d", recorder.Code)
 	}
 }
 
