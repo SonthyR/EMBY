@@ -13,7 +13,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/sites', component: () => import('@/views/SitesView.vue'), meta: { title: '站点', nav: 'main', icon: 'sites', mobile: true } },
   { path: '/share', component: () => import('@/views/ShareUsersView.vue'), meta: { title: '分享账号', nav: 'main', icon: 'share', mobile: true } },
   { path: '/logs', component: () => import('@/views/LogsView.vue'), meta: { title: '日志', nav: 'main', icon: 'logs' } },
-  { path: '/settings', component: () => import('@/views/LegacyView.vue'), meta: { title: '设置', nav: 'manage', icon: 'settings', mobile: true, legacy: 'global-settings' } },
+  { path: '/settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '设置', nav: 'manage', icon: 'settings', mobile: true } },
   { path: '/diagnostics', component: () => import('@/views/DiagnosticsView.vue'), meta: { title: '诊断', nav: 'manage', icon: 'diag' } },
   { path: '/account', component: () => import('@/views/AccountView.vue'), meta: { title: '账户', icon: 'account' } },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },

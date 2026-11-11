@@ -27,6 +27,16 @@ type requestTrafficMeter struct {
 	share         *shareUserState
 }
 
+// billableBytes applies the panel's traffic billing mode, so share-user usage
+// is counted the same way as site quotas.
+func (inst *ProxyInstance) billableBytes(bytesIn, bytesOut int64) int64 {
+	if inst != nil && inst.quota != nil && inst.quota.pm != nil && inst.quota.pm.database != nil &&
+		inst.quota.pm.database.currentSystemSettings().TrafficBillingMode == "outbound" {
+		return bytesOut
+	}
+	return bytesIn + bytesOut
+}
+
 // setShareUser attributes this request's bytes to a share user as well.
 func (m *requestTrafficMeter) setShareUser(user *shareUserState) {
 	if m == nil || user == nil {
@@ -104,7 +114,7 @@ func (m *requestTrafficMeter) add(bytesIn, bytesOut int64, at time.Time) {
 		return
 	}
 	if m.share != nil {
-		m.share.pending.Add(bytesIn + bytesOut)
+		m.share.pending.Add(m.inst.billableBytes(bytesIn, bytesOut))
 	}
 	if !m.streaming && minute == m.startedMinute {
 		m.inst.bytesIn.Add(bytesIn)

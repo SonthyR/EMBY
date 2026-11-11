@@ -159,7 +159,7 @@ async function save() {
       <fieldset>
         <legend>额度与限制</legend>
         <div class="grid">
-          <UiField label="流量额度" for="su-quota" :error="errors.quota" help="GB，上下行合计">
+          <UiField label="流量额度" for="su-quota" :error="errors.quota" help="GB，按设置中的计费方式统计">
             <input id="su-quota" v-model="form.quotaGB" class="input num" type="number" min="0" step="0.01" placeholder="不限" inputmode="decimal" />
           </UiField>
           <UiField label="每月重置" for="su-reset" help="到这天清零已用流量">
