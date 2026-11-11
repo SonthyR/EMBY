@@ -1,0 +1,40 @@
+name: Retag
+
+# Moves a release tag to the commit this workflow is run on, then starts the
+# Release workflow for it. Use it to re-cut a release after a fix lands,
+# without deleting the tag by hand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '要重建的版本号（例如 v1.0.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Move tag and start Release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use exactly vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f -a "$RELEASE_TAG" -m "云渡 $RELEASE_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+          gh workflow run release.yml --ref "$GITHUB_REF_NAME" -f release_tag="$RELEASE_TAG"

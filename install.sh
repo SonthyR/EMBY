@@ -2328,7 +2328,7 @@ do_tls() (
     [ -n "$token" ] || fail "DNS API Token 不能为空"
     tmp_dir=$(mktemp -d) || exit 1; chmod 0700 "$tmp_dir" || exit 1; snapshot="${tmp_dir}/snapshot"
     # Invoked by the EXIT trap in this subshell.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_tls() {
         local code=$?
         unset token
