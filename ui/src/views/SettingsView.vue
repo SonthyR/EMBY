@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ExternalLink } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
+import TlsSettings from '@/components/settings/TlsSettings.vue'
+import TelegramSettings from '@/components/settings/TelegramSettings.vue'
 import { api, sitesApi } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -14,7 +15,8 @@ const SECTIONS = [
   { key: 'general', label: '流量与时间' },
   { key: 'logs', label: '请求日志' },
   { key: 'backup', label: '备份与恢复' },
-  { key: 'more', label: '证书与通知' },
+  { key: 'tls', label: '面板地址与证书' },
+  { key: 'telegram', label: 'Telegram 机器人' },
 ]
 const section = ref('general')
 const settings = ref<Settings | null>(null)
@@ -219,16 +221,10 @@ async function doRestore() {
           </section>
         </template>
 
-        <template v-if="section === 'more'">
-          <section class="group">
-            <h2>证书与通知</h2>
-            <p class="faint p">这两项配置项较多，新版界面还在做，暂时在旧版面板里设置，数据是同一份。</p>
-            <a class="row-link" href="/#settings-tls"><span><strong>TLS 证书与面板地址</strong><small>面板域名、HTTPS 证书自动申请、上传证书</small></span><ExternalLink /></a>
-            <a class="row-link" href="/#telegram-report"><span><strong>Telegram 机器人</strong><small>Bot 管理、到期提醒、定时日报</small></span><ExternalLink /></a>
-          </section>
-        </template>
+        <TlsSettings v-if="section === 'tls'" />
+        <TelegramSettings v-if="section === 'telegram'" />
 
-        <p v-if="!settings && section !== 'backup' && section !== 'more'" class="faint">正在读取…</p>
+        <p v-if="!settings && (section === 'general' || section === 'logs')" class="faint">正在读取…</p>
       </div>
     </div>
 

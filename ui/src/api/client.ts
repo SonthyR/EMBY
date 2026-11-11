@@ -4,10 +4,12 @@
 export class ApiError extends Error {
   status: number
   retryAfter?: number
-  constructor(message: string, status: number, retryAfter?: number) {
+  data?: any
+  constructor(message: string, status: number, retryAfter?: number, data?: any) {
     super(message)
     this.status = status
     this.retryAfter = retryAfter
+    this.data = data
   }
 }
 
@@ -46,7 +48,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
   if (!response.ok) {
     const retry = Number(data?.retry_after_seconds || response.headers.get('Retry-After') || 0)
-    throw new ApiError(translateError(data?.error) || response.statusText || '请求失败', response.status, retry > 0 ? retry : undefined)
+    throw new ApiError(translateError(data?.error) || response.statusText || '请求失败', response.status, retry > 0 ? retry : undefined, data)
   }
   return data as T
 }
