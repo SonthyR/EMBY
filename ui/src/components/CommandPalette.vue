@@ -26,7 +26,7 @@ const commands = computed<Command[]>(() => [
   { id: 'go-logs', group: '前往', label: '日志', run: () => router.push('/logs') },
   { id: 'go-settings', group: '前往', label: '设置', run: () => router.push('/settings') },
   { id: 'new-share', group: '操作', label: '新建分享账号', hint: 'N', run: () => router.push({ path: '/share', query: { new: '1' } }) },
-  { id: 'new-site', group: '操作', label: '添加站点', run: () => (location.href = '/#sites/new') },
+  { id: 'new-site', group: '操作', label: '添加站点', run: () => router.push({ path: '/sites', query: { new: '1' } }) },
   { id: 'theme', group: '操作', label: '切换主题', run: cycleTheme },
   { id: 'logout', group: '操作', label: '退出登录', run: logout },
 ])

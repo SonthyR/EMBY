@@ -384,7 +384,7 @@ func (a *App) shareUserText(item *storedShareUser) (string, error) {
 		}
 	}
 	if origin := a.sharePortalOrigin(); origin != "" {
-		builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "/app/\n")
+		builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
 	}
 	builder.WriteString("在 Emby 客户端中添加服务器地址后，用上面的用户名和密码登录。")
 	return builder.String(), nil

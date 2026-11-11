@@ -51,6 +51,15 @@ jobs:
           go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
           gosec -quiet -severity medium -confidence medium ./...
 
+      - name: Check panel UI (type check, unit tests, build is committed)
+        working-directory: ui
+        run: |
+          npm ci --no-audit --no-fund
+          npx vue-tsc --noEmit
+          npx vitest run
+          npx vite build
+          git diff --exit-code -- ../web/static/app || { echo "web/static/app is out of date: run 'npx vite build' in ui/ and commit"; exit 1; }
+
       - name: Validate frontend and installer syntax
         run: |
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check

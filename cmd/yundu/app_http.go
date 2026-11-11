@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -244,8 +245,15 @@ func staticHandler(staticFS fs.FS) http.Handler {
 			w.Header().Set("Pragma", "no-cache")
 			w.Header().Set("Expires", "0")
 		}
-		if path == "/" {
-			path = "/index.html"
+		// The rebuilt panel (web/static/app) is the default page; the previous
+		// panel stays reachable at /legacy/ and keeps its absolute asset paths.
+		switch path {
+		case "/", "/index.html", "/app", "/app/":
+			serveStaticFile(w, r, staticFS, "app/index.html")
+			return
+		case "/legacy", "/legacy/":
+			serveStaticFile(w, r, staticFS, "index.html")
+			return
 		}
 		// fs.FS paths never end in a slash; a directory is served through its
 		// index.html (http.FileServer handles that and the trailing-slash redirect).
@@ -266,9 +274,18 @@ func staticHandler(staticFS fs.FS) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		r.URL.Path = "/"
-		fileServer.ServeHTTP(w, r)
+		serveStaticFile(w, r, staticFS, "app/index.html")
 	})
+}
+
+func serveStaticFile(w http.ResponseWriter, r *http.Request, staticFS fs.FS, name string) {
+	data, err := fs.ReadFile(staticFS, name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
 }
 
 func (a *App) jsonResponse(w http.ResponseWriter, status int, data interface{}) {

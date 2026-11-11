@@ -2,11 +2,11 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 
-// The build is embedded into the Go binary under web/static/app and served at
-// /app/ while the legacy panel still lives at /. Relative asset URLs keep the
-// bundle working wherever it is mounted.
+// The build is embedded into the Go binary under web/static/app. The page is
+// served at / (the legacy panel moved to /legacy/), so assets use an absolute
+// /app/ base to resolve the same from any page URL.
 export default defineConfig({
-  base: './',
+  base: '/app/',
   plugins: [vue()],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },

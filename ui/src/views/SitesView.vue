@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { Plus, Search, Copy, Zap, MoreHorizontal, ArrowUp, ArrowDown } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiMenu from '@/components/ui/UiMenu.vue'
@@ -56,6 +57,17 @@ async function load(silent = false) {
   }
 }
 onMounted(() => load())
+const route = useRoute()
+const router = useRouter()
+watch(
+  () => route.query.new,
+  value => {
+    if (!value) return
+    router.replace({ query: {} })
+    setTimeout(() => edit(), 0)
+  },
+  { immediate: true },
+)
 
 const selected = computed(() => sites.value.find(s => s.id === selectedId.value) || null)
 const counts = computed(() => ({ all: sites.value.length, running: sites.value.filter(s => s.running).length, stopped: sites.value.filter(s => !s.running).length }))

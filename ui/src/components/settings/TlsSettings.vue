@@ -135,7 +135,7 @@ async function restart() {
       try {
         const r = await fetch(new URL('/api/panel-ready', target).href, { mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(5000) })
         if (r.ok && (await r.json()).ready === true) {
-          location.replace(new URL('/app/', target).href)
+          location.replace(new URL('/', target).href)
           return
         }
       } catch {
