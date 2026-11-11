@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -340,7 +341,7 @@ func formatShareBytes(value int64) string {
 	return fmt.Sprintf("%.2f %s", size, units[unit])
 }
 
-func (a *App) shareUserText(item *storedShareUser) (string, error) {
+func (a *App) shareUserText(item *storedShareUser, origin string) (string, error) {
 	view := a.shareUserView(item, true)
 	var builder strings.Builder
 	builder.WriteString("【Emby 分享账号】\n")
@@ -374,7 +375,7 @@ func (a *App) shareUserText(item *storedShareUser) (string, error) {
 		if err != nil {
 			continue
 		}
-		lines := a.siteProxyLines(*site)
+		lines := a.siteProxyLinesFrom(*site, origin)
 		if len(lines) == 0 {
 			builder.WriteString("- " + site.Name + "：（入口未配置）\n")
 			continue
@@ -383,18 +384,35 @@ func (a *App) shareUserText(item *storedShareUser) (string, error) {
 			builder.WriteString("- " + site.Name + "：" + line + "\n")
 		}
 	}
-	if origin := a.sharePortalOrigin(); origin != "" {
+	if origin != "" {
 		builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
 	}
 	builder.WriteString("在 Emby 客户端中添加服务器地址后，用上面的用户名和密码登录。")
 	return builder.String(), nil
 }
 
-// sharePortalOrigin is the public origin friends reach the panel on, chosen
-// the same way as the site addresses in the share text.
-func (a *App) sharePortalOrigin() string {
+// shareTextOrigin is the public origin written into the share text. An
+// explicit public URL wins; otherwise it is the address the admin is using
+// right now, which is also what the panel's site list shows. A loopback
+// address (SSH tunnel) is useless to a friend, so it falls back to the
+// configured panel domain.
+func (a *App) shareTextOrigin(r *http.Request) string {
 	if settings, err := a.db.telegramBotSettings(); err == nil && strings.TrimSpace(settings.PublicURL) != "" {
 		return strings.TrimRight(strings.TrimSpace(settings.PublicURL), "/")
+	}
+	if r != nil && r.Host != "" {
+		host := r.Host
+		if hostname, _, err := net.SplitHostPort(host); err == nil {
+			host = hostname
+		}
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+			scheme := "http"
+			if requestIsHTTPS(r, a.trustedProxies) {
+				scheme = "https"
+			}
+			return scheme + "://" + r.Host
+		}
 	}
 	if origin := a.panelAccessURL(); origin != "" {
 		return origin
@@ -554,7 +572,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		text, err := a.shareUserText(item)
+		text, err := a.shareUserText(item, a.shareTextOrigin(r))
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "分享信息生成失败")
 			return

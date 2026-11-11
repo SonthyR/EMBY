@@ -28,6 +28,11 @@ func (a *App) panelAccessURL() string {
 	if a == nil || a.panelHost == "" {
 		return ""
 	}
+	// Behind the installer's Nginx/HTTPS proxy the listen port is internal;
+	// visitors reach the panel on the domain's standard HTTPS port.
+	if a.managedExternalTLSProxy() {
+		return "https://" + a.panelHost
+	}
 	scheme := "http"
 	defaultPort := 80
 	if a.panelTLSEnabled {

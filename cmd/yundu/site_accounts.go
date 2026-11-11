@@ -816,6 +816,17 @@ func (a *App) accountClientText(site Site, item storedSiteAccount, mode string) 
 	return a.renderAccountClientText(site, plain, mode, siteExportOptions{IncludeAccounts: true, IncludePasswords: true}), nil
 }
 
+// siteProxyLinesFrom builds a site's client address on a known public origin.
+func (a *App) siteProxyLinesFrom(site Site, origin string) []string {
+	if origin == "" {
+		return a.siteProxyLines(site)
+	}
+	if address, err := a.telegramSiteAddress(site, origin); err == nil {
+		return []string{address}
+	}
+	return nil
+}
+
 func (a *App) siteProxyLines(site Site) []string {
 	if settings, err := a.db.telegramBotSettings(); err == nil && settings.PublicURL != "" {
 		if address, err := a.telegramSiteAddress(site, settings.PublicURL); err == nil {

@@ -495,3 +495,26 @@ func TestEmbyRequestTokensReadsHeadersAndQuery(t *testing.T) {
 		t.Fatalf("tokens = %v", tokens)
 	}
 }
+
+func TestShareTextOriginUsesPublicPanelAddress(t *testing.T) {
+	app := newTestApp(t)
+	app.panelListenPort = 9090
+
+	req := httptest.NewRequest(http.MethodGet, "http://emby.example.com:9090/api/share-users/1/text", nil)
+	if got := app.shareTextOrigin(req); got != "http://emby.example.com:9090" {
+		t.Fatalf("direct panel origin = %q", got)
+	}
+
+	// An SSH tunnel address is useless to a friend: fall back to the domain,
+	// which behind the installer's Nginx proxy is plain HTTPS on 443.
+	app.panelHost = "emby.example.com"
+	app.panelBindLoopback = true
+	app.panelTLSEnabled = false
+	tunnel := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/api/share-users/1/text", nil)
+	if got := app.shareTextOrigin(tunnel); got != "https://emby.example.com" {
+		t.Fatalf("tunnel origin = %q", got)
+	}
+	if got := app.panelAccessURL(); got != "https://emby.example.com" {
+		t.Fatalf("panelAccessURL behind external proxy = %q", got)
+	}
+}
