@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   analyze:
+    # Private repositories on a free plan have no code scanning; skip instead of failing.
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

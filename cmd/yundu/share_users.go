@@ -880,7 +880,7 @@ func (c *shareLoginCapture) Write(b []byte) (int, error) {
 	if c.buffer.Len()+len(b) > shareLoginResponseLimit {
 		c.passthrough = true
 		c.target.WriteHeader(c.status)
-		if _, err := c.target.Write(c.buffer.Bytes()); err != nil {
+		if _, err := c.target.Write(c.buffer.Bytes()); err != nil { // #nosec G705 -- relays the upstream Emby login response unchanged, with its own headers and content type.
 			return 0, err
 		}
 		c.buffer.Reset()
@@ -911,7 +911,7 @@ func (c *shareLoginCapture) finish(pending *shareLoginPending) {
 		}
 	}
 	c.target.WriteHeader(status)
-	_, _ = c.target.Write(c.buffer.Bytes())
+	_, _ = c.target.Write(c.buffer.Bytes()) // #nosec G705 -- relays the upstream Emby login response unchanged, with its own headers and content type.
 }
 
 func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token string) error {

@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   build:
+    # Private repositories on a free plan have no GitHub Pages; skip instead of failing.
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
