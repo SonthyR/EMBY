@@ -863,13 +863,14 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 			rewritten = fallback
 			err = nil
 		} else {
+			// The fallback could not proxy a main video URL safely. Fall through
+			// to the explicit rejection path instead of emitting the unproxied
+			// upstream payload.
 			fallbackSession.rollback()
 			if accept != nil && !accept() {
 				return errDynamicCapabilityExpiredDuringUse
 			}
-			log.Printf("[%s] PlaybackInfo automatic URL proxy fallback preserved the upstream response", issuer.site.Name)
-			installDynamicStructuredBody(resp, payload)
-			return nil
+			err = fallbackErr
 		}
 	}
 	if err != nil {

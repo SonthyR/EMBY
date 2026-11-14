@@ -852,8 +852,9 @@ func rewritePlaybackInfoResponse(payload []byte, session *dynamicRewriteSession)
 
 // rewriteAutomaticPlaybackInfoResponse follows the response-rewrite model used
 // by simple Emby reverse proxies: every complete HTTP(S) URL in the JSON value
-// tree is routed back through Meridian. Invalid or unsupported URL candidates
-// are preserved instead of rejecting the entire PlaybackInfo response.
+// tree is routed back through Meridian. Main video URLs must be proxied; an
+// invalid or unsupported optional URL (such as a subtitle DeliveryUrl) is
+// preserved instead of rejecting the entire PlaybackInfo response.
 func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewriteSession) ([]byte, error) {
 	if session == nil || session.issuer == nil || session.base == nil {
 		return nil, fmt.Errorf("automatic PlaybackInfo rewrite session is unavailable")
@@ -874,7 +875,10 @@ func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewrit
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("invalid automatic PlaybackInfo JSON")
 	}
-	rewritten := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	rewritten, err := rewriteAutomaticPlaybackInfoValue(root, session, 0, "")
+	if err != nil {
+		return nil, err
+	}
 	output := session.outputBuffer()
 	encoder := json.NewEncoder(&output)
 	encoder.SetEscapeHTML(false)
@@ -884,28 +888,58 @@ func rewriteAutomaticPlaybackInfoResponse(payload []byte, session *dynamicRewrit
 	return bytes.TrimSuffix(output.Bytes(), []byte("\n")), nil
 }
 
-func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) any {
-	if session == nil || depth > globalDynamicMaxParseDepth || session.ctx.Err() != nil {
-		return value
+// automaticPlaybackInfoAbsoluteHTTPURL recognizes HTTP(S) URLs that the
+// automatic URL candidate filter rejected for an unsafe component (userinfo,
+// fragment, opaque form, and so on). A Path carrying one of these is still a
+// player-fetchable main video URL and must not be preserved unproxied.
+func automaticPlaybackInfoAbsoluteHTTPURL(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	return parsed.IsAbs() && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https"))
+}
+
+func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession, depth int, field string) (any, error) {
+	if session == nil || depth > globalDynamicMaxParseDepth {
+		return value, nil
+	}
+	if err := session.ctx.Err(); err != nil {
+		return nil, fmt.Errorf("automatic PlaybackInfo parsing deadline exceeded")
 	}
 	switch typed := value.(type) {
 	case string:
+		mainVideoField := strings.EqualFold(field, "DirectStreamUrl") || strings.EqualFold(field, "TranscodingUrl")
+		pathField := strings.EqualFold(field, "Path")
+		mainField := mainVideoField || pathField
 		candidate, ok := automaticPlaybackInfoURLCandidate(typed, session.base)
-		if !ok && (strings.EqualFold(field, "DirectStreamUrl") || strings.EqualFold(field, "TranscodingUrl")) {
-			session.rememberRelativePlaybackPath(typed)
-		}
 		if !ok {
-			return typed
+			// A relative DirectStreamUrl/TranscodingUrl is preserved as before, but
+			// any other non-URL value could leak an unproxied main video target.
+			if mainVideoField && typed != "" && !playbackInfoSafeRelativeURL(typed) ||
+				pathField && automaticPlaybackInfoAbsoluteHTTPURL(typed) {
+				return nil, fmt.Errorf("automatic PlaybackInfo field %s cannot be proxied", field)
+			}
+			if mainVideoField {
+				session.rememberRelativePlaybackPath(typed)
+			}
+			return typed, nil
 		}
 		source, kind, err := playbackInfoExtremeCapabilityType(candidate, session)
 		if err != nil {
-			return typed
+			if mainField {
+				return nil, fmt.Errorf("automatic PlaybackInfo field %s cannot be proxied: %w", field, err)
+			}
+			return typed, nil
 		}
 		route, err := session.rewriteAgainstSourceKindWithRequiredHeaders(candidate, session.base, source, kind, nil)
 		if err != nil {
-			return typed
+			if mainField {
+				return nil, fmt.Errorf("automatic PlaybackInfo field %s cannot be proxied: %w", field, err)
+			}
+			return typed, nil
 		}
-		return route
+		return route, nil
 	case map[string]any:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
@@ -916,16 +950,24 @@ func rewriteAutomaticPlaybackInfoValue(value any, session *dynamicRewriteSession
 			if strings.EqualFold(key, "RequiredHttpHeaders") {
 				continue
 			}
-			typed[key] = rewriteAutomaticPlaybackInfoValue(typed[key], session, depth+1, key)
+			rewritten, err := rewriteAutomaticPlaybackInfoValue(typed[key], session, depth+1, key)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = rewritten
 		}
-		return typed
+		return typed, nil
 	case []any:
 		for index := range typed {
-			typed[index] = rewriteAutomaticPlaybackInfoValue(typed[index], session, depth+1, field)
+			rewritten, err := rewriteAutomaticPlaybackInfoValue(typed[index], session, depth+1, field)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = rewritten
 		}
-		return typed
+		return typed, nil
 	default:
-		return value
+		return value, nil
 	}
 }
 

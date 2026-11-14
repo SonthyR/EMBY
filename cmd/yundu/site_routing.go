@@ -752,7 +752,19 @@ func isPlaybackRequest(path string) bool {
 
 func isPlaybackRedirectEndpoint(pathValue string) bool {
 	pathValue = strings.ToLower(pathValue)
-	return pathValue == "/emya/video" || pathValue == "/emby/emya/video"
+	switch pathValue {
+	case "/emya/video", "/emby/emya/video":
+		return true
+	}
+	parts := strings.Split(pathValue, "/")
+	switch {
+	case len(parts) == 4 && parts[0] == "" && parts[1] == "play" && parts[2] == "video" && parts[3] != "":
+		return true
+	case len(parts) == 5 && parts[0] == "" && parts[1] == "emby" && parts[2] == "play" && parts[3] == "video" && parts[4] != "":
+		return true
+	default:
+		return false
+	}
 }
 
 func isPlaybackInfoRequest(path string) bool {
