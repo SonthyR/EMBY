@@ -586,6 +586,7 @@ func parseShareLoginBody(contentType string, body []byte) (*shareLoginBody, bool
 			return nil, false
 		}
 		parsed := &shareLoginBody{json: values}
+		var fallbackPassword string
 		for key, value := range values {
 			text, _ := value.(string)
 			switch strings.ToLower(key) {
@@ -593,7 +594,12 @@ func parseShareLoginBody(contentType string, body []byte) (*shareLoginBody, bool
 				parsed.username = text
 			case "pw":
 				parsed.password = text
+			case "password":
+				fallbackPassword = text
 			}
+		}
+		if parsed.password == "" && fallbackPassword != "" {
+			parsed.password = fallbackPassword
 		}
 		return parsed, true
 	}
@@ -602,6 +608,7 @@ func parseShareLoginBody(contentType string, body []byte) (*shareLoginBody, bool
 		return nil, false
 	}
 	parsed := &shareLoginBody{form: form}
+	var fallbackPassword string
 	for key, values := range form {
 		if len(values) == 0 {
 			continue
@@ -611,7 +618,12 @@ func parseShareLoginBody(contentType string, body []byte) (*shareLoginBody, bool
 			parsed.username = values[0]
 		case "pw":
 			parsed.password = values[0]
+		case "password":
+			fallbackPassword = values[0]
 		}
+	}
+	if parsed.password == "" && fallbackPassword != "" {
+		parsed.password = fallbackPassword
 	}
 	return parsed, true
 }
@@ -1009,6 +1021,32 @@ func (rt *shareUserRuntime) drainingCount(userID int64) int {
 	return count
 }
 
+func (rt *shareUserRuntime) effectiveSpeedLimitMbps(user *shareUserState) int {
+	if rt == nil || user == nil {
+		return 0
+	}
+	rt.mu.RLock()
+	limit := user.speedLimit
+	rt.mu.RUnlock()
+	return limit
+}
+
+func (rt *shareUserRuntime) markEdgePlayback(tokenHash string) {
+	if rt == nil || tokenHash == "" {
+		return
+	}
+	now := time.Now()
+	rt.mu.Lock()
+	act := rt.activity[tokenHash]
+	if act == nil {
+		act = &shareSessionActivity{}
+		rt.activity[tokenHash] = act
+	}
+	act.playing = true
+	act.lastPlaybackAt = now
+	rt.mu.Unlock()
+}
+
 func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
 	if rt == nil || rt.db == nil || tokenHash == "" {
 		return nil
@@ -1250,6 +1288,7 @@ func (rt *shareUserRuntime) interceptLogin(w http.ResponseWriter, r *http.Reques
 	body, contentType := parsed.rewrite(upstreamUser, upstreamPassword)
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
+	r.TransferEncoding = nil
 	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	r.Header.Set("Content-Type", contentType)
 	// The login response is parsed for the access token, so keep it plain.

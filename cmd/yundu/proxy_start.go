@@ -96,6 +96,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			uaPolicy:              policy,
 			upstreamHeaderPolicy:  configuredHeaders,
 			pathPrefix:            site.PathPrefix,
+			pm:                    pm,
 		}
 	}
 	var pingCacheState *pingCache
@@ -390,6 +391,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 		}
+		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash))
 		if isReservedDynamicRoute(r.URL.Path) {
 			var rw http.ResponseWriter
 			if speedLimitBytes > 0 {
@@ -412,6 +414,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			} else {
 				dynamicIssuer.serve(rw, r)
 			}
+			return
+		}
+
+		if tryRedirectToEdgeNode(w, r, pm, site, target, playbackTarget, isRedirectMode, policy, configuredHeaders, inst.trustedProxies, requestLogEntry.ClientIP, shareUser, shareSessionHash) {
 			return
 		}
 

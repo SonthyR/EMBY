@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.0.3"
+var appVersion = "v1.1.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -168,7 +168,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid client IP region configuration: %v", err)
 	}
+	ip2regionDir := strings.TrimSpace(os.Getenv("IP2REGION_DIR"))
+	if ip2regionDir == "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		ip2regionDir = filepath.Join(filepath.Dir(dbPath), "ip2region")
+	}
+	ip2regionMgr := newIP2RegionManager(ip2regionDir, nil)
+	defer ip2regionMgr.Close()
+	clientIPRegions.setLocalDB(ip2regionMgr)
 	pm := NewProxyManager(db, upstreamHeaderKey)
+	pm.SetEdgeRuntime(newEdgeNodeRuntime(db, pm, ip2regionMgr))
 	if panelTLSEnabled {
 		pm.SetSiteTLSConfig(panelTLSConfig)
 	}
@@ -218,6 +226,7 @@ func main() {
 		loginLimiter:      newLoginRateLimiter(),
 		trustedProxies:    trustedProxies,
 		clientIPRegions:   clientIPRegions,
+		ip2region:         ip2regionMgr,
 		panelHost:         panelHost,
 		routeDomain:       routeDomain,
 		routeDirect:       envBool("PANEL_ROUTE_DIRECT"),
@@ -269,6 +278,12 @@ func main() {
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/share-users", cors(app.authMiddleware(app.handleShareUsers)))
 	mux.HandleFunc("/api/share-users/", cors(app.authMiddleware(app.handleShareUserByID)))
+	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
+	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
+	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))
+	mux.HandleFunc("/api/ip2region", cors(app.authMiddleware(app.handleIP2Region)))
+	mux.HandleFunc("/api/ip2region/", cors(app.authMiddleware(app.handleIP2Region)))
+	mux.HandleFunc("/api/agent/heartbeat", app.handleAgentHeartbeat)
 	mux.HandleFunc("/api/me/login", cors(app.csrfMiddleware(app.handleShareSelfLogin)))
 	mux.HandleFunc("/api/me/logout", cors(app.handleShareSelfLogout))
 	mux.HandleFunc("/api/me", cors(app.handleShareSelf))

@@ -97,3 +97,88 @@ export interface ShareUserInput {
   traffic_reset_day: number
   sites: { site_id: number; site_account_id: number }[]
 }
+
+export type EdgeNodeStatus = 'online' | 'offline' | 'disabled' | 'quota' | 'waiting'
+export type EdgeNodeTLSMode = 'auto' | 'external' | 'http'
+
+export interface EdgeNode {
+  id: number
+  name: string
+  public_port: number
+  listen_port: number
+  public_host: string
+  public_ip: string
+  detected_ip: string
+  tls_mode: EdgeNodeTLSMode | string
+  enabled: boolean
+  traffic_quota: number
+  traffic_used: number
+  traffic_reset_day: number
+  next_reset_at?: string
+  note: string
+  agent_version: string
+  last_seen_at: string
+  online: boolean
+  tls_active: boolean
+  active_streams: number
+  current_bps: number
+  public_url: string
+  status: EdgeNodeStatus
+  install_command?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface EdgeNodeInput {
+  name: string
+  public_port: number
+  listen_port?: number
+  public_host?: string
+  public_ip?: string
+  tls_mode?: EdgeNodeTLSMode | string
+  enabled?: boolean
+  traffic_quota?: number
+  traffic_reset_day?: number
+  note?: string
+}
+
+export interface ISPRouteNode {
+  node_id: number
+  name: string
+  is_master: boolean
+  enabled: boolean
+  online: boolean
+  status: EdgeNodeStatus | string
+  active: boolean
+  public_url?: string
+}
+
+export interface ISPRouteGroup {
+  group: 'ct' | 'cu' | 'cm' | 'other' | string
+  label: string
+  nodes: ISPRouteNode[]
+}
+
+export interface IP2RegionDBStatus {
+  version: 'v4' | 'v6' | string
+  downloaded: boolean
+  size_bytes: number
+  updated_at?: string
+}
+
+export interface IP2RegionStatus {
+  v4: IP2RegionDBStatus
+  v6: IP2RegionDBStatus
+  mirrors: string[]
+}
+
+export interface IP2RegionLookupResult {
+  ip: string
+  region: string
+  isp: string
+  isp_group: string
+  isp_label: string
+  node_id: number
+  node_name: string
+  public_url?: string
+}

@@ -526,6 +526,9 @@ func (d *DB) migrateOnce() error {
 	if err := ensureShareUserSchema(ctx, conn); err != nil {
 		return err
 	}
+	if err := ensureEdgeNodeSchema(ctx, conn); err != nil {
+		return err
+	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err

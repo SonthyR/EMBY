@@ -27,6 +27,7 @@ type dynamicCapabilityIssuer struct {
 	uaPolicy              UAHeaderPolicy
 	upstreamHeaderPolicy  upstreamHeaderPolicy
 	pathPrefix            string
+	pm                    *ProxyManager
 }
 
 func (i *dynamicCapabilityIssuer) clientRoute(route string) string {

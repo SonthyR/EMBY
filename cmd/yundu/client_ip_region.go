@@ -32,11 +32,21 @@ type clientIPRegionCacheEntry struct {
 type clientIPRegionResolver struct {
 	endpoint string
 	client   *http.Client
+	localDB  *ip2regionManager
 
 	mu       sync.Mutex
 	cache    map[string]clientIPRegionCacheEntry
 	inflight map[string]struct{}
 	workers  chan struct{}
+}
+
+func (r *clientIPRegionResolver) setLocalDB(mgr *ip2regionManager) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.localDB = mgr
+	r.mu.Unlock()
 }
 
 func newClientIPRegionResolver(endpoint string, client *http.Client) (*clientIPRegionResolver, error) {
@@ -93,6 +103,14 @@ func (r *clientIPRegionResolver) lookup(ip string) string {
 	}
 	if r == nil {
 		return clientIPRegionUnknown
+	}
+	r.mu.Lock()
+	localDB := r.localDB
+	r.mu.Unlock()
+	if localDB != nil {
+		if display, ok := localDB.LookupDisplay(normalized); ok {
+			return display
+		}
 	}
 	now := time.Now()
 	r.mu.Lock()

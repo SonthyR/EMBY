@@ -1,5 +1,17 @@
 import { api } from './client'
-import type { AuthCheck, ShareUser, ShareUserInput, Site, SiteAccount } from './types'
+import type {
+  AuthCheck,
+  EdgeNode,
+  EdgeNodeInput,
+  IP2RegionDBStatus,
+  IP2RegionLookupResult,
+  IP2RegionStatus,
+  ISPRouteGroup,
+  ShareUser,
+  ShareUserInput,
+  Site,
+  SiteAccount,
+} from './types'
 
 export * from './client'
 export * from './types'
@@ -244,4 +256,27 @@ export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput>
     sites: user.sites.map(site => ({ site_id: site.site_id, site_account_id: site.site_account_id || 0 })),
     ...patch,
   }
+}
+
+export const edgeApi = {
+  list: () => api.get<EdgeNode[]>('/api/edge-nodes'),
+  get: (nodeId: number) => api.get<EdgeNode>(`/api/edge-nodes/${id(nodeId)}`),
+  create: (input: EdgeNodeInput) => api.post<EdgeNode>('/api/edge-nodes', input),
+  update: (nodeId: number, input: EdgeNodeInput) => api.put<EdgeNode>(`/api/edge-nodes/${id(nodeId)}`, input),
+  remove: (nodeId: number) => api.del<{ deleted: boolean }>(`/api/edge-nodes/${id(nodeId)}`),
+  resetToken: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-token`),
+  resetTraffic: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-traffic`),
+}
+
+export const ispRoutesApi = {
+  get: () => api.get<{ groups: ISPRouteGroup[] }>('/api/isp-routes'),
+  update: (group: string, nodes: { node_id: number; enabled: boolean }[]) =>
+    api.put<{ groups: ISPRouteGroup[] }>('/api/isp-routes', { group, nodes }),
+}
+
+export const ip2regionApi = {
+  status: () => api.get<IP2RegionStatus>('/api/ip2region'),
+  update: (version: 'v4' | 'v6') => api.post<{ item: IP2RegionDBStatus; status: IP2RegionStatus }>('/api/ip2region/update', { version }),
+  remove: (version: 'v4' | 'v6') => api.del<IP2RegionStatus>(`/api/ip2region?version=${encodeURIComponent(version)}`),
+  lookup: (ip: string) => api.post<IP2RegionLookupResult>('/api/ip2region/lookup', { ip }),
 }

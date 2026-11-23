@@ -705,6 +705,14 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		redirectHeaders = outbound.Header.Clone()
 		applyDynamicCapabilityRequiredHeaders(outbound.Header, claims)
 	}
+	if claims.Kind == dynamicCapabilityKindResource && i.pm != nil && i.pm.edges != nil {
+		if tryRedirectDynamicResourceToEdgeNode(w, r, i.pm, i.site, target, outbound.Header, claims.RequiredHeaders) {
+			if i.state.useCapability(token, time.Now()) {
+				commit()
+			}
+			return
+		}
+	}
 	resp, roundTripErr := transport.RoundTrip(outbound)
 	if roundTripErr != nil || resp == nil {
 		if resp != nil && resp.Body != nil {

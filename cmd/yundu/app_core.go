@@ -26,6 +26,7 @@ type App struct {
 	loginLimiterOnce  sync.Once
 	trustedProxies    []*net.IPNet
 	clientIPRegions   *clientIPRegionResolver
+	ip2region         *ip2regionManager
 	panelHost         string
 	routeDomain       string
 	routeDirect       bool

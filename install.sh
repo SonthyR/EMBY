@@ -56,6 +56,15 @@ PASSWORD_TRANSACTION=0
 PANEL_WORK_DIR=""
 PANEL_TRANSACTION=0
 COSIGN_BIN=""
+AGENT_SERVICE_NAME="${MERIDIAN_AGENT_SERVICE_NAME:-meridian-agent}"
+AGENT_SERVICE_FILE="${MERIDIAN_AGENT_SERVICE_FILE:-/etc/systemd/system/meridian-agent.service}"
+AGENT_CONFIG_DIR="${MERIDIAN_AGENT_CONFIG_DIR:-/etc/meridian-agent}"
+AGENT_MASTER=""
+AGENT_NODE_ID=""
+AGENT_TOKEN=""
+AGENT_PORT="19090"
+AGENT_BIND="0.0.0.0"
+AGENT_UNINSTALL=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2895,6 +2904,121 @@ do_uninstall() {
     ok "Meridian 已卸载"
 }
 
+write_agent_systemd_service() {
+    local tmp_dir="$1" service_tmp
+    is_systemd || return 0
+    service_tmp="${tmp_dir}/meridian-agent.service"
+    cat > "$service_tmp" <<SVCEOF
+[Unit]
+Description=Meridian Edge Agent (Yundu media relay)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+UMask=0077
+EnvironmentFile=${AGENT_CONFIG_DIR}/env
+ExecStart=${INSTALL_DIR}/${BIN_NAME} agent
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    as_root install -o root -g root -m 0644 "$service_tmp" "$AGENT_SERVICE_FILE"
+    as_root systemctl daemon-reload
+    as_root systemctl enable "$AGENT_SERVICE_NAME" >/dev/null
+}
+
+do_agent() (
+    local tmp_dir latest env_tmp
+    init_privilege
+    validate_install_dir
+    validate_safe_directory "$AGENT_CONFIG_DIR" "从机配置目录"
+
+    if [ "$AGENT_UNINSTALL" = "1" ]; then
+        if is_systemd && [ -f "$AGENT_SERVICE_FILE" ]; then
+            as_root systemctl stop "$AGENT_SERVICE_NAME" 2>/dev/null || true
+            as_root systemctl disable "$AGENT_SERVICE_NAME" 2>/dev/null || true
+            as_root rm -f -- "$AGENT_SERVICE_FILE"
+            as_root systemctl daemon-reload
+        fi
+        as_root rm -rf -- "$AGENT_CONFIG_DIR"
+        ok "Meridian Edge Agent 已卸载"
+        exit 0
+    fi
+
+    [[ "$AGENT_MASTER" =~ ^https?://[^[:space:]]+$ ]] \
+        || fail "--master 必须是有效的 http(s):// 主机地址"
+    [[ "$AGENT_NODE_ID" =~ ^[1-9][0-9]*$ ]] \
+        || fail "--id 必须是正整数节点 ID"
+    [ -n "$AGENT_TOKEN" ] || fail "--token 不能为空"
+    AGENT_PORT=$(normalize_port "$AGENT_PORT") \
+        || fail "--port 无效: ${AGENT_PORT}（必须是 1-65535 的整数）"
+
+    need_cmd curl
+    ensure_cli_dependencies
+    ensure_service_user
+
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf -- "$tmp_dir"' EXIT
+
+    latest=$(resolve_latest_version)
+    download_release_binary "$latest" "$tmp_dir"
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${INSTALL_DIR}/${BIN_NAME}.new"
+    as_root mv -f "${INSTALL_DIR}/${BIN_NAME}.new" "${INSTALL_DIR}/${BIN_NAME}"
+
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$AGENT_CONFIG_DIR"
+    env_tmp="${tmp_dir}/agent.env"
+    cat > "$env_tmp" <<ENVEOF
+YUNDU_MASTER_URL=${AGENT_MASTER}
+YUNDU_NODE_ID=${AGENT_NODE_ID}
+YUNDU_NODE_TOKEN=${AGENT_TOKEN}
+YUNDU_AGENT_PORT=${AGENT_PORT}
+YUNDU_AGENT_BIND=${AGENT_BIND}
+ENVEOF
+    chmod 0600 "$env_tmp"
+    as_root install -o root -g "$ROOT_GROUP" -m 0600 "$env_tmp" "${AGENT_CONFIG_DIR}/env"
+
+    if is_systemd; then
+        write_agent_systemd_service "$tmp_dir"
+        as_root systemctl restart "$AGENT_SERVICE_NAME"
+        sleep 1
+        if as_root systemctl is-active --quiet "$AGENT_SERVICE_NAME"; then
+            ok "从机 Agent 已启动（节点 #${AGENT_NODE_ID}，监听 ${AGENT_BIND}:${AGENT_PORT}）"
+            info "查看日志: journalctl -u ${AGENT_SERVICE_NAME} -f"
+            info "卸载从机: bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/master/install.sh) agent --uninstall"
+        else
+            as_root systemctl status "$AGENT_SERVICE_NAME" --no-pager || true
+            fail "从机 Agent 启动失败，请检查上述日志"
+        fi
+    else
+        ok "二进制与配置已就绪，请手动运行: ${INSTALL_DIR}/${BIN_NAME} agent --master ${AGENT_MASTER} --id ${AGENT_NODE_ID} --port ${AGENT_PORT} --token <TOKEN>"
+    fi
+)
+
 usage() {
     cat <<'USAGE'
 Meridian 一键安装工具
@@ -2912,6 +3036,10 @@ Meridian 一键安装工具
       隐藏输入并修改唯一管理员密码，同时轮换 JWT 密钥。
   install.sh proxy --local
       为同机 Nginx / 宝塔反代添加回环可信代理，备份配置并重启；不修改域名、证书或 Nginx。
+  install.sh agent --master URL --id ID --token TOKEN [--port PORT] [--bind ADDR]
+      一键安装并启动轻量从机媒体中转节点（Edge Agent，约 15-25MB 内存，兼容 NAT VPS）。
+  install.sh agent --uninstall
+      卸载从机节点服务与配置（不影响主机服务）。
   install.sh uninstall [-y] [--purge]
       卸载程序；默认保留数据与备份，--purge 才删除数据。
   install.sh help
@@ -3005,12 +3133,41 @@ run_cli() {
                 shift
                 ;;
             --port|-p)
-                [[ "$action" = install || "$action" = tls ]] || fail "--port 仅用于 install 或 tls"
+                [[ "$action" = install || "$action" = tls || "$action" = agent ]] || fail "--port 仅用于 install、tls 或 agent"
                 [ "$#" -ge 2 ] || fail "--port 需要一个端口"
-                [ -z "$REQUESTED_PORT" ] || fail "端口选项不能重复"
-                REQUESTED_PORT=$(normalize_port "$2") \
-                    || fail "面板端口无效: $2（必须是 1-65535 的整数）"
+                if [ "$action" = agent ]; then
+                    AGENT_PORT=$(normalize_port "$2") \
+                        || fail "从机监听端口无效: $2（必须是 1-65535 的整数）"
+                else
+                    [ -z "$REQUESTED_PORT" ] || fail "端口选项不能重复"
+                    REQUESTED_PORT=$(normalize_port "$2") \
+                        || fail "面板端口无效: $2（必须是 1-65535 的整数）"
+                fi
                 shift
+                ;;
+            --master)
+                [ "$action" = agent ] || fail "--master 仅用于 agent"
+                [ "$#" -ge 2 ] || fail "--master 需要主机面板 URL"
+                AGENT_MASTER="$2"; shift
+                ;;
+            --id)
+                [ "$action" = agent ] || fail "--id 仅用于 agent"
+                [ "$#" -ge 2 ] || fail "--id 需要节点 ID"
+                AGENT_NODE_ID="$2"; shift
+                ;;
+            --token)
+                [ "$action" = agent ] || fail "--token 仅用于 agent"
+                [ "$#" -ge 2 ] || fail "--token 需要节点密钥"
+                AGENT_TOKEN="$2"; shift
+                ;;
+            --bind)
+                [ "$action" = agent ] || fail "--bind 仅用于 agent"
+                [ "$#" -ge 2 ] || fail "--bind 需要监听地址"
+                AGENT_BIND="$2"; shift
+                ;;
+            --uninstall)
+                [ "$action" = agent ] || fail "--uninstall 仅用于 agent"
+                AGENT_UNINSTALL=1
                 ;;
             --email)
                 [[ "$action" = install || "$action" = tls ]] || fail "--email 仅用于 install 或 tls"
@@ -3055,10 +3212,11 @@ run_cli() {
         update) do_update ;;
         password) do_password ;;
         proxy) do_proxy ;;
+        agent) do_agent ;;
         uninstall) do_uninstall ;;
         help) usage ;;
         menu) main_menu ;;
-        *) fail "未知操作: $action（仅支持 install、update、tls、proxy、password、uninstall、help）" ;;
+        *) fail "未知操作: $action（仅支持 install、update、tls、proxy、agent、password、uninstall、help）" ;;
     esac
 }
 

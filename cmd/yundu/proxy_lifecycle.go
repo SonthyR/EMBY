@@ -102,6 +102,9 @@ func (pm *ProxyManager) FlushTraffic() {
 		}
 	}
 	pm.shares.flush()
+	if pm.edges != nil {
+		pm.edges.flush()
+	}
 }
 
 // flushProxyTraffic persists inst's pending bytes and requests into the DB and
@@ -529,5 +532,9 @@ func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
 			delete(pm.proxies, id)
 		}
 		pm.mu.Unlock()
+	}
+	pm.shares.flush()
+	if pm.edges != nil {
+		pm.edges.flush()
 	}
 }
