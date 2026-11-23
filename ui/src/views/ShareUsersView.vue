@@ -84,7 +84,7 @@ const visible = computed(() => {
   const q = query.value.trim().toLowerCase()
   return users.value.filter(user => {
     if (filter.value !== 'all' && user.status !== filter.value) return false
-    return !q || [user.username, user.note, ...user.sites.map(s => s.site_name || '')].some(v => (v || '').toLowerCase().includes(q))
+    return !q || [user.username, user.route_prefix || '', user.note, ...user.sites.map(s => s.site_name || '')].some(v => (v || '').toLowerCase().includes(q))
   })
 })
 
@@ -202,7 +202,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
         >
           <span class="who" role="cell">
             <span class="name">{{ user.username }}</span>
-            <span class="sub">{{ user.note || user.sites.map(s => s.site_name).join('、') }}</span>
+            <span class="sub">{{ [user.route_prefix, user.note || user.active_site_name || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
           </span>
           <span class="status" role="cell"><span class="dot" :class="STATUS_TONE[user.status]" />{{ STATUS_LABEL[user.status] }}</span>
           <span class="traffic" role="cell">

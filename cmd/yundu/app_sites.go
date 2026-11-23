@@ -314,6 +314,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusBadRequest, "path_prefix is already assigned to another site")
 				return
 			}
+			if _, exists := a.pm.ShareRoutePrefixUserID(req.PathPrefix); exists {
+				a.jsonErr(w, http.StatusBadRequest, "path_prefix conflicts with a share user route")
+				return
+			}
 		}
 		candidate := Site{
 			Name:                          req.Name,
@@ -947,6 +951,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if candidate.PathPrefix != "" {
 			if assignedID, exists := a.pm.PathPrefixSiteID(candidate.PathPrefix); exists && assignedID != candidate.ID {
 				a.jsonErr(w, http.StatusBadRequest, "path_prefix is already assigned to another site")
+				return
+			}
+			if _, exists := a.pm.ShareRoutePrefixUserID(candidate.PathPrefix); exists {
+				a.jsonErr(w, http.StatusBadRequest, "path_prefix conflicts with a share user route")
 				return
 			}
 		}

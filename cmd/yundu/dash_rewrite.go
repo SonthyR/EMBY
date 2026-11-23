@@ -261,6 +261,9 @@ func rewriteDASHTemplate(value string, base *url.URL, session *dynamicRewriteSes
 	var discoveryErr *dynamicProxyError
 	if configured {
 		route, acquired, discoveryErr = session.issuer.mintTrustedValidatedTracked(validationTarget, claimTarget, expressions, fixedValues, session.source, dynamicCapabilityKindResource, 0)
+		if discoveryErr == nil {
+			route = session.issuer.clientRouteForContext(session.ctx, dynamicRoutePrefix+session.issuer.capabilityToken(route))
+		}
 	} else {
 		route, acquired, discoveryErr = session.issuer.mintValidatedDASHTemplateTracked(session.ctx, base, validationTarget, session.source, claimTarget, expressions, fixedValues)
 	}

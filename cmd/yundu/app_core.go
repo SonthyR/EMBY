@@ -159,6 +159,34 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 				handler.ServeHTTP(w, r)
 				return
 			}
+			if shareUserID, prefix, matched := a.pm.SharePathRoute(r.URL.Path); matched {
+				if r.URL.Path == prefix && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+					target := prefix + "/"
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, target, http.StatusPermanentRedirect) // #nosec G710 -- target is constructed solely from the matched local ingress prefix and original query.
+					return
+				}
+				ctx := context.WithValue(r.Context(), pathIngressContextKey{}, prefix)
+				ctx = context.WithValue(ctx, shareRouteUserContextKey{}, shareUserID)
+				r = r.Clone(ctx)
+				normalizeEmbeddedIngressRequestPath(r.URL, prefix)
+				stripIngressPathPrefix(r.URL, prefix)
+				normalizeStrippedIngressRequestPath(r.URL, prefix)
+				siteID, errStatus, errMsg := a.pm.shares.resolveShareRouteTarget(shareUserID, r)
+				if errStatus != 0 {
+					writeShareJSONError(w, errStatus, errMsg)
+					return
+				}
+				handler, ok := a.pm.SiteHandler(siteID)
+				if !ok || handler == nil {
+					writeShareJSONError(w, http.StatusServiceUnavailable, "暂无可用服务器")
+					return
+				}
+				handler.ServeHTTP(w, r)
+				return
+			}
 			panel.ServeHTTP(w, r)
 			return
 		}

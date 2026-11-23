@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -55,6 +56,24 @@ func applyUAHeaderPolicy(header http.Header, policy UAHeaderPolicy) {
 
 type publicHostIngressContextKey struct{}
 type pathIngressContextKey struct{}
+type shareRouteUserContextKey struct{}
+
+func requestPathIngressPrefix(ctx context.Context, fallback string) string {
+	if ctx != nil {
+		if prefix, _ := ctx.Value(pathIngressContextKey{}).(string); prefix != "" {
+			return prefix
+		}
+	}
+	return fallback
+}
+
+func shareRouteUserFromContext(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	userID, ok := ctx.Value(shareRouteUserContextKey{}).(int64)
+	return userID, ok && userID > 0
+}
 
 func applySiteForwardedHost(header http.Header, inbound *http.Request, site Site) {
 	header.Del("X-Forwarded-Host")
@@ -62,11 +81,14 @@ func applySiteForwardedHost(header http.Header, inbound *http.Request, site Site
 	if inbound == nil {
 		return
 	}
-	if ingressUsesPath(site.IngressMode) {
-		if prefix, _ := inbound.Context().Value(pathIngressContextKey{}).(string); prefix == site.PathPrefix {
+	if prefix, _ := inbound.Context().Value(pathIngressContextKey{}).(string); prefix != "" {
+		if _, isShareRoute := shareRouteUserFromContext(inbound.Context()); isShareRoute || (ingressUsesPath(site.IngressMode) && prefix == site.PathPrefix) {
 			header.Set("X-Forwarded-Host", inbound.Host)
 			header.Set("X-Forwarded-Prefix", prefix)
+			return
 		}
+	}
+	if ingressUsesPath(site.IngressMode) {
 		return
 	}
 	if !ingressUsesHost(site.IngressMode) {

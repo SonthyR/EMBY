@@ -27,13 +27,14 @@ const (
 var shareCapabilityPattern = regexp.MustCompile(`/_meridian/d/([A-Za-z0-9_\-.~]{16,})`)
 
 type shareCapabilityOwner struct {
-	userID  int64
-	siteID  int64
-	expires time.Time
+	userID    int64
+	siteID    int64
+	tokenHash string
+	expires   time.Time
 }
 
 // rememberCapabilities records capability tokens found in text as owned by user.
-func (rt *shareUserRuntime) rememberCapabilities(text string, userID, siteID int64) {
+func (rt *shareUserRuntime) rememberCapabilities(text string, userID, siteID int64, tokenHash string) {
 	matches := shareCapabilityPattern.FindAllStringSubmatch(text, -1)
 	if len(matches) == 0 {
 		return
@@ -55,31 +56,44 @@ func (rt *shareUserRuntime) rememberCapabilities(text string, userID, siteID int
 		}
 	}
 	for _, match := range matches {
-		rt.capabilities[match[1]] = shareCapabilityOwner{userID: userID, siteID: siteID, expires: now.Add(shareCapabilityTTL)}
+		rt.capabilities[match[1]] = shareCapabilityOwner{userID: userID, siteID: siteID, tokenHash: tokenHash, expires: now.Add(shareCapabilityTTL)}
 	}
 }
 
-// capabilityOwner returns the share user that received the capability in path.
-func (rt *shareUserRuntime) capabilityOwner(requestPath string, siteID int64) (int64, bool) {
+// capabilityOwnerInfo returns the share user, site, and session token hash that
+// received the capability in path.
+func (rt *shareUserRuntime) capabilityOwnerInfo(requestPath string) (shareCapabilityOwner, bool) {
+	if rt == nil {
+		return shareCapabilityOwner{}, false
+	}
 	normalized := normalizeDynamicCapabilityPath(requestPath)
 	if normalized == "" {
-		return 0, false
+		return shareCapabilityOwner{}, false
 	}
 	token, _, _ := strings.Cut(strings.TrimPrefix(normalized, dynamicRoutePrefix), "/")
 	if token == "" {
-		return 0, false
+		return shareCapabilityOwner{}, false
 	}
 	rt.capMu.Lock()
 	defer rt.capMu.Unlock()
 	owner, ok := rt.capabilities[token]
-	if !ok || owner.siteID != siteID {
-		return 0, false
+	if !ok {
+		return shareCapabilityOwner{}, false
 	}
 	if time.Now().After(owner.expires) {
 		delete(rt.capabilities, token)
-		return 0, false
+		return shareCapabilityOwner{}, false
 	}
-	return owner.userID, true
+	return owner, true
+}
+
+// capabilityOwner returns the share user that received the capability in path.
+func (rt *shareUserRuntime) capabilityOwner(requestPath string, siteID int64) (int64, string, bool) {
+	owner, ok := rt.capabilityOwnerInfo(requestPath)
+	if !ok || owner.siteID != siteID {
+		return 0, "", false
+	}
+	return owner.userID, owner.tokenHash, true
 }
 
 // shareRateLimiter is a token bucket shared by every request of one user.
@@ -140,6 +154,7 @@ type shareResponseWriter struct {
 	rt          *shareUserRuntime
 	userID      int64
 	siteID      int64
+	tokenHash   string
 	limiter     *shareRateLimiter
 	ctx         context.Context
 	scan        bool
@@ -148,14 +163,14 @@ type shareResponseWriter struct {
 	wroteHeader bool
 }
 
-func (rt *shareUserRuntime) wrapWriter(w http.ResponseWriter, r *http.Request, user *shareUserState, siteID int64) http.ResponseWriter {
+func (rt *shareUserRuntime) wrapWriter(w http.ResponseWriter, r *http.Request, user *shareUserState, siteID int64, tokenHash string) http.ResponseWriter {
 	if rt == nil || user == nil {
 		return w
 	}
 	rt.mu.RLock()
 	limiter := user.limiter
 	rt.mu.RUnlock()
-	return &shareResponseWriter{ResponseWriter: w, rt: rt, userID: user.id, siteID: siteID, limiter: limiter, ctx: r.Context()}
+	return &shareResponseWriter{ResponseWriter: w, rt: rt, userID: user.id, siteID: siteID, tokenHash: tokenHash, limiter: limiter, ctx: r.Context()}
 }
 
 func shareScannableContentType(value string) bool {
@@ -172,7 +187,7 @@ func (w *shareResponseWriter) WriteHeader(status int) {
 	if !w.wroteHeader {
 		w.wroteHeader = true
 		if location := w.Header().Get("Location"); location != "" {
-			w.rt.rememberCapabilities(location, w.userID, w.siteID)
+			w.rt.rememberCapabilities(location, w.userID, w.siteID, w.tokenHash)
 		}
 		w.scan = shareScannableContentType(w.Header().Get("Content-Type"))
 	}
@@ -185,7 +200,7 @@ func (w *shareResponseWriter) Write(b []byte) (int, error) {
 	}
 	if w.scan && w.scanned < shareCapabilityScanLimit {
 		chunk := w.tail + string(b)
-		w.rt.rememberCapabilities(chunk, w.userID, w.siteID)
+		w.rt.rememberCapabilities(chunk, w.userID, w.siteID, w.tokenHash)
 		w.scanned += len(b)
 		if len(chunk) > 256 {
 			w.tail = chunk[len(chunk)-256:]

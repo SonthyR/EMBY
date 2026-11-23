@@ -69,7 +69,7 @@ func (s *dynamicRewriteSession) publishLearnedPlaybackPaths() {
 }
 
 func (s *dynamicRewriteSession) rememberCapability(seenKey, token string) string {
-	route := s.issuer.clientRoute(dynamicRoutePrefix + token)
+	route := s.issuer.clientRouteForContext(s.ctx, dynamicRoutePrefix+token)
 	if s.seen == nil {
 		s.seen = make(map[string]string)
 	}
@@ -342,12 +342,14 @@ func (s *dynamicRewriteSession) rewriteAgainstSourceKindDepthWithRequiredHeaders
 		if discoveryErr != nil {
 			return "", discoveryErr
 		}
+		token := s.issuer.capabilityToken(route)
+		route = s.issuer.clientRouteForContext(s.ctx, dynamicRoutePrefix+token)
 		if s.seen == nil {
 			s.seen = make(map[string]string)
 		}
 		s.seen[seenKey] = route
 		if acquired {
-			s.minted = append(s.minted, s.issuer.capabilityToken(route))
+			s.minted = append(s.minted, token)
 		}
 		return route, nil
 	}

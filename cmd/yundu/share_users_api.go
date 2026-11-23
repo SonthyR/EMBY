@@ -21,27 +21,34 @@ type ShareUserSite struct {
 	SiteName      string `json:"site_name,omitempty"`
 	AccountName   string `json:"account_name,omitempty"`
 	SiteEnabled   bool   `json:"site_enabled,omitempty"`
+	SortOrder     int    `json:"sort_order"`
+	Active        bool   `json:"active,omitempty"`
 }
 
 type ShareUser struct {
-	ID           int64                `json:"id"`
-	Username     string               `json:"username"`
-	Password     string               `json:"password,omitempty"` // #nosec G117 -- authorized share-user memo for the administrator.
-	Note         string               `json:"note"`
-	Enabled      bool                 `json:"enabled"`
-	ExpiresAt    string               `json:"expires_at"`
-	TrafficQuota int64                `json:"traffic_quota"`
-	TrafficUsed  int64                `json:"traffic_used"`
-	Status       string               `json:"status"`
-	SessionCount int                  `json:"session_count"`
-	MaxDevices   int                  `json:"max_devices"`
-	SpeedLimit   int                  `json:"speed_limit"`
-	ResetDay     int                  `json:"traffic_reset_day"`
-	NextResetAt  string               `json:"next_reset_at,omitempty"`
-	Sites        []ShareUserSite      `json:"sites"`
-	Sessions     []shareStoredSession `json:"sessions,omitempty"`
-	CreatedAt    string               `json:"created_at"`
-	UpdatedAt    string               `json:"updated_at"`
+	ID               int64                `json:"id"`
+	Username         string               `json:"username"`
+	Password         string               `json:"password,omitempty"` // #nosec G117 -- authorized share-user memo for the administrator.
+	RoutePrefix      string               `json:"route_prefix"`
+	RouteURL         string               `json:"route_url,omitempty"`
+	Note             string               `json:"note"`
+	Enabled          bool                 `json:"enabled"`
+	ExpiresAt        string               `json:"expires_at"`
+	TrafficQuota     int64                `json:"traffic_quota"`
+	TrafficUsed      int64                `json:"traffic_used"`
+	Status           string               `json:"status"`
+	SessionCount     int                  `json:"session_count"`
+	DrainingSessions int                  `json:"draining_sessions,omitempty"`
+	MaxDevices       int                  `json:"max_devices"`
+	SpeedLimit       int                  `json:"speed_limit"`
+	ResetDay         int                  `json:"traffic_reset_day"`
+	NextResetAt      string               `json:"next_reset_at,omitempty"`
+	ActiveSiteID     int64                `json:"active_site_id,omitempty"`
+	ActiveSiteName   string               `json:"active_site_name,omitempty"`
+	Sites            []ShareUserSite      `json:"sites"`
+	Sessions         []shareStoredSession `json:"sessions,omitempty"`
+	CreatedAt        string               `json:"created_at"`
+	UpdatedAt        string               `json:"updated_at"`
 }
 
 type ShareUserSiteInput struct {
@@ -52,6 +59,7 @@ type ShareUserSiteInput struct {
 type ShareUserInput struct {
 	Username     string               `json:"username"`
 	Password     string               `json:"password"` // #nosec G117 -- request-only credential DTO.
+	RoutePrefix  string               `json:"route_prefix"`
 	Note         string               `json:"note"`
 	Enabled      *bool                `json:"enabled"`
 	ExpiresAt    string               `json:"expires_at"`
@@ -75,8 +83,8 @@ func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
-	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
-		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.CreatedAt, &item.UpdatedAt)
+	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
+		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +98,7 @@ func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) 
 }
 
 func (d *DB) shareUserSites(id int64) ([]ShareUserSite, error) {
-	rows, err := d.db.Query(`SELECT a.site_id, a.site_account_id, s.name, s.enabled, COALESCE(c.account_name, '') FROM share_user_sites a JOIN sites s ON s.id=a.site_id LEFT JOIN site_accounts c ON c.id=a.site_account_id AND c.site_id=a.site_id WHERE a.share_user_id=? ORDER BY s.sort_order, s.id`, id)
+	rows, err := d.db.Query(`SELECT a.site_id, a.site_account_id, a.sort_order, s.name, s.enabled, COALESCE(c.account_name, '') FROM share_user_sites a JOIN sites s ON s.id=a.site_id LEFT JOIN site_accounts c ON c.id=a.site_account_id AND c.site_id=a.site_id WHERE a.share_user_id=? ORDER BY a.sort_order, s.sort_order, s.id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +107,7 @@ func (d *DB) shareUserSites(id int64) ([]ShareUserSite, error) {
 	for rows.Next() {
 		var item ShareUserSite
 		var enabled int
-		if err := rows.Scan(&item.SiteID, &item.SiteAccountID, &item.SiteName, &enabled, &item.AccountName); err != nil {
+		if err := rows.Scan(&item.SiteID, &item.SiteAccountID, &item.SortOrder, &item.SiteName, &enabled, &item.AccountName); err != nil {
 			return nil, err
 		}
 		item.SiteEnabled = enabled != 0
@@ -137,7 +145,7 @@ func validShareUsername(value string) bool {
 	return true
 }
 
-func (a *App) normalizeShareUserInput(input ShareUserInput, creating bool) (ShareUserInput, error) {
+func (a *App) normalizeShareUserInput(input ShareUserInput, excludeID int64, creating bool) (ShareUserInput, error) {
 	input.Username = strings.TrimSpace(input.Username)
 	input.Note = strings.TrimSpace(input.Note)
 	input.ExpiresAt = strings.TrimSpace(input.ExpiresAt)
@@ -147,6 +155,34 @@ func (a *App) normalizeShareUserInput(input ShareUserInput, creating bool) (Shar
 	var adminNamed int
 	if err := a.db.db.QueryRow(`SELECT COUNT(*) FROM users WHERE username=? COLLATE NOCASE`, input.Username).Scan(&adminNamed); err == nil && adminNamed > 0 {
 		return input, errors.New("不能和管理员用户名相同")
+	}
+	if strings.TrimSpace(input.RoutePrefix) != "" {
+		normalized, err := normalizePathPrefix(input.RoutePrefix)
+		if err != nil {
+			if strings.Contains(err.Error(), "reserved") {
+				return input, errors.New("专属后缀不能使用系统保留路径")
+			}
+			return input, errors.New("专属后缀只能包含英文字母、数字、连字符和下划线（最多 64 位）")
+		}
+		if normalized == "/app" || normalized == "/legacy" {
+			return input, errors.New("专属后缀不能使用系统保留路径")
+		}
+		input.RoutePrefix = normalized
+		var siteConflict int
+		if err := a.db.db.QueryRow(`SELECT COUNT(*) FROM sites WHERE path_prefix=?`, input.RoutePrefix).Scan(&siteConflict); err == nil && siteConflict > 0 {
+			return input, errors.New("专属后缀与已有站点路径冲突")
+		}
+		if a.pm != nil {
+			if _, exists := a.pm.PathPrefixSiteID(input.RoutePrefix); exists {
+				return input, errors.New("专属后缀与已有站点路径冲突")
+			}
+		}
+		var userConflict int
+		if err := a.db.db.QueryRow(`SELECT COUNT(*) FROM share_users WHERE route_prefix=? AND id<>?`, input.RoutePrefix, excludeID).Scan(&userConflict); err == nil && userConflict > 0 {
+			return input, errors.New("专属后缀已被其他分享账号使用")
+		}
+	} else {
+		input.RoutePrefix = ""
 	}
 	if input.Password != "" && (len([]rune(input.Password)) < 4 || len(input.Password) > 72) {
 		return input, errors.New("密码需要 4–72 个字符")
@@ -231,10 +267,13 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Username, string(hash), cipher, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken)
+		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
+				if strings.Contains(err.Error(), "route_prefix") {
+					return 0, errors.New("专属后缀已被其他分享账号使用")
+				}
 				return 0, errors.New("用户名已存在")
 			}
 			return 0, err
@@ -251,10 +290,13 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 			}
 			enabled = current != 0
 		}
-		result, err := tx.Exec(`UPDATE share_users SET username=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, speed_limit=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-			input.Username, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, input.ResetDay, id)
+		result, err := tx.Exec(`UPDATE share_users SET username=?, route_prefix=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, speed_limit=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+			input.Username, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, input.ResetDay, id)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
+				if strings.Contains(err.Error(), "route_prefix") {
+					return 0, errors.New("专属后缀已被其他分享账号使用")
+				}
 				return 0, errors.New("用户名已存在")
 			}
 			return 0, err
@@ -279,8 +321,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 			return 0, err
 		}
 	}
-	for _, site := range input.Sites {
-		if _, err := tx.Exec(`INSERT INTO share_user_sites(share_user_id, site_id, site_account_id) VALUES(?,?,?)`, id, site.SiteID, site.SiteAccountID); err != nil {
+	for index, site := range input.Sites {
+		if _, err := tx.Exec(`INSERT INTO share_user_sites(share_user_id, site_id, site_account_id, sort_order) VALUES(?,?,?,?)`, id, site.SiteID, site.SiteAccountID, index+1); err != nil {
 			return 0, err
 		}
 	}
@@ -290,7 +332,7 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 	return id, nil
 }
 
-func (a *App) shareUserView(item *storedShareUser, includeSecrets bool) ShareUser {
+func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin string) ShareUser {
 	view := item.ShareUser
 	if a.pm != nil && a.pm.shares != nil {
 		used, _ := a.pm.shares.usage(item.ID)
@@ -298,6 +340,7 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool) ShareUse
 			view.TrafficUsed = used
 		}
 		view.SessionCount = a.pm.shares.deviceCount(item.ID)
+		view.DrainingSessions = a.pm.shares.drainingCount(item.ID)
 	}
 	if view.ResetDay > 0 {
 		if _, next := shareResetPeriod(time.Now().In(a.db.shareLocation()), view.ResetDay); !next.IsZero() {
@@ -320,6 +363,32 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool) ShareUse
 	}
 	if view.Sites == nil {
 		view.Sites = []ShareUserSite{}
+	} else {
+		copied := make([]ShareUserSite, len(view.Sites))
+		copy(copied, view.Sites)
+		view.Sites = copied
+	}
+	if view.RoutePrefix != "" && origin != "" {
+		view.RouteURL = strings.TrimRight(origin, "/") + view.RoutePrefix
+	}
+	activeSiteID := int64(0)
+	if a.pm != nil && a.pm.shares != nil {
+		activeSiteID = a.pm.shares.activeSiteID(item.ID)
+	}
+	if activeSiteID == 0 {
+		for _, site := range view.Sites {
+			if site.SiteEnabled {
+				activeSiteID = site.SiteID
+				break
+			}
+		}
+	}
+	for i := range view.Sites {
+		if view.Sites[i].SiteID == activeSiteID && activeSiteID != 0 {
+			view.Sites[i].Active = true
+			view.ActiveSiteID = view.Sites[i].SiteID
+			view.ActiveSiteName = view.Sites[i].SiteName
+		}
 	}
 	return view
 }
@@ -342,7 +411,7 @@ func formatShareBytes(value int64) string {
 }
 
 func (a *App) shareUserText(item *storedShareUser, origin string) (string, error) {
-	view := a.shareUserView(item, true)
+	view := a.shareUserView(item, true, origin)
 	var builder strings.Builder
 	builder.WriteString("【Emby 分享账号】\n")
 	builder.WriteString("用户名：" + view.Username + "\n")
@@ -369,23 +438,46 @@ func (a *App) shareUserText(item *storedShareUser, origin string) (string, error
 	if view.SpeedLimit > 0 {
 		builder.WriteString(fmt.Sprintf("限速：%d Mbps\n", view.SpeedLimit))
 	}
-	builder.WriteString("服务器地址：\n")
-	for _, assigned := range view.Sites {
-		site, err := a.db.GetSite(assigned.SiteID)
-		if err != nil {
-			continue
+	if view.RouteURL != "" {
+		builder.WriteString("服务器地址：" + view.RouteURL + "\n")
+		if view.ActiveSiteName != "" {
+			builder.WriteString("当前默认服务器：" + view.ActiveSiteName + "\n")
 		}
-		lines := a.siteProxyLinesFrom(*site, origin)
-		if len(lines) == 0 {
-			builder.WriteString("- " + site.Name + "：（入口未配置）\n")
-			continue
+		if len(view.Sites) > 1 {
+			names := make([]string, 0, len(view.Sites))
+			for _, assigned := range view.Sites {
+				if assigned.SiteName != "" {
+					names = append(names, assigned.SiteName)
+				}
+			}
+			if len(names) > 0 {
+				builder.WriteString("可用服务器：" + strings.Join(names, "、") + "\n")
+			}
+			if origin != "" {
+				builder.WriteString("查看用量、到期和切换服务器：用上面的账号登录 " + origin + "\n")
+			}
+		} else if origin != "" {
+			builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
 		}
-		for _, line := range lines {
-			builder.WriteString("- " + site.Name + "：" + line + "\n")
+	} else {
+		builder.WriteString("服务器地址：\n")
+		for _, assigned := range view.Sites {
+			site, err := a.db.GetSite(assigned.SiteID)
+			if err != nil {
+				continue
+			}
+			lines := a.siteProxyLinesFrom(*site, origin)
+			if len(lines) == 0 {
+				builder.WriteString("- " + site.Name + "：（入口未配置）\n")
+				continue
+			}
+			for _, line := range lines {
+				builder.WriteString("- " + site.Name + "：" + line + "\n")
+			}
 		}
-	}
-	if origin != "" {
-		builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
+		if origin != "" {
+			builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
+		}
 	}
 	builder.WriteString("在 Emby 客户端中添加服务器地址后，用上面的用户名和密码登录。")
 	return builder.String(), nil
@@ -437,13 +529,14 @@ func (a *App) handleShareUsers(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "分享账号读取失败")
 			return
 		}
+		origin := a.shareTextOrigin(r)
 		result := make([]ShareUser, 0, len(ids))
 		for _, id := range ids {
 			item, err := a.db.getShareUser(id)
 			if err != nil {
 				continue
 			}
-			result = append(result, a.shareUserView(item, true))
+			result = append(result, a.shareUserView(item, true, origin))
 		}
 		a.jsonOK(w, result)
 	case http.MethodPost:
@@ -452,7 +545,7 @@ func (a *App) handleShareUsers(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, "invalid request")
 			return
 		}
-		input, err := a.normalizeShareUserInput(input, true)
+		input, err := a.normalizeShareUserInput(input, 0, true)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -468,7 +561,7 @@ func (a *App) handleShareUsers(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusInternalServerError, "分享账号读取失败")
 			return
 		}
-		a.jsonResponse(w, http.StatusCreated, a.shareUserView(item, true))
+		a.jsonResponse(w, http.StatusCreated, a.shareUserView(item, true, a.shareTextOrigin(r)))
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -510,7 +603,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 	case "":
 		switch r.Method {
 		case http.MethodGet:
-			view := a.shareUserView(item, true)
+			view := a.shareUserView(item, true, a.shareTextOrigin(r))
 			if shares != nil {
 				if sessions, err := shares.listSessions(id); err == nil {
 					view.Sessions = sessions
@@ -523,7 +616,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusBadRequest, "invalid request")
 				return
 			}
-			input, err := a.normalizeShareUserInput(input, false)
+			input, err := a.normalizeShareUserInput(input, id, false)
 			if err != nil {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
@@ -533,27 +626,23 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			a.reloadShareUsers()
-			if shares != nil {
-				keep := make(map[int64]int64, len(input.Sites))
-				for _, site := range input.Sites {
-					keep[site.SiteID] = site.SiteAccountID
-				}
-				changedPassword := input.Password != ""
-				if changedPassword {
-					keep = map[int64]int64{}
-				}
-				_, _ = shares.revokeSessions(id, 0, keep)
-				shares.enforce(time.Now())
-				if input.MaxDevices > 0 {
-					_ = shares.enforceDeviceLimit(id, 0, "", "", input.MaxDevices)
-				}
-			}
 			updated, err := a.db.getShareUser(id)
 			if err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "分享账号读取失败")
 				return
 			}
-			a.jsonOK(w, a.shareUserView(updated, true))
+			if shares != nil {
+				if input.Password != "" || !updated.Enabled {
+					_, _ = shares.revokeSessions(id, 0, nil)
+				} else {
+					shares.reconcileSiteSwitch(id, false)
+				}
+				shares.enforce(time.Now())
+				if input.MaxDevices > 0 {
+					_ = shares.enforceDeviceLimit(id, 0, "", "", input.MaxDevices)
+				}
+			}
+			a.jsonOK(w, a.shareUserView(updated, true, a.shareTextOrigin(r)))
 		case http.MethodDelete:
 			if shares != nil {
 				_, _ = shares.revokeSessions(id, 0, nil)
@@ -610,7 +699,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 		if updated == nil {
 			updated = item
 		}
-		a.jsonOK(w, a.shareUserView(updated, true))
+		a.jsonOK(w, a.shareUserView(updated, true, a.shareTextOrigin(r)))
 	case "renew":
 		if r.Method != http.MethodPost {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -642,7 +731,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 		if updated == nil {
 			updated = item
 		}
-		a.jsonOK(w, a.shareUserView(updated, true))
+		a.jsonOK(w, a.shareUserView(updated, true, a.shareTextOrigin(r)))
 	default:
 		a.jsonErr(w, http.StatusNotFound, "not found")
 	}

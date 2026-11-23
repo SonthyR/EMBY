@@ -598,3 +598,30 @@ func (pm *ProxyManager) PathPrefixSiteID(prefix string) (int64, bool) {
 	id, ok := pm.pathPrefixes[prefix]
 	return id, ok
 }
+
+func (pm *ProxyManager) SiteHandler(siteID int64) (http.Handler, bool) {
+	if pm == nil || siteID <= 0 {
+		return nil, false
+	}
+	pm.mu.RLock()
+	inst := pm.proxies[siteID]
+	pm.mu.RUnlock()
+	if inst == nil || !inst.isOperational() {
+		return nil, false
+	}
+	return inst.handler, true
+}
+
+func (pm *ProxyManager) SharePathRoute(requestPath string) (int64, string, bool) {
+	if pm == nil || pm.shares == nil {
+		return 0, "", false
+	}
+	return pm.shares.matchRoutePrefix(requestPath)
+}
+
+func (pm *ProxyManager) ShareRoutePrefixUserID(prefix string) (int64, bool) {
+	if pm == nil || pm.shares == nil {
+		return 0, false
+	}
+	return pm.shares.routePrefixUserID(prefix)
+}

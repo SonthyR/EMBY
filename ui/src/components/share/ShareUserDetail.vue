@@ -77,6 +77,10 @@ async function remove() {
 async function copyPassword() {
   if (detail.value?.password && (await copyText(detail.value.password))) toast.success('密码已复制')
 }
+async function copyRouteURL() {
+  const url = detail.value?.route_url || detail.value?.route_prefix
+  if (url && (await copyText(url))) toast.success('专属地址已复制')
+}
 </script>
 
 <template>
@@ -101,6 +105,17 @@ async function copyPassword() {
       </section>
 
       <dl class="props">
+        <div v-if="detail.route_prefix">
+          <dt>专属地址</dt>
+          <dd class="secret">
+            <span class="mono">{{ detail.route_url || detail.route_prefix }}</span>
+            <button type="button" aria-label="复制专属地址" @click="copyRouteURL"><Copy /></button>
+          </dd>
+        </div>
+        <div v-if="detail.route_prefix && detail.active_site_name">
+          <dt>当前生效</dt>
+          <dd>{{ detail.active_site_name }}</dd>
+        </div>
         <div><dt>到期</dt><dd>{{ expiry.text }}<span v-if="expiry.sub" class="faint"> · {{ expiry.sub }}</span></dd></div>
         <div><dt>在线设备</dt><dd class="num">{{ detail.session_count }}{{ detail.max_devices ? ` / ${detail.max_devices} 台` : ' 台' }}</dd></div>
         <div><dt>限速</dt><dd>{{ detail.speed_limit ? `${detail.speed_limit} Mbps` : '不限' }}</dd></div>
@@ -122,7 +137,7 @@ async function copyPassword() {
           <li v-for="(s, i) in detail.sessions" :key="i">
             <MonitorSmartphone />
             <div>
-              <span>{{ s.device_name || '未知设备' }}</span>
+              <span>{{ s.device_name || '未知设备' }}<small v-if="s.draining" class="tag warn">观影后切换</small><small v-else-if="s.playing" class="tag good">播放中</small></span>
               <small class="faint">{{ [s.client, s.site_name, s.client_ip].filter(Boolean).join(' · ') }}</small>
             </div>
             <small class="faint">{{ relativeTime(s.last_seen_at) }}</small>
@@ -172,6 +187,9 @@ h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
 .devices svg { width: 16px; height: 16px; color: var(--text-3); flex: 0 0 16px; }
 .devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .devices small { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.good { background: var(--good-soft); color: var(--good); }
 .none { margin: 0; font-size: 13px; }
 .menu { display: flex; flex-direction: column; margin: 0 -10px; }
 .menu button { display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; border: 0; border-radius: var(--radius-sm); background: transparent; font-size: 13.5px; text-align: left; cursor: pointer; }

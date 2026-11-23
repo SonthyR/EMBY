@@ -98,7 +98,7 @@ func startShareTestSite(t *testing.T, app *App, upstream string) (*Site, string)
 
 func createShareUserForTest(t *testing.T, app *App, siteID int64, quota int64) int64 {
 	t.Helper()
-	input, err := app.normalizeShareUserInput(ShareUserInput{Username: "Friend", Password: "friend-pass", TrafficQuota: quota, Sites: []ShareUserSiteInput{{SiteID: siteID}}}, true)
+	input, err := app.normalizeShareUserInput(ShareUserInput{Username: "Friend", Password: "friend-pass", TrafficQuota: quota, Sites: []ShareUserSiteInput{{SiteID: siteID}}}, 0, true)
 	if err != nil {
 		t.Fatalf("normalizeShareUserInput: %v", err)
 	}
@@ -457,14 +457,14 @@ func TestShareRateLimiterThrottlesSharedBudget(t *testing.T) {
 func TestShareCapabilityAttributionAndLimitWriter(t *testing.T) {
 	app := newTestApp(t)
 	rt := app.pm.shares
-	rt.rememberCapabilities(`{"DirectStreamUrl":"/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4"}`, 7, 3)
-	if user, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4", 3); !ok || user != 7 {
-		t.Fatalf("capability owner = %d, %v", user, ok)
+	rt.rememberCapabilities(`{"DirectStreamUrl":"/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4"}`, 7, 3, "tok-hash")
+	if user, hash, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123/video.mp4", 3); !ok || user != 7 || hash != "tok-hash" {
+		t.Fatalf("capability owner = %d, %q, %v", user, hash, ok)
 	}
-	if user, ok := rt.capabilityOwner("/emby/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 3); !ok || user != 7 {
+	if user, _, ok := rt.capabilityOwner("/emby/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 3); !ok || user != 7 {
 		t.Fatalf("emby-prefixed capability owner = %d, %v", user, ok)
 	}
-	if _, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 4); ok {
+	if _, _, ok := rt.capabilityOwner("/_meridian/d/AbCdEfGhIjKlMnOpQrSt_-123", 4); ok {
 		t.Fatal("capability matched on another site")
 	}
 
@@ -472,14 +472,14 @@ func TestShareCapabilityAttributionAndLimitWriter(t *testing.T) {
 	state.limiter.setRate(8)
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/Items", nil)
-	writer := rt.wrapWriter(recorder, request, state, 5)
+	writer := rt.wrapWriter(recorder, request, state, 5, "tok-hash-2")
 	writer.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	writer.WriteHeader(http.StatusOK)
 	// Split a capability across two writes to exercise the carried tail.
 	_, _ = writer.Write([]byte("#EXTM3U\n/_meridian/d/ZyXwVuTsRqPo"))
 	_, _ = writer.Write([]byte("NmLkJi987/seg.ts\n"))
-	if user, ok := rt.capabilityOwner("/_meridian/d/ZyXwVuTsRqPoNmLkJi987/seg.ts", 5); !ok || user != 9 {
-		t.Fatalf("split capability owner = %d, %v", user, ok)
+	if user, hash, ok := rt.capabilityOwner("/_meridian/d/ZyXwVuTsRqPoNmLkJi987/seg.ts", 5); !ok || user != 9 || hash != "tok-hash-2" {
+		t.Fatalf("split capability owner = %d, %q, %v", user, hash, ok)
 	}
 	if !strings.Contains(recorder.Body.String(), "seg.ts") {
 		t.Fatalf("limited writer lost data: %q", recorder.Body.String())

@@ -100,7 +100,16 @@ func dynamicCapabilityRedirectLocation(resp *http.Response) string {
 		return ""
 	}
 	parsed, err := url.ParseRequestURI(location)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.RawPath != "" || parsed.RawQuery != "" || !isReservedDynamicRoute(parsed.Path) {
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.RawPath != "" || parsed.RawQuery != "" {
+		return ""
+	}
+	pathValue := parsed.Path
+	if resp.Request != nil {
+		if prefix := requestPathIngressPrefix(resp.Request.Context(), ""); prefix != "" && ingressPathMatches(pathValue, prefix) {
+			pathValue = strings.TrimPrefix(pathValue, prefix)
+		}
+	}
+	if !isReservedDynamicRoute(pathValue) {
 		return ""
 	}
 	return location

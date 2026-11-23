@@ -40,6 +40,8 @@ export interface ShareUserSite {
   site_name?: string
   account_name?: string
   site_enabled?: boolean
+  sort_order?: number
+  active?: boolean
 }
 
 export interface ShareSession {
@@ -50,6 +52,8 @@ export interface ShareSession {
   client_ip: string
   created_at: string
   last_seen_at: string
+  draining?: boolean
+  playing?: boolean
 }
 
 export type ShareStatus = 'active' | 'disabled' | 'expired' | 'quota'
@@ -58,6 +62,8 @@ export interface ShareUser {
   id: number
   username: string
   password?: string
+  route_prefix?: string
+  route_url?: string
   note: string
   enabled: boolean
   expires_at: string
@@ -65,10 +71,13 @@ export interface ShareUser {
   traffic_used: number
   status: ShareStatus
   session_count: number
+  draining_sessions?: number
   max_devices: number
   speed_limit: number
   traffic_reset_day: number
   next_reset_at?: string
+  active_site_id?: number
+  active_site_name?: string
   sites: ShareUserSite[]
   sessions?: ShareSession[]
   created_at: string
@@ -78,6 +87,7 @@ export interface ShareUser {
 export interface ShareUserInput {
   username: string
   password: string
+  route_prefix: string
   note: string
   enabled: boolean
   expires_at: string

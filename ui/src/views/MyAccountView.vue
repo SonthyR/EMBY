@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Copy, LogOut, MonitorSmartphone, Moon, Sun, SunMoon } from '@lucide/vue'
+import { ArrowUpToLine, Copy, GripVertical, LogOut, MonitorSmartphone, Moon, Sun, SunMoon } from '@lucide/vue'
 import logo from '@/assets/logo.svg'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import { meApi, type MyAccount } from '@/api'
+import { meApi, type MyAccount, type MyAccountServer } from '@/api'
 import { logout, session } from '@/stores/session'
 import { confirm } from '@/stores/confirm'
 import { cycleTheme, themeMode } from '@/stores/theme'
@@ -17,7 +17,22 @@ const me = ref<MyAccount | null>(null)
 const loadError = ref('')
 const pw = reactive({ open: false, current: '', next: '', busy: false, error: '' })
 
+const draggingId = ref<number | null>(null)
+const dragOrderBefore = ref<number[]>([])
+const savingOrder = ref(false)
+let touchDragActive = false
+
+const fixedAddress = computed(() => {
+  const u = me.value
+  if (!u?.route_prefix) return ''
+  return u.route_url || (typeof window !== 'undefined' ? `${window.location.origin}${u.route_prefix}` : u.route_prefix)
+})
+
+const hasPersonalRoute = computed(() => !!fixedAddress.value)
+const canReorder = computed(() => (me.value?.servers?.length || 0) > 1)
+
 async function load() {
+  if (draggingId.value !== null || savingOrder.value) return
   try {
     me.value = await meApi.get()
     loadError.value = ''
@@ -25,6 +40,7 @@ async function load() {
     loadError.value = errorMessage(error, '读取失败')
   }
 }
+
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   load()
@@ -40,6 +56,7 @@ const headline = computed(() => {
   if (u.status === 'quota') return '本期流量已用完'
   return '账号已被停用'
 })
+
 const expiry = computed(() => {
   const u = me.value
   if (!u?.expires_at) return { main: '永久', sub: '' }
@@ -47,9 +64,109 @@ const expiry = computed(() => {
   return { main: dateOnly(u.expires_at), sub: days === null ? '' : days < 0 ? '已过期' : days === 0 ? '今天到期' : `还剩 ${days} 天` }
 })
 
+function reorderLocal(sourceId: number, targetId: number) {
+  if (!me.value || sourceId === targetId) return
+  const list = [...me.value.servers]
+  const from = list.findIndex(item => item.site_id === sourceId)
+  const to = list.findIndex(item => item.site_id === targetId)
+  if (from < 0 || to < 0) return
+  const [moved] = list.splice(from, 1)
+  list.splice(to, 0, moved)
+  me.value = { ...me.value, servers: list }
+}
+
+async function commitOrder(previousIds: number[], previousActiveId?: number) {
+  if (!me.value) return
+  const nextIds = me.value.servers.map(item => item.site_id)
+  if (nextIds.length === previousIds.length && nextIds.every((id, idx) => id === previousIds[idx])) return
+  savingOrder.value = true
+  try {
+    const res = await meApi.reorderSites(nextIds)
+    me.value = res
+    const activeName = res.active_site_name || res.servers.find(s => s.active)?.name || ''
+    if (res.draining > 0 && activeName) {
+      toast.success(`已将「${activeName}」设为首选，当前视频关闭后自动生效`)
+    } else if (res.revoked > 0 && activeName) {
+      toast.success(`已切换为「${activeName}」，回客户端重新登录即可`)
+    } else if (hasPersonalRoute.value && res.active_site_id && res.active_site_id !== previousActiveId && activeName) {
+      toast.success(`已切换为「${activeName}」，回客户端重新登录即可`)
+    } else {
+      toast.success('服务器顺序已更新')
+    }
+  } catch (error) {
+    toast.error(errorMessage(error, '排序保存失败'))
+    await load()
+  } finally {
+    savingOrder.value = false
+  }
+}
+
+function onDragStart(event: DragEvent, server: MyAccountServer) {
+  if (!canReorder.value || savingOrder.value || !me.value) return
+  draggingId.value = server.site_id
+  dragOrderBefore.value = me.value.servers.map(item => item.site_id)
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(server.site_id))
+  }
+}
+
+function onDragOver(event: DragEvent, target: MyAccountServer) {
+  if (draggingId.value === null) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+  if (draggingId.value !== target.site_id) reorderLocal(draggingId.value, target.site_id)
+}
+
+function onDrop(event: DragEvent) {
+  event.preventDefault()
+}
+
+async function onDragEnd() {
+  if (draggingId.value === null) return
+  const prev = [...dragOrderBefore.value]
+  const prevActive = me.value?.active_site_id
+  draggingId.value = null
+  dragOrderBefore.value = []
+  await commitOrder(prev, prevActive)
+}
+
+function onTouchStart(event: TouchEvent, server: MyAccountServer) {
+  if (!canReorder.value || savingOrder.value || !me.value || event.touches.length !== 1) return
+  touchDragActive = true
+  draggingId.value = server.site_id
+  dragOrderBefore.value = me.value.servers.map(item => item.site_id)
+}
+
+function onTouchMove(event: TouchEvent) {
+  if (!touchDragActive || draggingId.value === null || event.touches.length !== 1) return
+  event.preventDefault()
+  const touch = event.touches[0]
+  const element = document.elementFromPoint(touch.clientX, touch.clientY)?.closest<HTMLElement>('[data-site-id]')
+  const targetId = element ? Number(element.dataset.siteId) : 0
+  if (targetId && targetId !== draggingId.value) reorderLocal(draggingId.value, targetId)
+}
+
+async function onTouchEnd() {
+  if (!touchDragActive) return
+  touchDragActive = false
+  await onDragEnd()
+}
+
+async function promoteToTop(server: MyAccountServer) {
+  if (!me.value || savingOrder.value) return
+  const prev = me.value.servers.map(item => item.site_id)
+  const prevActive = me.value.active_site_id
+  if (prev[0] === server.site_id) return
+  const list = [server, ...me.value.servers.filter(item => item.site_id !== server.site_id)]
+  me.value = { ...me.value, servers: list }
+  await commitOrder(prev, prevActive)
+}
+
 async function copy(value: string) {
   if (await copyText(value)) toast.success('已复制')
 }
+
 async function kick() {
   if (!(await confirm({ title: '断开所有设备？', message: '所有设备上的 Emby 都会退出登录，需要重新输入账号密码。', confirmText: '断开' }))) return
   try {
@@ -60,6 +177,7 @@ async function kick() {
     toast.error(errorMessage(error))
   }
 }
+
 async function changePassword() {
   pw.error = ''
   if (!pw.current) return (pw.error = '请输入当前密码')
@@ -112,18 +230,83 @@ async function changePassword() {
           <div><dt>速度</dt><dd>{{ me.speed_limit ? `${me.speed_limit} Mbps` : '不限速' }}</dd></div>
         </dl>
 
-        <section class="block">
+        <template v-if="hasPersonalRoute">
+          <section class="block">
+            <h2>客户端固定地址</h2>
+            <p class="faint hint">在 Emby 客户端里只填这一个地址，用你的账号密码登录。想换服务器时把它拖到下方第一位，回客户端重新登录即可。</p>
+            <div class="fixed-addr">
+              <span class="mono">{{ fixedAddress }}</span>
+              <UiButton variant="primary" size="sm" @click="copy(fixedAddress)"><Copy />复制</UiButton>
+            </div>
+            <p v-if="me.draining_sessions" class="drain-note">
+              有设备正在播放视频，不会立即切断；关闭视频后将自动切换为「{{ me.active_site_name || '新服务器' }}」，届时在客户端重新登录即可。
+            </p>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>我的服务器</h2>
+              <span v-if="canReorder" class="faint sub-hint">拖动排序 · 首位生效</span>
+            </div>
+            <p v-if="!me.servers?.length" class="faint none">暂无可用服务器</p>
+            <TransitionGroup v-else name="list" tag="ul" class="sortable-servers">
+              <li
+                v-for="(server, index) in me.servers"
+                :key="server.site_id"
+                :data-site-id="server.site_id"
+                class="server-card"
+                :class="{ current: server.active, disabled: !server.enabled, dragging: draggingId === server.site_id, movable: canReorder }"
+                :draggable="canReorder && !savingOrder"
+                @dragstart="onDragStart($event, server)"
+                @dragover="onDragOver($event, server)"
+                @drop="onDrop"
+                @dragend="onDragEnd"
+              >
+                <span
+                  v-if="canReorder"
+                  class="grip"
+                  aria-label="拖动排序"
+                  title="按住拖动排序"
+                  @touchstart="onTouchStart($event, server)"
+                  @touchmove="onTouchMove"
+                  @touchend="onTouchEnd"
+                  @touchcancel="onTouchEnd"
+                >
+                  <GripVertical />
+                </span>
+                <span class="rank num">{{ index + 1 }}</span>
+                <div class="server-info">
+                  <span class="server-name">{{ server.name }}</span>
+                  <small v-if="server.active" class="server-state good"><span class="dot good" />当前生效</small>
+                  <small v-else-if="!server.enabled" class="faint">暂不可用</small>
+                  <small v-else class="faint">拖到第一位即可切换</small>
+                </div>
+                <UiButton
+                  v-if="index > 0 && server.enabled"
+                  variant="ghost"
+                  size="sm"
+                  :disabled="savingOrder"
+                  @click="promoteToTop(server)"
+                >
+                  <ArrowUpToLine />设为当前
+                </UiButton>
+              </li>
+            </TransitionGroup>
+          </section>
+        </template>
+
+        <section v-else class="block">
           <h2>服务器地址</h2>
           <p class="faint hint">在 Emby 客户端里添加下面的地址，用你的账号和密码登录。</p>
           <ul class="servers">
-            <li v-for="server in me.servers" :key="server.name">
+            <li v-for="server in me.servers.filter(s => s.enabled)" :key="server.site_id">
               <span class="name">{{ server.name }}</span>
               <div v-for="addr in server.addresses" :key="addr" class="addr">
                 <span class="mono">{{ addr }}</span>
                 <UiButton variant="ghost" size="sm" icon aria-label="复制地址" @click="copy(addr)"><Copy /></UiButton>
               </div>
             </li>
-            <li v-if="!me.servers?.length" class="faint">暂无可用服务器</li>
+            <li v-if="!me.servers?.some(s => s.enabled)" class="faint">暂无可用服务器</li>
           </ul>
         </section>
 
@@ -136,7 +319,11 @@ async function changePassword() {
             <li v-for="(s, i) in me.sessions || []" :key="i">
               <MonitorSmartphone />
               <div>
-                <span>{{ s.device_name || '未知设备' }}</span>
+                <span>
+                  {{ s.device_name || '未知设备' }}
+                  <small v-if="s.draining" class="tag warn">观影后切换</small>
+                  <small v-else-if="s.playing" class="tag good">播放中</small>
+                </span>
                 <small class="faint">{{ [s.client, s.site_name].filter(Boolean).join(' · ') }}</small>
               </div>
               <small class="faint">{{ relativeTime(s.last_seen_at) }}</small>
@@ -190,9 +377,83 @@ h1 { margin: 10px 0 0; font-size: 26px; font-weight: 600; letter-spacing: -0.03e
 .facts dd { margin: 4px 0 0; font-size: 16px; font-weight: 500; display: flex; flex-direction: column; }
 .facts small { font-size: 12.5px; font-weight: 400; color: var(--text-3); }
 .block { padding: 26px 0 0; }
-.block-head { display: flex; align-items: center; justify-content: space-between; }
+.block-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .hint { margin: 4px 0 12px; font-size: 13px; }
+.sub-hint { font-size: 12px; }
+
+.fixed-addr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.fixed-addr .mono { overflow-wrap: anywhere; font-size: 13.5px; }
+.drain-note {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warn) 32%, var(--border));
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.sortable-servers {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.server-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), opacity var(--dur) var(--ease);
+}
+.server-card.movable { cursor: grab; user-select: none; }
+.server-card.movable:hover { border-color: var(--border-strong); background: var(--surface-2); }
+.server-card.current { border-color: color-mix(in srgb, var(--good) 40%, var(--border-strong)); background: color-mix(in srgb, var(--good) 4%, var(--surface)); }
+.server-card.disabled { opacity: 0.6; }
+.server-card.dragging { opacity: 0.45; cursor: grabbing; }
+.grip {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 28px;
+  color: var(--text-3);
+  touch-action: none;
+  flex: 0 0 24px;
+}
+.grip svg { width: 16px; height: 16px; }
+.rank {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  flex: 0 0 22px;
+}
+.server-card.current .rank { background: var(--good-soft); color: var(--good); }
+.server-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.server-name { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--good); }
+
 .servers, .devices { margin: 8px 0 0; padding: 0; list-style: none; }
 .servers li { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .servers li:last-child { border-bottom: 0; }
@@ -204,6 +465,9 @@ h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .devices svg { width: 16px; height: 16px; color: var(--text-3); flex: 0 0 16px; }
 .devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .devices small { font-size: 12px; }
+.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.good { background: var(--good-soft); color: var(--good); }
 .none { font-size: 13px; padding: 6px 0; }
 .pw { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
 .pw-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -213,5 +477,6 @@ h2 { margin: 0; font-size: 14px; font-weight: 600; }
   .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   h1 { font-size: 22px; }
   .big { font-size: 34px; }
+  .fixed-addr { flex-direction: column; align-items: stretch; }
 }
 </style>

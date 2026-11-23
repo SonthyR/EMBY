@@ -150,14 +150,28 @@ export const dashboardApi = {
   trends: (siteId: string, range: string) => api.get<TrendResponse>(`/api/dashboard-trends?site_id=${encodeURIComponent(siteId)}&range=${encodeURIComponent(range)}`),
 }
 
+export interface MyAccountServer {
+  site_id: number
+  name: string
+  enabled: boolean
+  active: boolean
+  addresses: string[]
+}
+
 export interface MyAccount extends ShareUser {
-  servers: { name: string; addresses: string[] }[]
+  servers: MyAccountServer[]
+}
+
+export interface MyAccountOrderResponse extends MyAccount {
+  revoked: number
+  draining: number
 }
 
 export const meApi = {
   login: (username: string, password: string) => api.post<{ username: string; share_account: boolean }>('/api/me/login', { username, password }),
   logout: () => api.post<{ logged_out: boolean }>('/api/me/logout'),
   get: () => api.get<MyAccount>('/api/me'),
+  reorderSites: (siteIds: number[]) => api.put<MyAccountOrderResponse>('/api/me/sites/order', { site_ids: siteIds }),
   kick: () => api.post<{ revoked: number }>('/api/me/kick'),
   password: (current: string, next: string) => api.post<{ changed: boolean }>('/api/me/password', { current_password: current, new_password: next }),
 }
@@ -219,6 +233,7 @@ export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput>
   return {
     username: user.username,
     password: '',
+    route_prefix: user.route_prefix || '',
     note: user.note || '',
     enabled: user.enabled,
     expires_at: user.expires_at || '',

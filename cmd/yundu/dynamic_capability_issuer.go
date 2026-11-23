@@ -36,7 +36,17 @@ func (i *dynamicCapabilityIssuer) clientRoute(route string) string {
 	return addIngressPathPrefix(route, i.pathPrefix)
 }
 
+func (i *dynamicCapabilityIssuer) clientRouteForContext(ctx context.Context, route string) string {
+	if i == nil {
+		return route
+	}
+	return addIngressPathPrefix(route, requestPathIngressPrefix(ctx, i.pathPrefix))
+}
+
 func (i *dynamicCapabilityIssuer) capabilityToken(route string) string {
+	if idx := strings.Index(route, dynamicRoutePrefix); idx >= 0 {
+		return route[idx+len(dynamicRoutePrefix):]
+	}
 	if i == nil {
 		return strings.TrimPrefix(route, dynamicRoutePrefix)
 	}
@@ -187,7 +197,7 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 	if token, exists := i.state.reuseCapability(cacheKey, time.Now()); exists {
 		reservation.rollback()
 		i.observe(source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
-		return i.clientRoute(dynamicRoutePrefix + token), true, nil
+		return i.clientRouteForContext(ctx, dynamicRoutePrefix+token), true, nil
 	}
 	claims := dynamicCapabilityClaims{
 		Version:         dynamicCapabilityVersion,
@@ -222,7 +232,7 @@ func (i *dynamicCapabilityIssuer) mintValidatedResourceWithRequiredHeadersTracke
 		reservation.rollback()
 	}
 	i.observe(source, dynamicObservationDecisionAllowed, dynamicObservationReasonCandidateAllowed, authority)
-	return i.clientRoute(dynamicRoutePrefix + registeredToken), true, nil
+	return i.clientRouteForContext(ctx, dynamicRoutePrefix+registeredToken), true, nil
 }
 
 func (i *dynamicCapabilityIssuer) mintTrustedTracked(target *url.URL, source, kind string, depth int) (string, bool, *dynamicProxyError) {

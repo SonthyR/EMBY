@@ -238,7 +238,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			dynamicResponse := responseIsDynamic(resp)
 			expectedSource := dynamicResponseExpectedStructuredSource(resp)
-			rewriteRelative := ingressUsesPath(site.IngressMode) && dynamicIssuer != nil
+			effectivePrefix := site.PathPrefix
+			if resp.Request != nil {
+				effectivePrefix = requestPathIngressPrefix(resp.Request.Context(), site.PathPrefix)
+			}
+			rewriteRelative := (effectivePrefix != "" || ingressUsesPath(site.IngressMode)) && dynamicIssuer != nil
 			if err := rewriteSiteStructuredResponse(resp, site.MainVideoStreamMode == mainVideoStreamModeDirect, dynamicIssuer, dynamicResponse || rewriteRelative, expectedSource); err != nil {
 				rollbackDynamicResponseAuthorities(resp)
 				return err
@@ -254,11 +258,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if dynamicResponse {
 				rebuildDynamicResponseHeaders(resp)
 				stripPanelSessionSetCookies(resp.Header)
-				prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
+				prefixPathIngressResponse(resp, effectivePrefix, target.Path)
 				return nil
 			}
 			stripPanelSessionSetCookies(resp.Header)
-			prefixPathIngressResponse(resp, site.PathPrefix, target.Path)
+			prefixPathIngressResponse(resp, effectivePrefix, target.Path)
 			if err := prepareAssetCacheResponse(resp, pm.assetCache, site); err != nil {
 				return err
 			}
@@ -363,12 +367,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		// Share users: sign-in swap, token checks and per-user metering.
 		var shareLogin *shareLoginPending
 		var shareUser *shareUserState
+		var shareSessionHash string
 		if pm.shares != nil {
+			var finishShareActivity func()
 			var handled bool
-			r, shareLogin, shareUser, handled = pm.shares.intercept(w, r, site, requestLogEntry.ClientIP)
+			r, shareLogin, shareUser, shareSessionHash, finishShareActivity, handled = pm.shares.intercept(w, r, site, requestLogEntry.ClientIP)
 			if handled {
 				return
 			}
+			defer finishShareActivity()
 			trafficMeter.setShareUser(shareUser)
 		}
 
@@ -399,7 +406,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			} else {
 				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 			}
-			rw = pm.shares.wrapWriter(rw, r, shareUser, site.ID)
+			rw = pm.shares.wrapWriter(rw, r, shareUser, site.ID, shareSessionHash)
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
 			} else {
@@ -454,7 +461,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				} else {
 					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 				}
-				cacheWriter = pm.shares.wrapWriter(cacheWriter, r, shareUser, site.ID)
+				cacheWriter = pm.shares.wrapWriter(cacheWriter, r, shareUser, site.ID, shareSessionHash)
 				serveAssetCacheHit(cacheWriter, r, hit)
 				return
 			}
@@ -500,7 +507,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		} else {
 			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 		}
-		rw = pm.shares.wrapWriter(rw, r, shareUser, site.ID)
+		rw = pm.shares.wrapWriter(rw, r, shareUser, site.ID, shareSessionHash)
 		var shareCapture *shareLoginCapture
 		if shareLogin != nil {
 			shareCapture = newShareLoginCapture(rw)

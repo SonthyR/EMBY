@@ -98,6 +98,8 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_users", "traffic_reset_period", "ALTER TABLE share_users ADD COLUMN traffic_reset_period TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "portal_token", "ALTER TABLE share_users ADD COLUMN portal_token TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "speed_limit", "ALTER TABLE share_users ADD COLUMN speed_limit INTEGER NOT NULL DEFAULT 0"},
+		{"share_users", "route_prefix", "ALTER TABLE share_users ADD COLUMN route_prefix TEXT NOT NULL DEFAULT ''"},
+		{"share_user_sites", "sort_order", "ALTER TABLE share_user_sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
@@ -108,12 +110,20 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 			if _, err := conn.ExecContext(ctx, column.sql); err != nil {
 				return err
 			}
+			if column.table == "share_user_sites" && column.name == "sort_order" {
+				if _, err := conn.ExecContext(ctx, `UPDATE share_user_sites SET sort_order = COALESCE((SELECT s.sort_order FROM sites s WHERE s.id = share_user_sites.site_id), site_id)`); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "UPDATE share_users SET portal_token=lower(hex(randomblob(16))) WHERE portal_token=''"); err != nil {
 		return err
 	}
-	_, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_portal ON share_users(portal_token) WHERE portal_token <> ''")
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_portal ON share_users(portal_token) WHERE portal_token <> ''"); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_route_prefix ON share_users(route_prefix) WHERE route_prefix <> ''")
 	return err
 }
 
@@ -146,6 +156,36 @@ func (d *DB) shareLocation() *time.Location {
 // ---------------------------------------------------------------------------
 // Runtime state
 
+var (
+	shareStreamIdleTimeout  = 25 * time.Second
+	sharePlayingIdleTimeout = 90 * time.Second
+	shareDrainSweepInterval = 5 * time.Second
+)
+
+type shareSessionActivity struct {
+	activeStreams  int
+	playing        bool
+	lastPlaybackAt time.Time
+	draining       bool
+	drainingSince  time.Time
+}
+
+func (a *shareSessionActivity) isWatching(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if a.activeStreams > 0 {
+		return true
+	}
+	if a.playing && !a.lastPlaybackAt.IsZero() && now.Sub(a.lastPlaybackAt) < sharePlayingIdleTimeout {
+		return true
+	}
+	if !a.lastPlaybackAt.IsZero() && now.Sub(a.lastPlaybackAt) < shareStreamIdleTimeout {
+		return true
+	}
+	return false
+}
+
 type shareSessionEntry struct {
 	userID int64
 	siteID int64
@@ -156,6 +196,7 @@ type shareUserState struct {
 	// The fields below are guarded by shareUserRuntime.mu.
 	username      string
 	passwordHash  string
+	routePrefix   string
 	enabled       bool
 	expiresAt     time.Time
 	quota         int64
@@ -165,6 +206,7 @@ type shareUserState struct {
 	limiter       *shareRateLimiter // nil when unlimited
 	resetDay      int
 	resetPeriod   string
+	siteOrder     []int64         // ordered site IDs (first enabled = active site)
 	sites         map[int64]int64 // site ID -> preferred site_account ID (0 = first usable)
 
 	pending atomic.Int64 // bytes metered but not yet written to share_users.traffic_used
@@ -179,15 +221,18 @@ type shareUserRuntime struct {
 	db *DB
 	pm *ProxyManager
 
-	mu       sync.RWMutex
-	users    map[int64]*shareUserState
-	byName   map[string]int64
-	sessions map[string]shareSessionEntry
-	revoked  map[string]int64 // token hash -> site ID
-	lastSeen map[string]time.Time
-	failures map[string]*shareLoginFailure
-	revoking map[int64]bool
-	flushMu  sync.Mutex
+	mu         sync.RWMutex
+	users      map[int64]*shareUserState
+	byName     map[string]int64
+	byRoute    map[string]int64 // normalized route prefix (e.g. "/ws") -> user ID
+	sessions   map[string]shareSessionEntry
+	revoked    map[string]int64 // token hash -> site ID
+	lastSeen   map[string]time.Time
+	activity   map[string]*shareSessionActivity
+	drainTimer *time.Timer
+	failures   map[string]*shareLoginFailure
+	revoking   map[int64]bool
+	flushMu    sync.Mutex
 
 	capMu        sync.Mutex
 	capabilities map[string]shareCapabilityOwner
@@ -200,9 +245,11 @@ func newShareUserRuntime(db *DB, pm *ProxyManager) *shareUserRuntime {
 		pm:       pm,
 		users:    make(map[int64]*shareUserState),
 		byName:   make(map[string]int64),
+		byRoute:  make(map[string]int64),
 		sessions: make(map[string]shareSessionEntry),
 		revoked:  make(map[string]int64),
 		lastSeen: make(map[string]time.Time),
+		activity: make(map[string]*shareSessionActivity),
 		failures: make(map[string]*shareLoginFailure),
 		revoking: make(map[int64]bool),
 	}
@@ -245,15 +292,15 @@ func (rt *shareUserRuntime) reload() error {
 		return nil
 	}
 	type row struct {
-		id                      int64
-		username, hash, expires string
-		enabled                 bool
-		quota, used             int64
-		maxDevices, resetDay    int
-		speedLimit              int
-		resetPeriod             string
+		id                                   int64
+		username, hash, routePrefix, expires string
+		enabled                              bool
+		quota, used                          int64
+		maxDevices, resetDay                 int
+		speedLimit                           int
+		resetPeriod                          string
 	}
-	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, traffic_reset_period, speed_limit FROM share_users`)
+	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, route_prefix, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, traffic_reset_period, speed_limit FROM share_users`)
 	if err != nil {
 		return err
 	}
@@ -261,7 +308,7 @@ func (rt *shareUserRuntime) reload() error {
 	for rows.Next() {
 		var item row
 		var enabled int
-		if err := rows.Scan(&item.id, &item.username, &item.hash, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.resetDay, &item.resetPeriod, &item.speedLimit); err != nil {
+		if err := rows.Scan(&item.id, &item.username, &item.hash, &item.routePrefix, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.resetDay, &item.resetPeriod, &item.speedLimit); err != nil {
 			rows.Close()
 			return err
 		}
@@ -274,11 +321,12 @@ func (rt *shareUserRuntime) reload() error {
 	}
 	rows.Close()
 
-	siteRows, err := rt.db.db.Query(`SELECT share_user_id, site_id, site_account_id FROM share_user_sites`)
+	siteRows, err := rt.db.db.Query(`SELECT a.share_user_id, a.site_id, a.site_account_id FROM share_user_sites a LEFT JOIN sites s ON s.id=a.site_id ORDER BY a.share_user_id, a.sort_order, COALESCE(s.sort_order, a.site_id), a.site_id`)
 	if err != nil {
 		return err
 	}
 	assignments := make(map[int64]map[int64]int64)
+	siteOrders := make(map[int64][]int64)
 	for siteRows.Next() {
 		var userID, siteID, accountID int64
 		if err := siteRows.Scan(&userID, &siteID, &accountID); err != nil {
@@ -289,6 +337,7 @@ func (rt *shareUserRuntime) reload() error {
 			assignments[userID] = make(map[int64]int64)
 		}
 		assignments[userID][siteID] = accountID
+		siteOrders[userID] = append(siteOrders[userID], siteID)
 	}
 	if err := siteRows.Err(); err != nil {
 		siteRows.Close()
@@ -341,6 +390,7 @@ func (rt *shareUserRuntime) reload() error {
 	rt.revoked = revoked
 	seen := make(map[int64]bool, len(loaded))
 	byName := make(map[string]int64, len(loaded))
+	byRoute := make(map[string]int64, len(loaded))
 	for _, item := range loaded {
 		seen[item.id] = true
 		state := rt.users[item.id]
@@ -350,6 +400,7 @@ func (rt *shareUserRuntime) reload() error {
 		}
 		state.username = item.username
 		state.passwordHash = item.hash
+		state.routePrefix = item.routePrefix
 		state.enabled = item.enabled
 		state.expiresAt = rt.db.shareExpiryTime(item.expires)
 		state.quota = item.quota
@@ -366,11 +417,15 @@ func (rt *shareUserRuntime) reload() error {
 		}
 		state.resetDay = item.resetDay
 		state.resetPeriod = item.resetPeriod
+		state.siteOrder = siteOrders[item.id]
 		state.sites = assignments[item.id]
 		if state.sites == nil {
 			state.sites = map[int64]int64{}
 		}
 		byName[strings.ToLower(item.username)] = item.id
+		if item.routePrefix != "" {
+			byRoute[item.routePrefix] = item.id
+		}
 	}
 	for id := range rt.users {
 		if !seen[id] {
@@ -378,10 +433,16 @@ func (rt *shareUserRuntime) reload() error {
 		}
 	}
 	rt.byName = byName
+	rt.byRoute = byRoute
 	rt.sessions = sessions
 	for hash := range rt.lastSeen {
 		if _, ok := sessions[hash]; !ok {
 			delete(rt.lastSeen, hash)
+		}
+	}
+	for hash := range rt.activity {
+		if _, ok := sessions[hash]; !ok {
+			delete(rt.activity, hash)
 		}
 	}
 	rt.loadError = nil
@@ -598,6 +659,378 @@ func (b *replayBody) Close() error {
 }
 
 // ---------------------------------------------------------------------------
+// Personal share routes and playback-aware switching
+
+func shareNormalizedPath(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimRight(r.URL.Path, "/"))
+}
+
+func isSharePlaybackStartRequest(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodPost && strings.HasSuffix(shareNormalizedPath(r), "/sessions/playing")
+}
+
+func isSharePlaybackProgressRequest(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodPost && strings.HasSuffix(shareNormalizedPath(r), "/sessions/playing/progress")
+}
+
+func isSharePlaybackStoppedRequest(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodPost && strings.HasSuffix(shareNormalizedPath(r), "/sessions/playing/stopped")
+}
+
+func isShareActiveMediaRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil || hasUpgradeIntent(r) {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	path := strings.ToLower(r.URL.Path)
+	if strings.Contains(path, "/images/") || strings.Contains(path, "/subtitles/") {
+		return false
+	}
+	return isReservedDynamicRoute(r.URL.Path) || isPlaybackRequest(r.URL.Path) || isPlaybackRedirectEndpoint(r.URL.Path) || isMainVideoStreamRequest(r)
+}
+
+func (rt *shareUserRuntime) matchRoutePrefix(requestPath string) (int64, string, bool) {
+	if rt == nil {
+		return 0, "", false
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	for prefix, userID := range rt.byRoute {
+		if ingressPathMatches(requestPath, prefix) || embeddedIngressPathMatches(requestPath, prefix) {
+			return userID, prefix, true
+		}
+	}
+	return 0, "", false
+}
+
+func (rt *shareUserRuntime) routePrefixUserID(prefix string) (int64, bool) {
+	if rt == nil || prefix == "" {
+		return 0, false
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	userID, ok := rt.byRoute[prefix]
+	return userID, ok
+}
+
+// activeSiteID returns the first operational site in the share user's ordered
+// site list, falling back to the first assigned site if ProxyManager is absent.
+func (rt *shareUserRuntime) activeSiteID(userID int64) int64 {
+	if rt == nil {
+		return 0
+	}
+	rt.mu.RLock()
+	state := rt.users[userID]
+	var order []int64
+	if state != nil && len(state.siteOrder) > 0 {
+		order = append([]int64(nil), state.siteOrder...)
+	}
+	rt.mu.RUnlock()
+	for _, siteID := range order {
+		if rt.pm == nil {
+			return siteID
+		}
+		if handler, ok := rt.pm.SiteHandler(siteID); ok && handler != nil {
+			return siteID
+		}
+	}
+	return 0
+}
+
+// resolveShareRouteTarget selects which site should serve a request arriving
+// on a share user's fixed personal prefix (e.g. /ws). New logins and
+// unauthenticated pre-login probes always hit the user's #1 active site; an
+// existing session on a previous site continues hitting that old site only
+// while it is actively finishing a video playback (draining).
+func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Request) (int64, int, string) {
+	if rt == nil {
+		return 0, http.StatusServiceUnavailable, "服务暂不可用"
+	}
+	activeSite := rt.activeSiteID(userID)
+	now := time.Now()
+	if isShareLoginRequest(r) {
+		if activeSite == 0 {
+			return 0, http.StatusServiceUnavailable, "暂无可用服务器"
+		}
+		return activeSite, 0, ""
+	}
+	if isReservedDynamicRoute(r.URL.Path) {
+		owner, ok := rt.capabilityOwnerInfo(r.URL.Path)
+		if !ok || owner.userID != userID {
+			return 0, http.StatusUnauthorized, "播放链接已失效，请重新登录"
+		}
+		rt.mu.RLock()
+		state := rt.users[userID]
+		reason := state.blockReasonLocked(now)
+		var sessionOK bool
+		var act *shareSessionActivity
+		if owner.tokenHash != "" {
+			entry, exists := rt.sessions[owner.tokenHash]
+			sessionOK = exists && entry.userID == userID && entry.siteID == owner.siteID
+			act = rt.activity[owner.tokenHash]
+		} else {
+			sessionOK = true
+		}
+		rt.mu.RUnlock()
+		if reason != "" {
+			return 0, http.StatusUnauthorized, shareBlockMessage(reason)
+		}
+		if !sessionOK {
+			return 0, http.StatusUnauthorized, "登录已失效，请重新登录"
+		}
+		if owner.siteID == activeSite || (act != nil && act.draining && act.isWatching(now)) {
+			return owner.siteID, 0, ""
+		}
+		return 0, http.StatusUnauthorized, "服务器已切换，请重新登录"
+	}
+	for _, token := range embyRequestTokens(r) {
+		hash := shareTokenHash(token)
+		rt.mu.RLock()
+		entry, ok := rt.sessions[hash]
+		_, revoked := rt.revoked[hash]
+		if !ok && revoked {
+			rt.mu.RUnlock()
+			return 0, http.StatusUnauthorized, "登录已失效，请重新登录"
+		}
+		if !ok {
+			rt.mu.RUnlock()
+			continue
+		}
+		if entry.userID != userID {
+			rt.mu.RUnlock()
+			return 0, http.StatusUnauthorized, "此入口仅限对应分享账号使用"
+		}
+		state := rt.users[userID]
+		reason := state.blockReasonLocked(now)
+		act := rt.activity[hash]
+		drainingAllowed := act != nil && act.draining && (act.isWatching(now) || isSharePlaybackStoppedRequest(r))
+		rt.mu.RUnlock()
+		if reason != "" {
+			if state != nil {
+				rt.revokeAsync(userID, 0, reason)
+			}
+			return 0, http.StatusUnauthorized, shareBlockMessage(reason)
+		}
+		if entry.siteID == activeSite {
+			return entry.siteID, 0, ""
+		}
+		if drainingAllowed {
+			return entry.siteID, 0, ""
+		}
+		_ = rt.revokeByHash(hash)
+		return 0, http.StatusUnauthorized, "服务器已切换，请重新登录"
+	}
+	if activeSite == 0 {
+		return 0, http.StatusServiceUnavailable, "暂无可用服务器"
+	}
+	return activeSite, 0, ""
+}
+
+func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Request) func() {
+	if rt == nil || tokenHash == "" {
+		return func() {}
+	}
+	isStart := isSharePlaybackStartRequest(r)
+	isProgress := isSharePlaybackProgressRequest(r)
+	isStopped := isSharePlaybackStoppedRequest(r)
+	isMedia := isShareActiveMediaRequest(r)
+	if !isStart && !isProgress && !isStopped && !isMedia {
+		return func() {}
+	}
+	now := time.Now()
+	rt.mu.Lock()
+	act := rt.activity[tokenHash]
+	if act == nil {
+		act = &shareSessionActivity{}
+		rt.activity[tokenHash] = act
+	}
+	if isStart || isProgress {
+		act.playing = true
+		act.lastPlaybackAt = now
+	}
+	if isMedia {
+		act.activeStreams++
+		act.lastPlaybackAt = now
+	}
+	rt.mu.Unlock()
+	if !isMedia && !isStopped {
+		return func() {}
+	}
+	return func() {
+		revokeNow := false
+		rt.mu.Lock()
+		act := rt.activity[tokenHash]
+		if act != nil {
+			if isMedia {
+				if act.activeStreams > 0 {
+					act.activeStreams--
+				}
+				act.lastPlaybackAt = time.Now()
+				if act.draining {
+					rt.scheduleDrainSweepLocked()
+				}
+			}
+			if isStopped {
+				act.playing = false
+				if act.activeStreams == 0 {
+					act.lastPlaybackAt = time.Time{}
+				}
+				if act.draining {
+					revokeNow = true
+				}
+			}
+		}
+		rt.mu.Unlock()
+		if revokeNow {
+			_ = rt.revokeByHash(tokenHash)
+		}
+	}
+}
+
+func (rt *shareUserRuntime) scheduleDrainSweepLocked() {
+	if rt == nil || rt.drainTimer != nil {
+		return
+	}
+	interval := shareDrainSweepInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	rt.drainTimer = time.AfterFunc(interval, func() {
+		rt.mu.Lock()
+		rt.drainTimer = nil
+		rt.mu.Unlock()
+		rt.sweepDrainingSessions(time.Now())
+	})
+}
+
+func (rt *shareUserRuntime) sweepDrainingSessions(now time.Time) {
+	if rt == nil {
+		return
+	}
+	var toRevoke []string
+	hasRemaining := false
+	rt.mu.Lock()
+	for hash, act := range rt.activity {
+		if !act.draining {
+			continue
+		}
+		if _, exists := rt.sessions[hash]; !exists {
+			delete(rt.activity, hash)
+			continue
+		}
+		if !act.isWatching(now) {
+			toRevoke = append(toRevoke, hash)
+		} else {
+			hasRemaining = true
+		}
+	}
+	if hasRemaining {
+		rt.scheduleDrainSweepLocked()
+	}
+	rt.mu.Unlock()
+	for _, hash := range toRevoke {
+		_ = rt.revokeByHash(hash)
+	}
+}
+
+// reconcileSiteSwitch handles switching a share user's active/assigned sites.
+// Sessions on a site that is no longer active (for personal routes) or no
+// longer assigned are revoked immediately if idle, or marked draining if the
+// user is currently watching a video so playback finishes uninterrupted.
+func (rt *shareUserRuntime) reconcileSiteSwitch(userID int64, forceImmediate bool) (revoked int, draining int) {
+	if rt == nil || rt.db == nil {
+		return 0, 0
+	}
+	sessions, err := rt.listSessions(userID)
+	if err != nil {
+		return 0, 0
+	}
+	activeSite := rt.activeSiteID(userID)
+	now := time.Now()
+	rt.mu.Lock()
+	state := rt.users[userID]
+	if state == nil {
+		rt.mu.Unlock()
+		return 0, 0
+	}
+	hasPersonalRoute := state.routePrefix != ""
+	var immediate []shareStoredSession
+	for _, session := range sessions {
+		_, assigned := state.sites[session.SiteID]
+		matchesActive := !hasPersonalRoute || activeSite == 0 || session.SiteID == activeSite
+		if assigned && matchesActive {
+			if act := rt.activity[session.TokenHash]; act != nil {
+				act.draining = false
+				act.drainingSince = time.Time{}
+			}
+			continue
+		}
+		act := rt.activity[session.TokenHash]
+		if !forceImmediate && act != nil && act.isWatching(now) {
+			if !act.draining {
+				act.draining = true
+				act.drainingSince = now
+			}
+			draining++
+			rt.scheduleDrainSweepLocked()
+			continue
+		}
+		immediate = append(immediate, session)
+	}
+	rt.mu.Unlock()
+	for _, session := range immediate {
+		if err := rt.revokeOne(session); err == nil {
+			revoked++
+		}
+	}
+	return revoked, draining
+}
+
+func (rt *shareUserRuntime) drainingCount(userID int64) int {
+	if rt == nil {
+		return 0
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	count := 0
+	for hash, entry := range rt.sessions {
+		if entry.userID != userID {
+			continue
+		}
+		if act := rt.activity[hash]; act != nil && act.draining {
+			count++
+		}
+	}
+	return count
+}
+
+func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
+	if rt == nil || rt.db == nil || tokenHash == "" {
+		return nil
+	}
+	var session shareStoredSession
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
+		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		rt.mu.Lock()
+		delete(rt.sessions, tokenHash)
+		delete(rt.lastSeen, tokenHash)
+		delete(rt.activity, tokenHash)
+		rt.mu.Unlock()
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return rt.revokeOne(session)
+}
+
+// ---------------------------------------------------------------------------
 // Proxy interception
 
 type shareLoginPending struct {
@@ -612,14 +1045,16 @@ type shareLoginPending struct {
 
 // intercept runs before a proxied request is forwarded. It returns the request
 // to forward, a pending login when the request is a share-user sign-in, the
-// share user to meter traffic against, and whether a response was already
-// written (the request must then not be forwarded).
-func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, site Site, clientIP string) (*http.Request, *shareLoginPending, *shareUserState, bool) {
+// share user to meter traffic against, the active session token hash, a finish
+// hook for playback tracking, and whether a response was already written.
+func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, site Site, clientIP string) (*http.Request, *shareLoginPending, *shareUserState, string, func(), bool) {
+	noop := func() {}
 	if rt == nil {
-		return r, nil, nil, false
+		return r, nil, nil, "", noop, false
 	}
 	if isShareLoginRequest(r) {
-		return rt.interceptLogin(w, r, site, clientIP)
+		req, pending, user, handled := rt.interceptLogin(w, r, site, clientIP)
+		return req, pending, user, "", noop, handled
 	}
 	tokens := embyRequestTokens(r)
 	now := time.Now()
@@ -631,7 +1066,7 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 		if !ok && revoked && (revokedSite == 0 || revokedSite == site.ID) {
 			rt.mu.RUnlock()
 			writeShareJSONError(w, http.StatusUnauthorized, "登录已失效，请重新登录")
-			return r, nil, nil, true
+			return r, nil, nil, "", noop, true
 		}
 		if !ok || entry.siteID != site.ID {
 			rt.mu.RUnlock()
@@ -639,46 +1074,72 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 		}
 		state := rt.users[entry.userID]
 		reason := state.blockReasonLocked(now)
+		act := rt.activity[hash]
+		draining := act != nil && act.draining
 		if reason == "" {
 			if _, allowed := state.sites[site.ID]; !allowed {
-				reason = "site"
+				if !(draining && (act.isWatching(now) || isSharePlaybackStoppedRequest(r))) {
+					reason = "site"
+				}
 			}
 		}
 		last := rt.lastSeen[hash]
 		rt.mu.RUnlock()
 		if reason != "" {
 			if state != nil {
-				rt.revokeAsync(entry.userID, 0, reason)
+				if reason == "site" {
+					_ = rt.revokeByHash(hash)
+				} else {
+					rt.revokeAsync(entry.userID, 0, reason)
+				}
 			}
 			writeShareJSONError(w, http.StatusUnauthorized, shareBlockMessage(reason))
-			return r, nil, nil, true
+			return r, nil, nil, "", noop, true
 		}
 		if now.Sub(last) >= shareSessionTouchInterval {
 			rt.mu.Lock()
 			rt.lastSeen[hash] = now
 			rt.mu.Unlock()
 		}
-		return r, nil, state, false
+		finish := rt.beginRequestActivity(hash, r)
+		return r, nil, state, hash, finish, false
 	}
 	// Dynamic playback routes carry no Emby token; attribute them through the
 	// capability handed to the share user earlier.
-	if userID, ok := rt.capabilityOwner(r.URL.Path, site.ID); ok {
+	if userID, tokenHash, ok := rt.capabilityOwner(r.URL.Path, site.ID); ok {
 		rt.mu.RLock()
 		state := rt.users[userID]
 		reason := state.blockReasonLocked(now)
+		var act *shareSessionActivity
+		sessionOK := true
+		if tokenHash != "" {
+			entry, exists := rt.sessions[tokenHash]
+			sessionOK = exists && entry.userID == userID && entry.siteID == site.ID
+			act = rt.activity[tokenHash]
+		}
+		if reason == "" && !sessionOK {
+			reason = "revoked"
+		}
 		if reason == "" {
 			if _, allowed := state.sites[site.ID]; !allowed {
-				reason = "site"
+				if !(act != nil && act.draining && act.isWatching(now)) {
+					reason = "site"
+				}
 			}
 		}
 		rt.mu.RUnlock()
 		if reason != "" {
-			writeShareJSONError(w, http.StatusUnauthorized, shareBlockMessage(reason))
-			return r, nil, nil, true
+			msg := shareBlockMessage(reason)
+			if reason == "revoked" {
+				msg = "登录已失效，请重新登录"
+			}
+			writeShareJSONError(w, http.StatusUnauthorized, msg)
+			return r, nil, nil, "", noop, true
 		}
-		return r, nil, state, false
+		finish := rt.beginRequestActivity(tokenHash, r)
+		return r, nil, state, tokenHash, finish, false
 	}
-	return r, nil, nil, false
+	return r, nil, nil, "", noop, false
 }
 
 func (rt *shareUserRuntime) loginBlocked(key string, now time.Time) bool {
@@ -748,7 +1209,13 @@ func (rt *shareUserRuntime) interceptLogin(w http.ResponseWriter, r *http.Reques
 		preferredAccount, assigned = state.sites[site.ID]
 	}
 	rt.mu.RUnlock()
-	if !known || state == nil || !assigned {
+	routeUserID, isPersonalRoute := shareRouteUserFromContext(r.Context())
+	if !known || state == nil || !assigned || (isPersonalRoute && userID != routeUserID) {
+		if isPersonalRoute {
+			_ = original.Close()
+			writeShareJSONError(w, http.StatusUnauthorized, "用户名或密码错误")
+			return r, nil, nil, true
+		}
 		// Not a share user for this site: keep the normal pass-through login.
 		return restore(), nil, nil, false
 	}
@@ -932,6 +1399,10 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	delete(rt.revoked, hash)
 	rt.sessions[hash] = shareSessionEntry{userID: pending.user.id, siteID: pending.siteID}
 	rt.lastSeen[hash] = time.Now()
+	if act := rt.activity[hash]; act != nil {
+		act.draining = false
+		act.drainingSince = time.Time{}
+	}
 	maxDevices := pending.user.maxDevices
 	rt.mu.Unlock()
 	if err := rt.enforceDeviceLimit(pending.user.id, pending.siteID, hash, pending.deviceID, maxDevices); err != nil {
@@ -975,7 +1446,7 @@ func (rt *shareUserRuntime) enforceDeviceLimit(userID, siteID int64, keepHash, d
 			continue
 		}
 		k := key(session)
-		if k == keepKey && session.SiteID == siteID {
+		if k == keepKey && (session.SiteID == siteID || session.Draining) {
 			stale = append(stale, session)
 			continue
 		}
@@ -1048,6 +1519,8 @@ type shareStoredSession struct {
 	ClientIP   string `json:"client_ip"`
 	CreatedAt  string `json:"created_at"`
 	LastSeenAt string `json:"last_seen_at"`
+	Draining   bool   `json:"draining,omitempty"`
+	Playing    bool   `json:"playing,omitempty"`
 }
 
 func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, error) {
@@ -1067,7 +1540,19 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 		}
 		result = append(result, item)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	for i := range result {
+		if act := rt.activity[result[i].TokenHash]; act != nil {
+			result[i].Draining = act.draining
+			result[i].Playing = act.isWatching(now)
+		}
+	}
+	rt.mu.RUnlock()
+	return result, nil
 }
 
 // revokeOne denylists one session's token, removes it and logs it out upstream.
@@ -1081,6 +1566,7 @@ func (rt *shareUserRuntime) revokeOne(session shareStoredSession) error {
 	rt.mu.Lock()
 	delete(rt.sessions, session.TokenHash)
 	delete(rt.lastSeen, session.TokenHash)
+	delete(rt.activity, session.TokenHash)
 	rt.revoked[session.TokenHash] = session.SiteID
 	rt.mu.Unlock()
 	if token, err := decryptSiteAccountSecret(session.ciphertext); err == nil && token != "" {
@@ -1233,6 +1719,7 @@ func (rt *shareUserRuntime) flush() {
 		log.Printf("share users: reload: %v", err)
 		return
 	}
+	rt.sweepDrainingSessions(time.Now())
 	rt.enforce(time.Now())
 }
 

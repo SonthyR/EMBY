@@ -157,7 +157,10 @@ func (a *App) handleShareSelfLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 type shareSelfSite struct {
+	SiteID    int64    `json:"site_id"`
 	Name      string   `json:"name"`
+	Enabled   bool     `json:"enabled"`
+	Active    bool     `json:"active"`
 	Addresses []string `json:"addresses"`
 }
 
@@ -166,7 +169,47 @@ type shareSelfView struct {
 	Servers []shareSelfSite `json:"servers"`
 }
 
-// GET /api/me, POST /api/me/kick, POST /api/me/password
+type shareSelfOrderResponse struct {
+	shareSelfView
+	Revoked  int `json:"revoked"`
+	Draining int `json:"draining"`
+}
+
+func (a *App) buildShareSelfView(user *storedShareUser, r *http.Request) shareSelfView {
+	origin := a.shareTextOrigin(r)
+	view := shareSelfView{ShareUser: a.shareUserView(user, false, origin)}
+	if a.pm != nil && a.pm.shares != nil {
+		if sessions, err := a.pm.shares.listSessions(user.ID); err == nil {
+			view.Sessions = sessions
+		}
+	}
+	view.Note = ""
+	view.Servers = make([]shareSelfSite, 0, len(view.Sites))
+	for _, assigned := range view.Sites {
+		site, err := a.db.GetSite(assigned.SiteID)
+		if err != nil {
+			continue
+		}
+		addresses := []string{}
+		if site.Enabled && view.RoutePrefix == "" {
+			addresses = a.siteProxyLinesFrom(*site, origin)
+		}
+		view.Servers = append(view.Servers, shareSelfSite{
+			SiteID:    site.ID,
+			Name:      site.Name,
+			Enabled:   site.Enabled,
+			Active:    assigned.Active,
+			Addresses: addresses,
+		})
+	}
+	for i := range view.Sites {
+		view.Sites[i].SiteAccountID = 0
+		view.Sites[i].AccountName = ""
+	}
+	return view
+}
+
+// GET /api/me, PUT /api/me/sites/order, POST /api/me/kick, POST /api/me/password
 func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	user, err := a.shareSessionUser(r)
@@ -185,26 +228,65 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		view := shareSelfView{ShareUser: a.shareUserView(user, false)}
+		a.jsonOK(w, a.buildShareSelfView(user, r))
+	case "sites/order":
+		if r.Method != http.MethodPut {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req struct {
+			SiteIDs []int64 `json:"site_ids"`
+		}
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, "invalid request")
+			return
+		}
+		if len(req.SiteIDs) != len(user.Sites) || len(req.SiteIDs) == 0 {
+			a.jsonErr(w, http.StatusBadRequest, "服务器排序列表不完整")
+			return
+		}
+		allowed := make(map[int64]bool, len(user.Sites))
+		for _, site := range user.Sites {
+			allowed[site.SiteID] = true
+		}
+		seen := make(map[int64]bool, len(req.SiteIDs))
+		for _, siteID := range req.SiteIDs {
+			if !allowed[siteID] || seen[siteID] {
+				a.jsonErr(w, http.StatusBadRequest, "服务器排序列表无效")
+				return
+			}
+			seen[siteID] = true
+		}
+		tx, err := a.db.db.Begin()
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "排序保存失败")
+			return
+		}
+		defer tx.Rollback()
+		for index, siteID := range req.SiteIDs {
+			if _, err := tx.Exec(`UPDATE share_user_sites SET sort_order=? WHERE share_user_id=? AND site_id=?`, index+1, user.ID, siteID); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "排序保存失败")
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "排序保存失败")
+			return
+		}
+		a.reloadShareUsers()
+		revoked, draining := 0, 0
 		if a.pm != nil && a.pm.shares != nil {
-			if sessions, err := a.pm.shares.listSessions(user.ID); err == nil {
-				view.Sessions = sessions
-			}
+			revoked, draining = a.pm.shares.reconcileSiteSwitch(user.ID, false)
 		}
-		view.Note = ""
-		origin := a.shareTextOrigin(r)
-		for _, assigned := range view.Sites {
-			site, err := a.db.GetSite(assigned.SiteID)
-			if err != nil || !site.Enabled {
-				continue
-			}
-			view.Servers = append(view.Servers, shareSelfSite{Name: site.Name, Addresses: a.siteProxyLinesFrom(*site, origin)})
+		updated, err := a.db.getShareUser(user.ID)
+		if err != nil {
+			updated = user
 		}
-		for i := range view.Sites {
-			view.Sites[i].SiteAccountID = 0
-			view.Sites[i].AccountName = ""
-		}
-		a.jsonOK(w, view)
+		a.jsonOK(w, shareSelfOrderResponse{
+			shareSelfView: a.buildShareSelfView(updated, r),
+			Revoked:       revoked,
+			Draining:      draining,
+		})
 	case "kick":
 		if r.Method != http.MethodPost {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
