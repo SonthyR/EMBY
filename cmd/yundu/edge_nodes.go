@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,31 +242,38 @@ func openEdgePlaybackTicket(token, encoded string) (edgePlaybackTicket, error) {
 // Edge node DTOs and runtime state
 
 type EdgeNode struct {
-	ID             int64  `json:"id"`
-	Name           string `json:"name"`
-	PublicPort     int    `json:"public_port"`
-	ListenPort     int    `json:"listen_port"`
-	PublicHost     string `json:"public_host"`
-	PublicIP       string `json:"public_ip"`
-	DetectedIP     string `json:"detected_ip"`
-	TLSMode        string `json:"tls_mode"`
-	Enabled        bool   `json:"enabled"`
-	TrafficQuota   int64  `json:"traffic_quota"`
-	TrafficUsed    int64  `json:"traffic_used"`
-	ResetDay       int    `json:"traffic_reset_day"`
-	NextResetAt    string `json:"next_reset_at,omitempty"`
-	Note           string `json:"note"`
-	AgentVersion   string `json:"agent_version"`
-	LastSeenAt     string `json:"last_seen_at"`
-	Online         bool   `json:"online"`
-	TLSActive      bool   `json:"tls_active"`
-	ActiveStreams  int    `json:"active_streams"`
-	CurrentBps     int64  `json:"current_bps"`
-	PublicURL      string `json:"public_url"`
-	Status         string `json:"status"` // online, offline, disabled, quota, waiting
-	InstallCommand string `json:"install_command,omitempty"`
-	CreatedAt      string `json:"created_at"`
-	UpdatedAt      string `json:"updated_at"`
+	ID                int64             `json:"id"`
+	Name              string            `json:"name"`
+	PublicPort        int               `json:"public_port"`
+	ListenPort        int               `json:"listen_port"`
+	PublicHost        string            `json:"public_host"`
+	PublicIP          string            `json:"public_ip"`
+	DetectedIP        string            `json:"detected_ip"`
+	TLSMode           string            `json:"tls_mode"`
+	Enabled           bool              `json:"enabled"`
+	TrafficQuota      int64             `json:"traffic_quota"`
+	TrafficUsed       int64             `json:"traffic_used"`
+	ResetDay          int               `json:"traffic_reset_day"`
+	NextResetAt       string            `json:"next_reset_at,omitempty"`
+	Note              string            `json:"note"`
+	AgentVersion      string            `json:"agent_version"`
+	MasterVersion     string            `json:"master_version,omitempty"`
+	UpgradeAvailable  bool              `json:"upgrade_available"`
+	UpgradeTarget     string            `json:"upgrade_target,omitempty"`
+	UpgradeStatus     string            `json:"upgrade_status,omitempty"`
+	LastSeenAt        string            `json:"last_seen_at"`
+	Online            bool              `json:"online"`
+	TLSActive         bool              `json:"tls_active"`
+	ActiveStreams     int               `json:"active_streams"`
+	CurrentBps        int64             `json:"current_bps"`
+	MemoryBytes       uint64            `json:"memory_bytes"`
+	UptimeSec         int64             `json:"uptime_sec"`
+	UpstreamLatencies []edgeSiteLatency `json:"upstream_latencies,omitempty"`
+	PublicURL         string            `json:"public_url"`
+	Status            string            `json:"status"` // online, offline, disabled, quota, waiting
+	InstallCommand    string            `json:"install_command,omitempty"`
+	CreatedAt         string            `json:"created_at"`
+	UpdatedAt         string            `json:"updated_at"`
 }
 
 type EdgeNodeInput struct {
@@ -282,27 +290,37 @@ type EdgeNodeInput struct {
 }
 
 type edgeNodeLiveState struct {
-	id            int64
-	name          string
-	publicPort    int
-	listenPort    int
-	publicHost    string
-	publicIP      string
-	detectedIP    string
-	tlsMode       string
-	tokenHash     string
-	tokenPlain    string
-	enabled       bool
-	quota         int64
-	persistedUsed int64
-	resetDay      int
-	resetPeriod   string
-	note          string
-	agentVersion  string
-	lastSeen      time.Time
-	tlsActive     bool
-	activeStreams int
-	currentBps    int64
+	id                  int64
+	name                string
+	publicPort          int
+	listenPort          int
+	publicHost          string
+	publicIP            string
+	detectedIP          string
+	tlsMode             string
+	tokenHash           string
+	tokenPlain          string
+	enabled             bool
+	quota               int64
+	persistedUsed       int64
+	resetDay            int
+	resetPeriod         string
+	note                string
+	agentVersion        string
+	lastSeen            time.Time
+	tlsActive           bool
+	activeStreams       int
+	currentBps          int64
+	memoryBytes         uint64
+	uptimeSec           int64
+	upstreamLatencies   map[int64]int
+	upgradeTarget       string
+	upgradeRequestID    string
+	upgradeStatus       string
+	alertSeenOnline     bool
+	alertKnownOffline   bool
+	alertQuota80Period  string
+	alertQuota100Period string
 
 	pending atomic.Int64
 }
@@ -773,27 +791,41 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 		a.pm.edges.mu.RUnlock()
 		return EdgeNode{}, false
 	}
+	online := state.isOnline(now)
 	view := EdgeNode{
-		ID:            state.id,
-		Name:          state.name,
-		PublicPort:    state.publicPort,
-		ListenPort:    state.listenPort,
-		PublicHost:    state.publicHost,
-		PublicIP:      state.publicIP,
-		DetectedIP:    state.detectedIP,
-		TLSMode:       state.tlsMode,
-		Enabled:       state.enabled,
-		TrafficQuota:  state.quota,
-		TrafficUsed:   state.totalUsed(),
-		ResetDay:      state.resetDay,
-		Note:          state.note,
-		AgentVersion:  state.agentVersion,
-		Online:        state.isOnline(now),
-		TLSActive:     state.tlsActive,
-		ActiveStreams: state.activeStreams,
-		CurrentBps:    state.currentBps,
-		PublicURL:     state.publicURL(),
-		Status:        state.statusAt(now),
+		ID:               state.id,
+		Name:             state.name,
+		PublicPort:       state.publicPort,
+		ListenPort:       state.listenPort,
+		PublicHost:       state.publicHost,
+		PublicIP:         state.publicIP,
+		DetectedIP:       state.detectedIP,
+		TLSMode:          state.tlsMode,
+		Enabled:          state.enabled,
+		TrafficQuota:     state.quota,
+		TrafficUsed:      state.totalUsed(),
+		ResetDay:         state.resetDay,
+		Note:             state.note,
+		AgentVersion:     state.agentVersion,
+		MasterVersion:    appVersion,
+		UpgradeAvailable: online && state.agentVersion != "" && state.agentVersion != appVersion,
+		UpgradeTarget:    state.upgradeTarget,
+		UpgradeStatus:    state.upgradeStatus,
+		Online:           online,
+		TLSActive:        state.tlsActive,
+		ActiveStreams:    state.activeStreams,
+		CurrentBps:       state.currentBps,
+		MemoryBytes:      state.memoryBytes,
+		UptimeSec:        state.uptimeSec,
+		PublicURL:        state.publicURL(),
+		Status:           state.statusAt(now),
+	}
+	var rawLatencies map[int64]int
+	if len(state.upstreamLatencies) > 0 {
+		rawLatencies = make(map[int64]int, len(state.upstreamLatencies))
+		for sid, ms := range state.upstreamLatencies {
+			rawLatencies[sid] = ms
+		}
 	}
 	if !state.lastSeen.IsZero() {
 		view.LastSeenAt = state.lastSeen.UTC().Format(time.RFC3339)
@@ -801,6 +833,23 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 	token := state.tokenPlain
 	listenPort := state.effectiveListenPort()
 	a.pm.edges.mu.RUnlock()
+
+	if len(rawLatencies) > 0 && a.pm != nil {
+		latViews := make([]edgeSiteLatency, 0, len(rawLatencies))
+		a.pm.mu.RLock()
+		for sid, ms := range rawLatencies {
+			name := fmt.Sprintf("站点 #%d", sid)
+			if inst := a.pm.proxies[sid]; inst != nil && inst.Site.Name != "" {
+				name = inst.Site.Name
+			}
+			latViews = append(latViews, edgeSiteLatency{SiteName: name, LatencyMs: ms})
+		}
+		a.pm.mu.RUnlock()
+		sort.Slice(latViews, func(i, j int) bool {
+			return latViews[i].SiteName < latViews[j].SiteName
+		})
+		view.UpstreamLatencies = latViews
+	}
 
 	if view.ResetDay > 0 {
 		if _, next := shareResetPeriod(now.In(a.db.shareLocation()), view.ResetDay); !next.IsZero() {
@@ -1086,6 +1135,36 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusInternalServerError, "流量清零失败")
 				return
 			}
+		}
+		view, _ := a.buildEdgeNodeView(id, origin, true)
+		a.jsonOK(w, view)
+	case "upgrade":
+		if r.Method != http.MethodPost {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req struct {
+			Version string `json:"version"`
+		}
+		if r.Body != nil {
+			_ = decodeJSONBody(w, r, &req)
+		}
+		target := strings.TrimSpace(req.Version)
+		if target == "" {
+			target = appVersion
+		}
+		if !validEdgeReleaseVersion(target) {
+			a.jsonErr(w, http.StatusBadRequest, "目标版本号格式无效")
+			return
+		}
+		if a.pm != nil && a.pm.edges != nil {
+			a.pm.edges.mu.Lock()
+			if state := a.pm.edges.nodes[id]; state != nil {
+				state.upgradeTarget = target
+				state.upgradeRequestID = newEdgeUpgradeRequestID()
+				state.upgradeStatus = "pending"
+			}
+			a.pm.edges.mu.Unlock()
 		}
 		view, _ := a.buildEdgeNodeView(id, origin, true)
 		a.jsonOK(w, view)
@@ -1384,24 +1463,32 @@ type agentTrafficReport struct {
 }
 
 type agentHeartbeatRequest struct {
-	Version         string               `json:"version"`
-	ListenPort      int                  `json:"listen_port"`
-	TLSActive       bool                 `json:"tls_active"`
-	ActiveStreams   int                  `json:"active_streams"`
-	CurrentBps      int64                `json:"current_bps"`
-	CertFingerprint string               `json:"cert_fingerprint"`
-	TrafficReports  []agentTrafficReport `json:"traffic_reports"`
+	Version           string               `json:"version"`
+	ListenPort        int                  `json:"listen_port"`
+	TLSActive         bool                 `json:"tls_active"`
+	ActiveStreams     int                  `json:"active_streams"`
+	CurrentBps        int64                `json:"current_bps"`
+	MemoryBytes       uint64               `json:"memory_bytes"`
+	UptimeSec         int64                `json:"uptime_sec"`
+	UpstreamLatencies map[int64]int        `json:"upstream_latencies,omitempty"`
+	UpgradeRequestID  string               `json:"upgrade_request_id,omitempty"`
+	UpgradeStatus     string               `json:"upgrade_status,omitempty"`
+	CertFingerprint   string               `json:"cert_fingerprint"`
+	TrafficReports    []agentTrafficReport `json:"traffic_reports"`
 }
 
 type agentHeartbeatResponse struct {
-	OK              bool          `json:"ok"`
-	NodeEnabled     bool          `json:"node_enabled"`
-	BlockedUsers    []int64       `json:"blocked_users"`
-	RevokedHashes   []string      `json:"revoked_hashes"`
-	UserSpeedLimits map[int64]int `json:"user_speed_limits"`
-	TLSCertPEM      string        `json:"tls_cert_pem,omitempty"`
-	TLSKeyPEM       string        `json:"tls_key_pem,omitempty"`
-	CertFingerprint string        `json:"cert_fingerprint,omitempty"`
+	OK               bool               `json:"ok"`
+	NodeEnabled      bool               `json:"node_enabled"`
+	BlockedUsers     []int64            `json:"blocked_users"`
+	RevokedHashes    []string           `json:"revoked_hashes"`
+	UserSpeedLimits  map[int64]int      `json:"user_speed_limits"`
+	ProbeTargets     []agentProbeTarget `json:"probe_targets,omitempty"`
+	UpgradeToVersion string             `json:"upgrade_to_version,omitempty"`
+	UpgradeRequestID string             `json:"upgrade_request_id,omitempty"`
+	TLSCertPEM       string             `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM        string             `json:"tls_key_pem,omitempty"`
+	CertFingerprint  string             `json:"cert_fingerprint,omitempty"`
 }
 
 func (a *App) masterTLSPEMForHost(hostname string) (certPEM, keyPEM, fingerprint string, ok bool) {
@@ -1468,12 +1555,13 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	a.pm.edges.mu.RLock()
 	node := a.pm.edges.nodes[nodeID]
-	var expectedHash, publicHost, tlsMode string
+	var expectedHash, publicHost, tlsMode, nodeName string
 	var nodeEnabled bool
 	if node != nil {
 		expectedHash = node.tokenHash
 		publicHost = node.publicHost
 		tlsMode = node.tlsMode
+		nodeName = node.name
 		nodeEnabled = node.enabled
 	}
 	a.pm.edges.mu.RUnlock()
@@ -1519,7 +1607,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		// Credit share user traffic and refresh draining playback timestamp.
 		if a.pm.shares != nil && report.ShareUserID > 0 {
-			a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, now)
+			a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, nodeName, now)
 		}
 	}
 	if nodeBytesDelta > 0 {
@@ -1537,14 +1625,61 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	node.tlsActive = req.TLSActive
 	node.activeStreams = max(0, req.ActiveStreams)
 	node.currentBps = max(int64(0), req.CurrentBps)
+	node.memoryBytes = req.MemoryBytes
+	if req.UptimeSec >= 0 {
+		node.uptimeSec = req.UptimeSec
+	}
+	if len(req.UpstreamLatencies) > 0 && len(req.UpstreamLatencies) <= 128 {
+		lat := make(map[int64]int, len(req.UpstreamLatencies))
+		for sid, ms := range req.UpstreamLatencies {
+			if sid > 0 {
+				lat[sid] = ms
+			}
+		}
+		node.upstreamLatencies = lat
+	}
+	if node.upgradeTarget != "" {
+		if req.Version == node.upgradeTarget {
+			node.upgradeTarget = ""
+			node.upgradeRequestID = ""
+			node.upgradeStatus = ""
+		} else if req.UpgradeRequestID != "" && req.UpgradeRequestID == node.upgradeRequestID && req.UpgradeStatus != "" {
+			status := strings.TrimSpace(req.UpgradeStatus)
+			if len(status) > 200 {
+				status = status[:200]
+			}
+			node.upgradeStatus = status
+			if strings.HasPrefix(status, "failed:") {
+				node.upgradeTarget = ""
+				node.upgradeRequestID = ""
+			}
+		}
+	}
+	upgradeVersion := node.upgradeTarget
+	upgradeReqID := node.upgradeRequestID
 	a.pm.edges.mu.Unlock()
 
+	var probeTargets []agentProbeTarget
+	a.pm.mu.RLock()
+	for sid, inst := range a.pm.proxies {
+		if inst != nil && inst.Site.Enabled && strings.TrimSpace(inst.Site.TargetURL) != "" {
+			probeTargets = append(probeTargets, agentProbeTarget{SiteID: sid, URL: inst.Site.TargetURL})
+		}
+	}
+	a.pm.mu.RUnlock()
+	sort.Slice(probeTargets, func(i, j int) bool {
+		return probeTargets[i].SiteID < probeTargets[j].SiteID
+	})
+
 	resp := agentHeartbeatResponse{
-		OK:              true,
-		NodeEnabled:     nodeEnabled,
-		BlockedUsers:    []int64{},
-		RevokedHashes:   []string{},
-		UserSpeedLimits: map[int64]int{},
+		OK:               true,
+		NodeEnabled:      nodeEnabled,
+		BlockedUsers:     []int64{},
+		RevokedHashes:    []string{},
+		UserSpeedLimits:  map[int64]int{},
+		ProbeTargets:     probeTargets,
+		UpgradeToVersion: upgradeVersion,
+		UpgradeRequestID: upgradeReqID,
 	}
 	if a.pm.shares != nil {
 		resp.BlockedUsers, resp.RevokedHashes, resp.UserSpeedLimits = a.pm.shares.agentSyncSnapshot(now)
@@ -1599,7 +1734,7 @@ func (pm *ProxyManager) recordExternalSiteTraffic(siteID, bytesIn, bytesOut, req
 
 // recordExternalTraffic credits bytes reported by an edge node to a share user
 // and keeps active-playback tracking fresh for graceful site switching.
-func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string, billed int64, playing bool, now time.Time) {
+func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string, billed int64, playing bool, nodeName string, now time.Time) {
 	if rt == nil {
 		return
 	}
@@ -1614,6 +1749,9 @@ func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string
 			rt.activity[tokenHash] = act
 		}
 		act.lastPlaybackAt = now
+		if strings.TrimSpace(nodeName) != "" {
+			act.lastNodeName = strings.TrimSpace(nodeName)
+		}
 	}
 	rt.mu.Unlock()
 }

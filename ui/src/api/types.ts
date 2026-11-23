@@ -16,6 +16,7 @@ export interface Site {
   listen_port: number
   public_host: string
   path_prefix: string
+  edge_routing_mode?: 'global' | 'master' | string
   traffic_used?: number
   monthly_traffic?: number
   [key: string]: unknown
@@ -45,15 +46,47 @@ export interface ShareUserSite {
 }
 
 export interface ShareSession {
+  session_id?: string
   site_id: number
   site_name: string
   device_name: string
   client: string
   client_ip: string
+  client_region?: string
+  node_name?: string
   created_at: string
   last_seen_at: string
   draining?: boolean
   playing?: boolean
+}
+
+export interface LiveShareSession {
+  session_id: string
+  user_id: number
+  username: string
+  site_id: number
+  site_name: string
+  device_name: string
+  client: string
+  client_ip: string
+  client_region?: string
+  node_name?: string
+  playing?: boolean
+  draining?: boolean
+  created_at: string
+  last_seen_at: string
+}
+
+export interface ShareSelfNetwork {
+  client_ip: string
+  region?: string
+  isp?: string
+  isp_group?: string
+  isp_label?: string
+  non_mainland_cn?: boolean
+  node_name?: string
+  blocked?: boolean
+  block_reason?: 'non_mainland' | 'group' | string
 }
 
 export type ShareStatus = 'active' | 'disabled' | 'expired' | 'quota'
@@ -101,6 +134,11 @@ export interface ShareUserInput {
 export type EdgeNodeStatus = 'online' | 'offline' | 'disabled' | 'quota' | 'waiting'
 export type EdgeNodeTLSMode = 'auto' | 'external' | 'http'
 
+export interface EdgeSiteLatency {
+  site_name: string
+  latency_ms: number
+}
+
 export interface EdgeNode {
   id: number
   name: string
@@ -117,11 +155,18 @@ export interface EdgeNode {
   next_reset_at?: string
   note: string
   agent_version: string
+  master_version?: string
+  upgrade_available?: boolean
+  upgrade_target?: string
+  upgrade_status?: string
   last_seen_at: string
   online: boolean
   tls_active: boolean
   active_streams: number
   current_bps: number
+  memory_bytes?: number
+  uptime_sec?: number
+  upstream_latencies?: EdgeSiteLatency[]
   public_url: string
   status: EdgeNodeStatus
   install_command?: string

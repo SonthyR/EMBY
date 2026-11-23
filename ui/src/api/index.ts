@@ -7,6 +7,8 @@ import type {
   IP2RegionLookupResult,
   IP2RegionStatus,
   ISPRoutesResponse,
+  LiveShareSession,
+  ShareSelfNetwork,
   ShareUser,
   ShareUserInput,
   Site,
@@ -172,6 +174,7 @@ export interface MyAccountServer {
 
 export interface MyAccount extends ShareUser {
   servers: MyAccountServer[]
+  network?: ShareSelfNetwork
 }
 
 export interface MyAccountOrderResponse extends MyAccount {
@@ -185,6 +188,7 @@ export const meApi = {
   get: () => api.get<MyAccount>('/api/me'),
   reorderSites: (siteIds: number[]) => api.put<MyAccountOrderResponse>('/api/me/sites/order', { site_ids: siteIds }),
   kick: () => api.post<{ revoked: number }>('/api/me/kick'),
+  kickSession: (sessionId: string) => api.post<{ revoked: boolean }>(`/api/me/sessions/${encodeURIComponent(sessionId)}/kick`),
   password: (current: string, next: string) => api.post<{ changed: boolean }>('/api/me/password', { current_password: current, new_password: next }),
 }
 
@@ -231,12 +235,15 @@ export const sitesApi = {
 
 export const shareApi = {
   list: () => api.get<ShareUser[]>('/api/share-users'),
+  liveSessions: () => api.get<LiveShareSession[]>('/api/live-sessions'),
   get: (userId: number) => api.get<ShareUser>(`/api/share-users/${id(userId)}`),
   create: (input: ShareUserInput) => api.post<ShareUser>('/api/share-users', input),
   update: (userId: number, input: ShareUserInput) => api.put<ShareUser>(`/api/share-users/${id(userId)}`, input),
   remove: (userId: number) => api.del<{ deleted: boolean }>(`/api/share-users/${id(userId)}`),
   text: (userId: number) => api.get<{ text: string }>(`/api/share-users/${id(userId)}/text`),
   kick: (userId: number) => api.post<{ revoked: number }>(`/api/share-users/${id(userId)}/kick`),
+  kickSession: (userId: number, sessionId: string) =>
+    api.post<{ revoked: boolean }>(`/api/share-users/${id(userId)}/sessions/${encodeURIComponent(sessionId)}/kick`),
   resetTraffic: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-traffic`),
   renew: (userId: number, days: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/renew`, { days }),
 }
@@ -266,6 +273,7 @@ export const edgeApi = {
   remove: (nodeId: number) => api.del<{ deleted: boolean }>(`/api/edge-nodes/${id(nodeId)}`),
   resetToken: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-token`),
   resetTraffic: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-traffic`),
+  upgrade: (nodeId: number, version = '') => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/upgrade`, version ? { version } : {}),
 }
 
 export const ispRoutesApi = {

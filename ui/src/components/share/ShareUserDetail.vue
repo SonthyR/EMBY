@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight } from '@lucide/vue'
+import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import { shareApi, shareUserToInput, type ShareUser } from '@/api'
+import { shareApi, shareUserToInput, type ShareSession, type ShareUser } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { copyText, daysUntil, dateOnly, formatBytes, relativeTime } from '@/utils/format'
@@ -60,6 +60,10 @@ async function resetTraffic() {
   if (await confirm({ title: '清零已用流量？', message: '本周期的已用流量会归零，额度重新计算。', confirmText: '清零' })) run('reset', () => shareApi.resetTraffic(detail.value!.id), '已清零')
 }
 const kick = () => run('kick', () => shareApi.kick(detail.value!.id), '已断开所有设备')
+async function kickOne(session: ShareSession) {
+  if (!detail.value || !session.session_id) return
+  await run(`kick-${session.session_id}`, () => shareApi.kickSession(detail.value!.id, session.session_id!), `已断开「${session.device_name || '该设备'}」`)
+}
 async function remove() {
   const u = detail.value!
   if (!(await confirm({ title: `删除 ${u.username}？`, message: '在线设备会立刻断开。这个操作无法撤销。', confirmText: '删除', danger: true }))) return
@@ -134,13 +138,29 @@ async function copyRouteURL() {
       <section class="block">
         <h3>已登录设备</h3>
         <ul v-if="detail.sessions?.length" class="devices">
-          <li v-for="(s, i) in detail.sessions" :key="i">
+          <li v-for="(s, i) in detail.sessions" :key="s.session_id || i">
             <MonitorSmartphone />
             <div>
-              <span>{{ s.device_name || '未知设备' }}<small v-if="s.draining" class="tag warn">观影后切换</small><small v-else-if="s.playing" class="tag good">播放中</small></span>
-              <small class="faint">{{ [s.client, s.site_name, s.client_ip].filter(Boolean).join(' · ') }}</small>
+              <span>
+                {{ s.device_name || '未知设备' }}
+                <small v-if="s.draining" class="tag warn">观影后切换</small>
+                <small v-else-if="s.playing" class="tag good">播放中{{ s.node_name ? ` · ${s.node_name}` : '' }}</small>
+                <small v-else-if="s.node_name" class="tag">{{ s.node_name }}</small>
+              </span>
+              <small class="faint" :title="s.client_ip">{{ [s.client, s.site_name, s.client_region || s.client_ip].filter(Boolean).join(' · ') }}</small>
             </div>
             <small class="faint">{{ relativeTime(s.last_seen_at) }}</small>
+            <button
+              v-if="s.session_id"
+              type="button"
+              class="kick-one"
+              :disabled="!!busy"
+              title="断开该设备"
+              aria-label="断开该设备"
+              @click="kickOne(s)"
+            >
+              <X />
+            </button>
           </li>
         </ul>
         <p v-else class="faint none">没有设备登录</p>
@@ -187,9 +207,13 @@ h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
 .devices svg { width: 16px; height: 16px; color: var(--text-3); flex: 0 0 16px; }
 .devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .devices small { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; }
+.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; background: var(--surface); color: var(--text-2); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.good { background: var(--good-soft); color: var(--good); }
+.kick-one { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; flex: 0 0 26px; }
+.kick-one:hover:not(:disabled) { background: var(--surface-hover); color: var(--bad); }
+.kick-one:disabled { opacity: 0.4; cursor: default; }
+.kick-one svg { width: 14px; height: 14px; color: inherit; }
 .none { margin: 0; font-size: 13px; }
 .menu { display: flex; flex-direction: column; margin: 0 -10px; }
 .menu button { display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; border: 0; border-radius: var(--radius-sm); background: transparent; font-size: 13.5px; text-align: left; cursor: pointer; }

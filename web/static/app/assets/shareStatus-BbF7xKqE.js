@@ -1,0 +1,1 @@
+var e={active:`正常`,disabled:`已停用`,expired:`已过期`,quota:`流量用完`},t={active:`good`,disabled:`neutral`,expired:`bad`,quota:`warn`};export{t as n,e as t};

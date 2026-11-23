@@ -146,7 +146,7 @@ func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *Proxy
 	filename := sanitizeEdgeFilename(targetURL.Path)
 	redirectURL := strings.TrimRight(decision.PublicURL, "/") + edgeTicketPathPrefix + sealed + "/" + filename
 	if pm != nil && pm.shares != nil && shareTokenHash != "" {
-		pm.shares.markEdgePlayback(shareTokenHash)
+		pm.shares.markEdgePlayback(shareTokenHash, decision.NodeName)
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("X-Yundu-Edge-Node", decision.NodeName)
@@ -168,7 +168,7 @@ func tryRedirectToEdgeNode(
 	shareUser *shareUserState,
 	shareTokenHash string,
 ) bool {
-	if pm == nil || pm.edges == nil || site.MainVideoStreamMode == mainVideoStreamModeDirect {
+	if pm == nil || pm.edges == nil || site.MainVideoStreamMode == mainVideoStreamModeDirect || site.EdgeRoutingMode == edgeRoutingModeMaster {
 		return false
 	}
 	if !isEdgeOffloadableMediaRequest(r) {
@@ -213,7 +213,7 @@ func tryRedirectDynamicResourceToEdgeNode(
 	outboundHeaders http.Header,
 	requiredHeaders []dynamicCapabilityHeaderClaim,
 ) bool {
-	if pm == nil || pm.edges == nil || site.MainVideoStreamMode == mainVideoStreamModeDirect {
+	if pm == nil || pm.edges == nil || site.MainVideoStreamMode == mainVideoStreamModeDirect || site.EdgeRoutingMode == edgeRoutingModeMaster {
 		return false
 	}
 	if r == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {

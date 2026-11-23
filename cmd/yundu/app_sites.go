@@ -90,6 +90,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PlaybackTargetURL          string                `json:"playback_target_url"`
 			PlaybackMode               string                `json:"playback_mode"`
 			MainVideoStreamMode        string                `json:"main_video_stream_mode"`
+			EdgeRoutingMode            string                `json:"edge_routing_mode"`
 			FailoverTargets            []string              `json:"failover_targets"`
 			FailoverLines              []FailoverLine        `json:"failover_lines"`
 			StreamHosts                []string              `json:"stream_hosts"`
@@ -271,6 +272,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		req.EdgeRoutingMode, err = normalizeEdgeRoutingMode(req.EdgeRoutingMode)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -330,6 +336,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PlaybackTargetURL:             req.PlaybackTargetURL,
 			PlaybackMode:                  req.PlaybackMode,
 			MainVideoStreamMode:           req.MainVideoStreamMode,
+			EdgeRoutingMode:               req.EdgeRoutingMode,
 			FailoverTargets:               string(failoverTargetsJSON),
 			StoredFailoverLines:           string(failoverLinesJSON),
 			StreamHosts:                   string(streamHostsJSON),
@@ -588,6 +595,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			PlaybackTargetURL          *string                `json:"playback_target_url"`
 			PlaybackMode               *string                `json:"playback_mode"`
 			MainVideoStreamMode        *string                `json:"main_video_stream_mode"`
+			EdgeRoutingMode            *string                `json:"edge_routing_mode"`
 			FailoverTargets            *[]string              `json:"failover_targets"`
 			FailoverLines              *[]FailoverLine        `json:"failover_lines"`
 			StreamHosts                *[]string              `json:"stream_hosts"`
@@ -649,6 +657,14 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		mainVideoStreamMode := oldSite.MainVideoStreamMode
 		if req.MainVideoStreamMode != nil {
 			mainVideoStreamMode, err = normalizeMainVideoStreamMode(*req.MainVideoStreamMode)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		edgeRoutingMode := oldSite.EdgeRoutingMode
+		if req.EdgeRoutingMode != nil {
+			edgeRoutingMode, err = normalizeEdgeRoutingMode(*req.EdgeRoutingMode)
 			if err != nil {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
@@ -850,6 +866,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.PlaybackTargetURL = playbackTargetURL
 		candidate.PlaybackMode = playbackMode
 		candidate.MainVideoStreamMode = mainVideoStreamMode
+		candidate.EdgeRoutingMode = edgeRoutingMode
 		candidate.FailoverTargets = failoverTargets
 		candidate.StoredFailoverLines = failoverLines
 		candidate.StreamHosts = streamHosts

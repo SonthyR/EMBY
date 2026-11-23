@@ -166,6 +166,7 @@ type shareSessionActivity struct {
 	activeStreams  int
 	playing        bool
 	lastPlaybackAt time.Time
+	lastNodeName   string
 	draining       bool
 	drainingSince  time.Time
 }
@@ -868,6 +869,9 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 	if isMedia {
 		act.activeStreams++
 		act.lastPlaybackAt = now
+		if act.lastNodeName == "" {
+			act.lastNodeName = "主机"
+		}
 	}
 	rt.mu.Unlock()
 	if !isMedia && !isStopped {
@@ -1031,7 +1035,7 @@ func (rt *shareUserRuntime) effectiveSpeedLimitMbps(user *shareUserState) int {
 	return limit
 }
 
-func (rt *shareUserRuntime) markEdgePlayback(tokenHash string) {
+func (rt *shareUserRuntime) markEdgePlayback(tokenHash, nodeName string) {
 	if rt == nil || tokenHash == "" {
 		return
 	}
@@ -1044,6 +1048,9 @@ func (rt *shareUserRuntime) markEdgePlayback(tokenHash string) {
 	}
 	act.playing = true
 	act.lastPlaybackAt = now
+	if strings.TrimSpace(nodeName) != "" {
+		act.lastNodeName = strings.TrimSpace(nodeName)
+	}
 	rt.mu.Unlock()
 }
 
@@ -1547,19 +1554,48 @@ func (rt *shareUserRuntime) deviceCount(userID int64) int {
 // Revocation
 
 type shareStoredSession struct {
-	TokenHash  string `json:"-"`
-	ciphertext string
-	lastSeen   time.Time
-	SiteID     int64  `json:"site_id"`
-	SiteName   string `json:"site_name"`
-	DeviceID   string `json:"-"`
-	DeviceName string `json:"device_name"`
-	Client     string `json:"client"`
-	ClientIP   string `json:"client_ip"`
-	CreatedAt  string `json:"created_at"`
-	LastSeenAt string `json:"last_seen_at"`
-	Draining   bool   `json:"draining,omitempty"`
-	Playing    bool   `json:"playing,omitempty"`
+	TokenHash    string `json:"-"`
+	SessionID    string `json:"session_id,omitempty"`
+	ciphertext   string
+	lastSeen     time.Time
+	SiteID       int64  `json:"site_id"`
+	SiteName     string `json:"site_name"`
+	DeviceID     string `json:"-"`
+	DeviceName   string `json:"device_name"`
+	Client       string `json:"client"`
+	ClientIP     string `json:"client_ip"`
+	ClientRegion string `json:"client_region,omitempty"`
+	NodeName     string `json:"node_name,omitempty"`
+	CreatedAt    string `json:"created_at"`
+	LastSeenAt   string `json:"last_seen_at"`
+	Draining     bool   `json:"draining,omitempty"`
+	Playing      bool   `json:"playing,omitempty"`
+}
+
+type liveShareSessionView struct {
+	ShareUserID  int64  `json:"share_user_id"`
+	Username     string `json:"username"`
+	SessionID    string `json:"session_id"`
+	SiteID       int64  `json:"site_id"`
+	SiteName     string `json:"site_name"`
+	DeviceName   string `json:"device_name"`
+	Client       string `json:"client"`
+	ClientIP     string `json:"client_ip"`
+	ClientRegion string `json:"client_region,omitempty"`
+	NodeName     string `json:"node_name,omitempty"`
+	Playing      bool   `json:"playing"`
+	Draining     bool   `json:"draining,omitempty"`
+	LastSeenAt   string `json:"last_seen_at"`
+}
+
+func (rt *shareUserRuntime) lookupSessionRegion(clientIP string) string {
+	if rt == nil || rt.pm == nil || rt.pm.edges == nil || rt.pm.edges.ip2region == nil || strings.TrimSpace(clientIP) == "" {
+		return ""
+	}
+	if disp, ok := rt.pm.edges.ip2region.LookupDisplay(clientIP); ok {
+		return disp
+	}
+	return ""
 }
 
 func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, error) {
@@ -1574,6 +1610,8 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.CreatedAt, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
+		item.SessionID = item.TokenHash
+		item.ClientRegion = rt.lookupSessionRegion(item.ClientIP)
 		if parsed, err := time.Parse("2006-01-02 15:04:05", item.LastSeenAt); err == nil {
 			item.lastSeen = parsed
 		}
@@ -1588,10 +1626,86 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 		if act := rt.activity[result[i].TokenHash]; act != nil {
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
+			if act.lastNodeName != "" {
+				result[i].NodeName = act.lastNodeName
+			} else if result[i].Playing {
+				result[i].NodeName = "主机"
+			}
 		}
 	}
 	rt.mu.RUnlock()
 	return result, nil
+}
+
+func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error) {
+	if rt == nil || rt.db == nil {
+		return []liveShareSessionView{}, nil
+	}
+	rows, err := rt.db.db.Query(`SELECT s.share_user_id, COALESCE(u.username, ''), s.token_hash, s.site_id, COALESCE(t.name, ''), s.device_name, s.client, s.client_ip, COALESCE(s.last_seen_at, '') FROM share_user_sessions s JOIN share_users u ON u.id=s.share_user_id LEFT JOIN sites t ON t.id=s.site_id ORDER BY s.last_seen_at DESC LIMIT 200`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]liveShareSessionView, 0)
+	for rows.Next() {
+		var item liveShareSessionView
+		if err := rows.Scan(&item.ShareUserID, &item.Username, &item.SessionID, &item.SiteID, &item.SiteName, &item.DeviceName, &item.Client, &item.ClientIP, &item.LastSeenAt); err != nil {
+			return nil, err
+		}
+		item.ClientRegion = rt.lookupSessionRegion(item.ClientIP)
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	for i := range result {
+		if act := rt.activity[result[i].SessionID]; act != nil {
+			result[i].Draining = act.draining
+			result[i].Playing = act.isWatching(now)
+			if act.lastNodeName != "" {
+				result[i].NodeName = act.lastNodeName
+			} else if result[i].Playing {
+				result[i].NodeName = "主机"
+			}
+		}
+	}
+	rt.mu.RUnlock()
+	// Sort playing sessions first, preserving recency order within each bucket.
+	playing := make([]liveShareSessionView, 0, len(result))
+	idle := make([]liveShareSessionView, 0, len(result))
+	for _, item := range result {
+		if item.Playing {
+			playing = append(playing, item)
+		} else {
+			idle = append(idle, item)
+		}
+	}
+	return append(playing, idle...), nil
+}
+
+func (rt *shareUserRuntime) revokeUserSession(userID int64, sessionID string) (bool, error) {
+	if rt == nil || rt.db == nil {
+		return false, nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return false, nil
+	}
+	var session shareStoredSession
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id FROM share_user_sessions WHERE share_user_id=? AND token_hash=?`, userID, sessionID).
+		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := rt.revokeOne(session); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // revokeOne denylists one session's token, removes it and logs it out upstream.

@@ -164,9 +164,22 @@ type shareSelfSite struct {
 	Addresses []string `json:"addresses"`
 }
 
+type shareSelfNetwork struct {
+	ClientIP      string `json:"client_ip"`
+	Region        string `json:"region"`
+	ISP           string `json:"isp"`
+	ISPGroup      string `json:"isp_group"`
+	ISPLabel      string `json:"isp_label"`
+	NonMainlandCN bool   `json:"non_mainland_cn"`
+	NodeName      string `json:"node_name"`
+	Blocked       bool   `json:"blocked"`
+	BlockReason   string `json:"block_reason,omitempty"`
+}
+
 type shareSelfView struct {
 	ShareUser
-	Servers []shareSelfSite `json:"servers"`
+	Servers []shareSelfSite   `json:"servers"`
+	Network *shareSelfNetwork `json:"network,omitempty"`
 }
 
 type shareSelfOrderResponse struct {
@@ -175,9 +188,42 @@ type shareSelfOrderResponse struct {
 	Draining int `json:"draining"`
 }
 
+func (a *App) buildShareSelfNetwork(r *http.Request) *shareSelfNetwork {
+	if r == nil {
+		return nil
+	}
+	clientIP := requestClientKey(r, a.trustedProxies)
+	if clientIP == "" || clientIP == "unknown" {
+		return nil
+	}
+	if a.pm != nil && a.pm.edges != nil {
+		d := a.pm.edges.selectNodeForIP(clientIP)
+		return &shareSelfNetwork{
+			ClientIP:      clientIP,
+			Region:        d.Region,
+			ISP:           d.ISP,
+			ISPGroup:      d.ISPGroup,
+			ISPLabel:      d.ISPLabel,
+			NonMainlandCN: d.NonMainlandCN,
+			NodeName:      d.NodeName,
+			Blocked:       d.Blocked,
+			BlockReason:   d.BlockReason,
+		}
+	}
+	return &shareSelfNetwork{
+		ClientIP: clientIP,
+		ISPGroup: ispGroupOther,
+		ISPLabel: ispGroupLabel(ispGroupOther),
+		NodeName: "主机",
+	}
+}
+
 func (a *App) buildShareSelfView(user *storedShareUser, r *http.Request) shareSelfView {
 	origin := a.shareTextOrigin(r)
-	view := shareSelfView{ShareUser: a.shareUserView(user, false, origin)}
+	view := shareSelfView{
+		ShareUser: a.shareUserView(user, false, origin),
+		Network:   a.buildShareSelfNetwork(r),
+	}
 	if a.pm != nil && a.pm.shares != nil {
 		if sessions, err := a.pm.shares.listSessions(user.ID); err == nil {
 			view.Sessions = sessions
@@ -344,6 +390,31 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 		a.setShareSessionCookie(w, r, signShareSession(user.ID, string(newHash), time.Now()), int(shareSessionDuration.Seconds()))
 		a.jsonOK(w, map[string]bool{"changed": true})
 	default:
+		if strings.HasPrefix(action, "sessions/") && strings.HasSuffix(action, "/kick") {
+			if r.Method != http.MethodPost {
+				a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			sessionID := strings.TrimSuffix(strings.TrimPrefix(action, "sessions/"), "/kick")
+			if strings.Contains(sessionID, "/") || strings.TrimSpace(sessionID) == "" {
+				a.jsonErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			revoked := false
+			if a.pm != nil && a.pm.shares != nil {
+				revoked, err = a.pm.shares.revokeUserSession(user.ID, sessionID)
+				if err != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "操作失败")
+					return
+				}
+			}
+			if !revoked {
+				a.jsonErr(w, http.StatusNotFound, "设备会话不存在或已下线")
+				return
+			}
+			a.jsonOK(w, map[string]bool{"revoked": true})
+			return
+		}
 		a.jsonErr(w, http.StatusNotFound, "not found")
 	}
 }

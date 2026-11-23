@@ -681,6 +681,29 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.jsonOK(w, map[string]int{"revoked": count})
+	case "sessions":
+		// POST /api/share-users/{id}/sessions/{session_id}/kick
+		if len(parts) != 4 || parts[3] != "kick" {
+			a.jsonErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		revoked := false
+		if shares != nil {
+			revoked, err = shares.revokeUserSession(id, parts[2])
+			if err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "断开设备失败")
+				return
+			}
+		}
+		if !revoked {
+			a.jsonErr(w, http.StatusNotFound, "设备会话不存在或已下线")
+			return
+		}
+		a.jsonOK(w, map[string]bool{"revoked": true})
 	case "reset-traffic":
 		if r.Method != http.MethodPost {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -735,4 +758,26 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.jsonErr(w, http.StatusNotFound, "not found")
 	}
+}
+
+// GET /api/live-sessions
+func (a *App) handleLiveSessions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if a.pm == nil || a.pm.shares == nil {
+		a.jsonOK(w, []liveShareSessionView{})
+		return
+	}
+	sessions, err := a.pm.shares.listAllLiveSessions()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "获取在线会话失败")
+		return
+	}
+	if sessions == nil {
+		sessions = []liveShareSessionView{}
+	}
+	a.jsonOK(w, sessions)
 }

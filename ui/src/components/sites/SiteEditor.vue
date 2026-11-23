@@ -17,7 +17,7 @@ type Line = { name: string; url: string; enabled: boolean; test?: string }
 type Header = { name: string; value: string; configured: boolean }
 interface EditorState {
   name: string; target: string; lines: Line[]; ingress: string; pathPrefix: string; routePrefix: string; publicHost: string; port: string | number
-  routing: string; profile: string; rules: { type: string; value: string }[]; playbackURL: string; streamHosts: string[]
+  routing: string; edgeRoutingMode: 'global' | 'master'; profile: string; rules: { type: string; value: string }[]; playbackURL: string; streamHosts: string[]
   ua: string; customUA: string; customClient: string; customVersion: string; clientIP: string; headers: Header[]
   cache: boolean; cacheHours: string | number; cacheMB: string | number; cacheRules: string; quotaGB: string | number; speed: string | number
   extremeAck: boolean; extremeName: string
@@ -32,6 +32,7 @@ const cfg = ref<EditorState>({
   publicHost: '',
   port: '' as string | number,
   routing: 'auto',
+  edgeRoutingMode: 'global',
   profile: 'compatible',
   rules: [] as { type: string; value: string }[],
   playbackURL: '',
@@ -83,6 +84,7 @@ watch(
       publicHost: host,
       port: s.listen_port || '',
       routing: s.main_video_stream_mode === 'direct' ? 'direct' : props.site ? (s.dynamic_discovery_enabled ? 'auto' : 'manual') : 'auto',
+      edgeRoutingMode: s.edge_routing_mode === 'master' ? 'master' : 'global',
       profile: ['safe', 'compatible', 'extreme'].includes(s.dynamic_profile) ? s.dynamic_profile : 'compatible',
       rules: Array.isArray(s.dynamic_domain_rules) ? s.dynamic_domain_rules.map((r: any) => ({ type: r.type || 'suffix', value: r.value || '' })) : [],
       playbackURL: s.playback_target_url || '',
@@ -227,6 +229,7 @@ function buildPayload(): Record<string, unknown> | null {
     playback_target_url: cfg.value.routing === 'manual' ? cfg.value.playbackURL.trim() : '',
     playback_mode: 'direct',
     main_video_stream_mode: cfg.value.routing === 'direct' ? 'direct' : 'proxy',
+    edge_routing_mode: cfg.value.edgeRoutingMode,
     stream_hosts: cfg.value.routing === 'manual' ? cfg.value.streamHosts.map(s => s.trim()).filter(Boolean) : [],
     ...ingress,
     upstream_headers: headers.map(h => ({ name: h.name.trim(), value: h.value.trim() })),
@@ -379,6 +382,12 @@ async function save() {
             <UiButton size="sm" variant="ghost" @click="cfg.streamHosts.push('')"><Plus />添加节点</UiButton>
           </div>
         </template>
+        <UiField v-if="cfg.routing !== 'direct'" label="从机分流" for="se-edge-routing" help="选择「仅走主机」后，该站点视频将跳过三网从机始终由主机中转。">
+          <select id="se-edge-routing" v-model="cfg.edgeRoutingMode" class="select">
+            <option value="global">跟随全局三网分流（默认）</option>
+            <option value="master">仅走主机（不走从机）</option>
+          </select>
+        </UiField>
       </fieldset>
 
       <fieldset>

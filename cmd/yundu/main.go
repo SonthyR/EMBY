@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.1.2"
+var appVersion = "v1.2.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -212,6 +212,7 @@ func main() {
 		}
 	}()
 	go runTelegramReportScheduler(ctx, db)
+	go runEdgeNodeAlertMonitor(ctx, db, pm.edges)
 
 	if panelHost != "" {
 		if _, configured := pm.PublicHostHandler(panelHost); configured {
@@ -278,6 +279,7 @@ func main() {
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/share-users", cors(app.authMiddleware(app.handleShareUsers)))
 	mux.HandleFunc("/api/share-users/", cors(app.authMiddleware(app.handleShareUserByID)))
+	mux.HandleFunc("/api/live-sessions", cors(app.authMiddleware(app.handleLiveSessions)))
 	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))

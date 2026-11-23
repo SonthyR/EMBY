@@ -6,12 +6,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -736,4 +739,508 @@ func TestISPBlockNonMainlandAndPerGroupBlock(t *testing.T) {
 func jsonInt(v int) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func TestEdgeRoutingModeMasterSkipsEdgeNode(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ipDir := filepath.Join(t.TempDir(), "ip2region")
+	if err := os.MkdirAll(ipDir, 0o700); err != nil {
+		t.Fatalf("mkdir ip2region: %v", err)
+	}
+	v4Raw := buildSyntheticXDB(t, xdbIPv4VersionNo, []testXDBSegment{
+		{start: netip.MustParseAddr("1.2.3.0"), end: netip.MustParseAddr("1.2.3.255"), region: "中国|广东省|广州市|电信|CN"},
+	})
+	if err := os.WriteFile(filepath.Join(ipDir, "ip2region_v4.xdb"), v4Raw, 0o600); err != nil {
+		t.Fatalf("write v4 xdb: %v", err)
+	}
+	ipMgr := newIP2RegionManager(ipDir, nil)
+	defer ipMgr.Close()
+
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "video/x-matroska")
+		_, _ = w.Write([]byte("master-video-bytes"))
+	}))
+	defer upstream.Close()
+
+	pm := NewProxyManager(db, bytes.Repeat([]byte{0x34}, 32))
+	_, loopbackCIDR, _ := net.ParseCIDR("127.0.0.1/32")
+	pm.SetTrustedProxies([]*net.IPNet{loopbackCIDR})
+	edgeRT := newEdgeNodeRuntime(db, pm, ipMgr)
+	pm.SetEdgeRuntime(edgeRT)
+	app := &App{db: db, dbPath: dbPath, pm: pm, ip2region: ipMgr, trustedProxies: []*net.IPNet{loopbackCIDR}}
+
+	// Create an online edge node and assign it as #1 for Telecom (ct)
+	createRec := httptest.NewRecorder()
+	app.handleEdgeNodes(createRec, httptest.NewRequest(http.MethodPost, "/api/edge-nodes", strings.NewReader(`{"name":"HK-Edge","public_port":19090,"public_ip":"198.51.100.10","tls_mode":"http"}`)))
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("createEdgeNode status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var node EdgeNode
+	if err := json.Unmarshal(createRec.Body.Bytes(), &node); err != nil {
+		t.Fatalf("decode edge node: %v", err)
+	}
+	routeRec := httptest.NewRecorder()
+	routeBody := `{"group":"ct","nodes":[{"node_id":` + jsonInt(int(node.ID)) + `,"enabled":true},{"node_id":0,"enabled":true}]}`
+	app.handleISPRoutes(routeRec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(routeBody)))
+	if routeRec.Code != http.StatusOK {
+		t.Fatalf("update isp routes status=%d body=%s", routeRec.Code, routeRec.Body.String())
+	}
+	edgeRT.mu.Lock()
+	if live := edgeRT.nodes[node.ID]; live != nil {
+		live.lastSeen = time.Now()
+		live.agentVersion = appVersion
+	}
+	edgeRT.mu.Unlock()
+
+	masterSite, err := db.CreateSiteRecord(Site{
+		Name:            "MasterOnly",
+		TargetURL:       upstream.URL,
+		ListenPort:      18101,
+		IngressMode:     ingressModePath,
+		PathPrefix:      "/masteronly",
+		Enabled:         true,
+		UAMode:          "passthrough",
+		EdgeRoutingMode: edgeRoutingModeMaster,
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord master: %v", err)
+	}
+	globalSite, err := db.CreateSiteRecord(Site{
+		Name:            "GlobalEdge",
+		TargetURL:       upstream.URL,
+		ListenPort:      18102,
+		IngressMode:     ingressModePath,
+		PathPrefix:      "/globaledge",
+		Enabled:         true,
+		UAMode:          "passthrough",
+		EdgeRoutingMode: edgeRoutingModeGlobal,
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord global: %v", err)
+	}
+	if err := pm.StartSite(*masterSite); err != nil {
+		t.Fatalf("StartSite master: %v", err)
+	}
+	if err := pm.StartSite(*globalSite); err != nil {
+		t.Fatalf("StartSite global: %v", err)
+	}
+	defer pm.GracefulShutdown(context.Background())
+
+	// 1. masterSite MUST NOT redirect to edge node; it proxies directly from master
+	hMaster, _ := pm.SiteHandler(masterSite.ID)
+	req1 := httptest.NewRequest(http.MethodGet, "/emby/Videos/101/stream.mkv?Static=true", nil)
+	req1.RemoteAddr = "127.0.0.1:41000"
+	req1.Header.Set("X-Real-IP", "1.2.3.4")
+	rec1 := httptest.NewRecorder()
+	hMaster.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK || rec1.Body.String() != "master-video-bytes" || upstreamHits != 1 {
+		t.Fatalf("master-only site should serve directly from master, got status=%d loc=%q body=%q hits=%d",
+			rec1.Code, rec1.Header().Get("Location"), rec1.Body.String(), upstreamHits)
+	}
+
+	// 2. globalSite MUST 307 redirect to edge node
+	hGlobal, _ := pm.SiteHandler(globalSite.ID)
+	req2 := httptest.NewRequest(http.MethodGet, "/emby/Videos/101/stream.mkv?Static=true", nil)
+	req2.RemoteAddr = "127.0.0.1:41000"
+	req2.Header.Set("X-Real-IP", "1.2.3.4")
+	rec2 := httptest.NewRecorder()
+	hGlobal.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTemporaryRedirect || !strings.HasPrefix(rec2.Header().Get("Location"), "http://198.51.100.10:19090"+edgeTicketPathPrefix) {
+		t.Fatalf("global site should 307 to edge node, got status=%d loc=%q", rec2.Code, rec2.Header().Get("Location"))
+	}
+}
+
+func TestLiveSessionsSingleDeviceKickAndSelfNetwork(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ipDir := filepath.Join(t.TempDir(), "ip2region")
+	if err := os.MkdirAll(ipDir, 0o700); err != nil {
+		t.Fatalf("mkdir ip2region: %v", err)
+	}
+	v4Raw := buildSyntheticXDB(t, xdbIPv4VersionNo, []testXDBSegment{
+		{start: netip.MustParseAddr("1.2.3.0"), end: netip.MustParseAddr("1.2.3.255"), region: "中国|广东省|广州市|电信|CN"},
+		{start: netip.MustParseAddr("45.46.47.0"), end: netip.MustParseAddr("45.46.47.255"), region: "中国|香港|0|PCCW|HK"},
+	})
+	if err := os.WriteFile(filepath.Join(ipDir, "ip2region_v4.xdb"), v4Raw, 0o600); err != nil {
+		t.Fatalf("write v4 xdb: %v", err)
+	}
+	ipMgr := newIP2RegionManager(ipDir, nil)
+	defer ipMgr.Close()
+
+	pm := NewProxyManager(db, bytes.Repeat([]byte{0x35}, 32))
+	_, loopbackCIDR, _ := net.ParseCIDR("127.0.0.1/32")
+	pm.SetTrustedProxies([]*net.IPNet{loopbackCIDR})
+	edgeRT := newEdgeNodeRuntime(db, pm, ipMgr)
+	pm.SetEdgeRuntime(edgeRT)
+	app := &App{db: db, dbPath: dbPath, pm: pm, ip2region: ipMgr, trustedProxies: []*net.IPNet{loopbackCIDR}}
+
+	site, err := db.CreateSiteRecord(Site{
+		Name:        "TestEmby",
+		TargetURL:   "https://emby.example.com",
+		IngressMode: ingressModePath,
+		PathPrefix:  "/testemby",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	createUserBody := fmt.Sprintf(`{"username":"alice","password":"secret-password","enabled":true,"sites":[{"site_id":%d}]}`, site.ID)
+	createUserRec := httptest.NewRecorder()
+	app.handleShareUsers(createUserRec, httptest.NewRequest(http.MethodPost, "/api/share-users", strings.NewReader(createUserBody)))
+	if createUserRec.Code != http.StatusCreated {
+		t.Fatalf("createShareUser status=%d body=%s", createUserRec.Code, createUserRec.Body.String())
+	}
+	var user struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(createUserRec.Body.Bytes(), &user); err != nil {
+		t.Fatalf("decode share user: %v", err)
+	}
+	pm.shares.mu.RLock()
+	userState := pm.shares.users[user.ID]
+	pm.shares.mu.RUnlock()
+
+	// Register two distinct device sessions
+	tok1 := "emby-token-device-1"
+	tok2 := "emby-token-device-2"
+	if err := pm.shares.registerSession(&shareLoginPending{
+		rt: pm.shares, user: userState, siteID: site.ID,
+		deviceID: "dev-1", device: "Apple TV", client: "Infuse", clientIP: "1.2.3.4",
+	}, tok1); err != nil {
+		t.Fatalf("registerSession 1: %v", err)
+	}
+	if err := pm.shares.registerSession(&shareLoginPending{
+		rt: pm.shares, user: userState, siteID: site.ID,
+		deviceID: "dev-2", device: "iPhone", client: "SenPlayer", clientIP: "1.2.3.4",
+	}, tok2); err != nil {
+		t.Fatalf("registerSession 2: %v", err)
+	}
+	hash1 := shareTokenHash(tok1)
+	hash2 := shareTokenHash(tok2)
+	pm.shares.markEdgePlayback(hash2, "香港从机")
+
+	// 1. GET /api/live-sessions should return both sessions with playing session first + region + node_name
+	liveRec := httptest.NewRecorder()
+	app.handleLiveSessions(liveRec, httptest.NewRequest(http.MethodGet, "/api/live-sessions", nil))
+	if liveRec.Code != http.StatusOK {
+		t.Fatalf("live-sessions status=%d body=%s", liveRec.Code, liveRec.Body.String())
+	}
+	var liveList []liveShareSessionView
+	if err := json.Unmarshal(liveRec.Body.Bytes(), &liveList); err != nil {
+		t.Fatalf("decode live-sessions: %v", err)
+	}
+	if len(liveList) != 2 {
+		t.Fatalf("expected 2 live sessions, got %d", len(liveList))
+	}
+	if liveList[0].SessionID != hash2 || !liveList[0].Playing || liveList[0].NodeName != "香港从机" {
+		t.Fatalf("expected playing edge session first, got %+v", liveList[0])
+	}
+	if !strings.Contains(liveList[0].ClientRegion, "广东") || !strings.Contains(liveList[0].ClientRegion, "电信") {
+		t.Fatalf("expected formatted client_region, got %q", liveList[0].ClientRegion)
+	}
+
+	// 2. Admin single-device kick revokes ONLY hash1
+	kickRec := httptest.NewRecorder()
+	kickPath := fmt.Sprintf("/api/share-users/%d/sessions/%s/kick", user.ID, hash1)
+	app.handleShareUserByID(kickRec, httptest.NewRequest(http.MethodPost, kickPath, nil))
+	if kickRec.Code != http.StatusOK {
+		t.Fatalf("admin kick session status=%d body=%s", kickRec.Code, kickRec.Body.String())
+	}
+	remaining, _ := pm.shares.listSessions(user.ID)
+	if len(remaining) != 1 || remaining[0].SessionID != hash2 {
+		t.Fatalf("expected only session 2 to remain, got %+v", remaining)
+	}
+
+	// 3. Friend /api/me returns network diagnosis (normal mainland vs blocked HK) + self single-device kick
+	var pwHash string
+	if err := db.db.QueryRow(`SELECT password_hash FROM share_users WHERE id=?`, user.ID).Scan(&pwHash); err != nil {
+		t.Fatalf("load pwHash: %v", err)
+	}
+	cookieVal := signShareSession(user.ID, pwHash, time.Now())
+
+	putRec := httptest.NewRecorder()
+	app.handleISPRoutes(putRec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"block_non_mainland":true}`)))
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("enable block_non_mainland: %d", putRec.Code)
+	}
+
+	meReqHK := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	meReqHK.RemoteAddr = "127.0.0.1:42000"
+	meReqHK.Header.Set("X-Real-IP", "45.46.47.48")
+	meReqHK.AddCookie(&http.Cookie{Name: shareSessionCookie, Value: cookieVal})
+	meRecHK := httptest.NewRecorder()
+	app.handleShareSelf(meRecHK, meReqHK)
+	if meRecHK.Code != http.StatusOK {
+		t.Fatalf("GET /api/me (HK) status=%d body=%s", meRecHK.Code, meRecHK.Body.String())
+	}
+	var meHK shareSelfView
+	if err := json.Unmarshal(meRecHK.Body.Bytes(), &meHK); err != nil {
+		t.Fatalf("decode /api/me HK: %v", err)
+	}
+	if meHK.Network == nil || !meHK.Network.Blocked || meHK.Network.BlockReason != "non_mainland" || !meHK.Network.NonMainlandCN {
+		t.Fatalf("expected blocked non_mainland network diagnosis for HK IP, got %+v", meHK.Network)
+	}
+
+	meReqCN := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	meReqCN.RemoteAddr = "127.0.0.1:42001"
+	meReqCN.Header.Set("X-Real-IP", "1.2.3.4")
+	meReqCN.AddCookie(&http.Cookie{Name: shareSessionCookie, Value: cookieVal})
+	meRecCN := httptest.NewRecorder()
+	app.handleShareSelf(meRecCN, meReqCN)
+	var meCN shareSelfView
+	if err := json.Unmarshal(meRecCN.Body.Bytes(), &meCN); err != nil {
+		t.Fatalf("decode /api/me CN: %v", err)
+	}
+	if meCN.Network == nil || meCN.Network.Blocked || meCN.Network.NodeName != "主机" || meCN.Network.ISPGroup != ispGroupCT {
+		t.Fatalf("expected allowed ct/主机 network diagnosis, got %+v", meCN.Network)
+	}
+
+	// Self single-device kick revokes hash2
+	selfKickReq := httptest.NewRequest(http.MethodPost, "http://example.com/api/me/sessions/"+hash2+"/kick", nil)
+	selfKickReq.Header.Set("Origin", "http://example.com")
+	selfKickReq.AddCookie(&http.Cookie{Name: shareSessionCookie, Value: cookieVal})
+	selfKickRec := httptest.NewRecorder()
+	app.handleShareSelf(selfKickRec, selfKickReq)
+	if selfKickRec.Code != http.StatusOK {
+		t.Fatalf("self kick session status=%d body=%s", selfKickRec.Code, selfKickRec.Body.String())
+	}
+	remainingAfter, _ := pm.shares.listSessions(user.ID)
+	if len(remainingAfter) != 0 {
+		t.Fatalf("expected 0 remaining sessions after self kick, got %d", len(remainingAfter))
+	}
+}
+
+func TestEdgeAgentHealthAndRemoteUpgrade(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	site, err := db.CreateSiteRecord(Site{
+		Name:        "ProbeSite",
+		TargetURL:   upstream.URL,
+		IngressMode: ingressModePath,
+		PathPrefix:  "/probesite",
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+
+	pm := NewProxyManager(db, bytes.Repeat([]byte{0x36}, 32))
+	_, loopbackCIDR, _ := net.ParseCIDR("127.0.0.1/32")
+	pm.SetTrustedProxies([]*net.IPNet{loopbackCIDR})
+	edgeRT := newEdgeNodeRuntime(db, pm, nil)
+	pm.SetEdgeRuntime(edgeRT)
+	if err := pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	defer pm.GracefulShutdown(context.Background())
+	app := &App{db: db, dbPath: dbPath, pm: pm, trustedProxies: []*net.IPNet{loopbackCIDR}}
+
+	createRec := httptest.NewRecorder()
+	app.handleEdgeNodes(createRec, httptest.NewRequest(http.MethodPost, "/api/edge-nodes", strings.NewReader(`{"name":"UpgradeNode","public_port":19090}`)))
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("createEdgeNode status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var node EdgeNode
+	if err := json.Unmarshal(createRec.Body.Bytes(), &node); err != nil {
+		t.Fatalf("decode edge node: %v", err)
+	}
+	edgeRT.mu.RLock()
+	nodeToken := edgeRT.nodes[node.ID].tokenPlain
+	edgeRT.mu.RUnlock()
+
+	masterServer := httptest.NewServer(http.HandlerFunc(app.handleAgentHeartbeat))
+	defer masterServer.Close()
+
+	assetName, err := edgeAgentAssetName()
+	if err != nil {
+		t.Fatalf("edgeAgentAssetName: %v", err)
+	}
+	newBinaryPayload := []byte("meridian-binary-v9.9.9-test-payload")
+	sumBytes := sha256.Sum256(newBinaryPayload)
+	validSum := hex.EncodeToString(sumBytes[:])
+	badSum := strings.Repeat("0", 64)
+	serveBadSum := false
+
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v9.9.9/SHA256SUMS":
+			if serveBadSum {
+				_, _ = fmt.Fprintf(w, "%s  %s\n", badSum, assetName)
+			} else {
+				_, _ = fmt.Fprintf(w, "%s  %s\n", validSum, assetName)
+			}
+		case "/v9.9.9/" + assetName:
+			_, _ = w.Write(newBinaryPayload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	exePath := filepath.Join(t.TempDir(), "meridian-agent-test")
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("write fake exe: %v", err)
+	}
+
+	agent := newEdgeAgent(edgeAgentConfig{
+		MasterURL:      masterServer.URL,
+		NodeID:         node.ID,
+		Token:          nodeToken,
+		Port:           19090,
+		ReleaseBaseURL: releaseServer.URL,
+		ReleaseClient:  releaseServer.Client(),
+		ExecutablePath: exePath,
+	})
+	agent.masterClient = masterServer.Client()
+
+	// 1. First heartbeat receives probe targets; run probe once; second heartbeat reports health + latency
+	if err := agent.sendHeartbeat(context.Background()); err != nil {
+		t.Fatalf("first heartbeat: %v", err)
+	}
+	agent.runProbeOnce(context.Background())
+	if err := agent.sendHeartbeat(context.Background()); err != nil {
+		t.Fatalf("second heartbeat: %v", err)
+	}
+
+	listRec := httptest.NewRecorder()
+	app.handleEdgeNodes(listRec, httptest.NewRequest(http.MethodGet, "/api/edge-nodes", nil))
+	var nodesResp []EdgeNode
+	if err := json.Unmarshal(listRec.Body.Bytes(), &nodesResp); err != nil {
+		t.Fatalf("decode edge-nodes: %v", err)
+	}
+	if len(nodesResp) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodesResp))
+	}
+	if nodesResp[0].MemoryBytes == 0 {
+		t.Fatalf("expected non-zero memory_bytes in node view")
+	}
+	if len(nodesResp[0].UpstreamLatencies) != 1 || nodesResp[0].UpstreamLatencies[0].SiteName != site.Name || nodesResp[0].UpstreamLatencies[0].LatencyMs <= 0 {
+		t.Fatalf("expected resolved ProbeSite latency > 0, got %+v", nodesResp[0].UpstreamLatencies)
+	}
+
+	// 2. SHA-256 mismatch must fail cleanly and preserve old binary
+	serveBadSum = true
+	if err := agent.performSelfUpgrade(context.Background(), "v9.9.9"); err == nil {
+		t.Fatalf("expected SHA-256 mismatch error")
+	}
+	gotOld, _ := os.ReadFile(exePath)
+	if string(gotOld) != "old-binary" {
+		t.Fatalf("binary must remain untouched on checksum mismatch, got %q", string(gotOld))
+	}
+
+	// 3. Queue remote upgrade via Master API -> Heartbeat delivers -> Agent swaps binary & signals restartCh
+	serveBadSum = false
+	upgRec := httptest.NewRecorder()
+	app.handleEdgeNodeByID(upgRec, httptest.NewRequest(
+		http.MethodPost,
+		fmt.Sprintf("/api/edge-nodes/%d/upgrade", node.ID),
+		strings.NewReader(`{"version":"v9.9.9"}`),
+	))
+	if upgRec.Code != http.StatusOK {
+		t.Fatalf("queue upgrade status=%d body=%s", upgRec.Code, upgRec.Body.String())
+	}
+
+	if err := agent.sendHeartbeat(context.Background()); err != nil {
+		t.Fatalf("upgrade heartbeat: %v", err)
+	}
+
+	select {
+	case <-agent.restartCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for agent self-upgrade restart signal")
+	}
+	gotNew, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read upgraded binary: %v", err)
+	}
+	if !bytes.Equal(gotNew, newBinaryPayload) {
+		t.Fatalf("upgraded binary mismatch: got %q", string(gotNew))
+	}
+}
+
+func TestEdgeNodeAlertMonitorTransitions(t *testing.T) {
+	rt := &edgeNodeRuntime{
+		nodes: map[int64]*edgeNodeLiveState{
+			1: {
+				id:           1,
+				name:         "HK-Alert",
+				enabled:      true,
+				publicPort:   19090,
+				publicIP:     "198.51.100.20",
+				tlsMode:      "http",
+				agentVersion: "v1.2.0",
+				quota:        1000 * 1024 * 1024, // ~1000 MiB
+				resetPeriod:  "2026-11",
+			},
+		},
+	}
+	t0 := time.Now()
+	rt.nodes[1].lastSeen = t0
+
+	// 1. Initial online observation: no alert yet, marks alertSeenOnline=true
+	if msgs := rt.collectAlerts(t0); len(msgs) != 0 {
+		t.Fatalf("expected 0 alerts on initial online, got %v", msgs)
+	}
+
+	// 2. Node goes offline -> 1 offline alert
+	tOffline := t0.Add(edgeNodeOfflineAfter + 5*time.Second)
+	msgs := rt.collectAlerts(tOffline)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "已离线") {
+		t.Fatalf("expected 1 offline alert, got %v", msgs)
+	}
+	// Repeat check while still offline -> deduplicated (0 alerts)
+	if msgs2 := rt.collectAlerts(tOffline.Add(15 * time.Second)); len(msgs2) != 0 {
+		t.Fatalf("expected deduplicated offline alert, got %v", msgs2)
+	}
+
+	// 3. Node recovers online -> 1 recovery alert
+	tRecover := tOffline.Add(30 * time.Second)
+	rt.nodes[1].lastSeen = tRecover
+	msgs = rt.collectAlerts(tRecover)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "恢复上线") {
+		t.Fatalf("expected 1 recovery alert, got %v", msgs)
+	}
+
+	// 4. Quota crosses 80% -> 1 warning alert, deduplicated
+	rt.nodes[1].persistedUsed = 820 * 1024 * 1024
+	msgs = rt.collectAlerts(tRecover)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "流量预警") {
+		t.Fatalf("expected 1 80%% quota alert, got %v", msgs)
+	}
+	if msgs2 := rt.collectAlerts(tRecover); len(msgs2) != 0 {
+		t.Fatalf("expected deduplicated 80%% alert, got %v", msgs2)
+	}
+
+	// 5. Quota crosses 100% -> 1 exhausted alert, deduplicated
+	rt.nodes[1].persistedUsed = 1000 * 1024 * 1024
+	msgs = rt.collectAlerts(tRecover)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "已耗尽") {
+		t.Fatalf("expected 1 100%% quota alert, got %v", msgs)
+	}
+	if msgs2 := rt.collectAlerts(tRecover); len(msgs2) != 0 {
+		t.Fatalf("expected deduplicated 100%% alert, got %v", msgs2)
+	}
 }

@@ -45,6 +45,7 @@ const state = computed(() => {
         <div><dt>访问地址</dt><dd class="mono">{{ address || '入口未配置' }}</dd></div>
         <div><dt>回源</dt><dd class="mono">{{ site.target_url }}</dd></div>
         <div><dt>入口</dt><dd>{{ INGRESS_LABEL[mode] }}</dd></div>
+        <div v-if="site.main_video_stream_mode !== 'direct'"><dt>从机分流</dt><dd>{{ site.edge_routing_mode === 'master' ? '仅走主机' : '跟随全局三网分流' }}</dd></div>
         <div><dt>客户端身份</dt><dd>{{ UA_LABEL[String(site.ua_mode)] || site.ua_mode }}</dd></div>
         <div>
           <dt>延迟</dt>

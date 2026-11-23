@@ -31,11 +31,14 @@ const (
 )
 
 type edgeAgentConfig struct {
-	MasterURL string
-	NodeID    int64
-	Token     string
-	BindAddr  string
-	Port      int
+	MasterURL      string
+	NodeID         int64
+	Token          string
+	BindAddr       string
+	Port           int
+	ReleaseBaseURL string
+	ReleaseClient  *http.Client
+	ExecutablePath string
 }
 
 func firstNonEmptyEnv(keys ...string) string {
@@ -151,6 +154,7 @@ func runEdgeAgentCommand(args []string) error {
 	}
 
 	go agent.heartbeatLoop(ctx)
+	go agent.probeLoop(ctx)
 
 	log.Println("============================================================")
 	log.Printf("  Yundu Edge Agent %s (node #%d)", appVersion, cfg.NodeID)
@@ -170,6 +174,8 @@ func runEdgeAgentCommand(args []string) error {
 	select {
 	case <-sigCh:
 		log.Println("Yundu Edge Agent shutting down...")
+	case <-agent.restartCh:
+		log.Println("Yundu Edge Agent restarting after self-upgrade...")
 	case serveErr := <-errCh:
 		return serveErr
 	}
@@ -244,6 +250,7 @@ type agentTrafficAccum struct {
 
 type edgeAgent struct {
 	cfg            edgeAgentConfig
+	startedAt      time.Time
 	masterClient   *http.Client
 	upstreamClient *http.Client
 	nodeEnabled    atomic.Bool
@@ -263,6 +270,27 @@ type edgeAgent struct {
 	trafficMu sync.Mutex
 	traffic   map[agentTrafficKey]*agentTrafficAccum
 	flushCh   chan struct{}
+
+	probeMu      sync.RWMutex
+	probeTargets []agentProbeTarget
+	latencies    map[int64]int
+	probeNowCh   chan struct{}
+
+	upgradeMu            sync.RWMutex
+	upgradeReqID         string
+	upgradeStatus        string
+	lastHandledUpgradeID string
+	upgrading            atomic.Bool
+
+	restartCh   chan struct{}
+	restartOnce sync.Once
+}
+
+func (a *edgeAgent) requestRestart() {
+	if a == nil || a.restartCh == nil {
+		return
+	}
+	a.restartOnce.Do(func() { close(a.restartCh) })
 }
 
 func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
@@ -277,7 +305,8 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 	upstreamTransport.IdleConnTimeout = 90 * time.Second
 
 	agent := &edgeAgent{
-		cfg: cfg,
+		cfg:       cfg,
+		startedAt: time.Now(),
 		masterClient: &http.Client{
 			Transport: masterTransport,
 			Timeout:   10 * time.Second,
@@ -294,6 +323,9 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 		speedLimits:  make(map[int64]int),
 		traffic:      make(map[agentTrafficKey]*agentTrafficAccum),
 		flushCh:      make(chan struct{}, 1),
+		latencies:    make(map[int64]int),
+		probeNowCh:   make(chan struct{}, 1),
+		restartCh:    make(chan struct{}),
 	}
 	agent.nodeEnabled.Store(true)
 	return agent
@@ -412,14 +444,20 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	tlsActive := a.cert != nil
 	a.certMu.RUnlock()
 
+	upgradeReqID, upgradeStatus := a.getUpgradeState()
 	payload := agentHeartbeatRequest{
-		Version:         appVersion,
-		ListenPort:      a.cfg.Port,
-		TLSActive:       tlsActive,
-		ActiveStreams:   int(a.activeStreams.Load()),
-		CurrentBps:      bps,
-		CertFingerprint: fp,
-		TrafficReports:  reports,
+		Version:           appVersion,
+		ListenPort:        a.cfg.Port,
+		TLSActive:         tlsActive,
+		ActiveStreams:     int(a.activeStreams.Load()),
+		CurrentBps:        bps,
+		MemoryBytes:       currentProcessMemoryBytes(),
+		UptimeSec:         int64(time.Since(a.startedAt).Seconds()),
+		UpstreamLatencies: a.snapshotLatencies(),
+		UpgradeRequestID:  upgradeReqID,
+		UpgradeStatus:     upgradeStatus,
+		CertFingerprint:   fp,
+		TrafficReports:    reports,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -492,6 +530,10 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 		} else {
 			log.Printf("edge agent: invalid synced TLS certificate: %v", err)
 		}
+	}
+	a.setProbeTargets(reply.ProbeTargets)
+	if reply.UpgradeToVersion != "" && reply.UpgradeRequestID != "" {
+		a.maybeTriggerUpgrade(ctx, reply.UpgradeToVersion, reply.UpgradeRequestID)
 	}
 	return nil
 }

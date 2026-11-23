@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ArrowUpToLine, Copy, GripVertical, LogOut, MonitorSmartphone, Moon, Sun, SunMoon } from '@lucide/vue'
+import { ArrowUpToLine, Copy, GripVertical, LogOut, MonitorSmartphone, Moon, ShieldBan, Sun, SunMoon, Wifi, X } from '@lucide/vue'
 import logo from '@/assets/logo.svg'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import { meApi, type MyAccount, type MyAccountServer } from '@/api'
+import { meApi, type MyAccount, type MyAccountServer, type ShareSession } from '@/api'
 import { logout, session } from '@/stores/session'
 import { confirm } from '@/stores/confirm'
 import { cycleTheme, themeMode } from '@/stores/theme'
@@ -20,7 +20,14 @@ const pw = reactive({ open: false, current: '', next: '', busy: false, error: ''
 const draggingId = ref<number | null>(null)
 const dragOrderBefore = ref<number[]>([])
 const savingOrder = ref(false)
+const kickingSessionId = ref('')
 let touchDragActive = false
+
+const networkLabel = computed(() => {
+  const n = me.value?.network
+  if (!n) return ''
+  return [n.region, n.isp].filter(Boolean).join(' · ') || n.client_ip || ''
+})
 
 const fixedAddress = computed(() => {
   const u = me.value
@@ -178,6 +185,20 @@ async function kick() {
   }
 }
 
+async function kickOne(sessionItem: ShareSession) {
+  if (!sessionItem.session_id || kickingSessionId.value) return
+  kickingSessionId.value = sessionItem.session_id
+  try {
+    await meApi.kickSession(sessionItem.session_id)
+    toast.success(`已断开「${sessionItem.device_name || '该设备'}」`)
+    await load()
+  } catch (error) {
+    toast.error(errorMessage(error))
+  } finally {
+    kickingSessionId.value = ''
+  }
+}
+
 async function changePassword() {
   pw.error = ''
   if (!pw.current) return (pw.error = '请输入当前密码')
@@ -215,6 +236,25 @@ async function changePassword() {
         <section class="hero">
           <span class="state"><span class="dot" :class="STATUS_TONE[me.status]" />{{ STATUS_LABEL[me.status] }}</span>
           <h1>{{ headline }}</h1>
+          <div v-if="me.network?.blocked" class="net-alert">
+            <ShieldBan class="net-ico" />
+            <div>
+              <strong>当前网络已被禁止连接 Emby</strong>
+              <p v-if="me.network.block_reason === 'non_mainland'">
+                检测到当前访问来源为「{{ networkLabel }}」（非中国大陆 IP）。如果你开启了海外代理或 VPN，请先关闭或将本站点加入直连规则后再播放。
+              </p>
+              <p v-else>
+                检测到当前运营商线路「{{ me.network.isp_label || networkLabel }}」已被管理员禁止接入，请联系分享人处理。
+              </p>
+            </div>
+          </div>
+          <div v-else-if="me.network && (networkLabel || me.network.node_name)" class="net-pill">
+            <Wifi class="net-ico" />
+            <span>
+              当前网络：<strong>{{ networkLabel || '已识别' }}</strong>
+              <template v-if="me.network.node_name"> · 播放节点：<strong>{{ me.network.node_name }}</strong></template>
+            </span>
+          </div>
         </section>
 
         <section class="usage">
@@ -316,17 +356,29 @@ async function changePassword() {
             <UiButton v-if="me.sessions?.length" variant="ghost" size="sm" @click="kick">全部断开</UiButton>
           </div>
           <ul class="devices">
-            <li v-for="(s, i) in me.sessions || []" :key="i">
+            <li v-for="(s, i) in me.sessions || []" :key="s.session_id || i">
               <MonitorSmartphone />
               <div>
                 <span>
                   {{ s.device_name || '未知设备' }}
                   <small v-if="s.draining" class="tag warn">观影后切换</small>
-                  <small v-else-if="s.playing" class="tag good">播放中</small>
+                  <small v-else-if="s.playing" class="tag good">播放中{{ s.node_name ? ` · ${s.node_name}` : '' }}</small>
+                  <small v-else-if="s.node_name" class="tag">{{ s.node_name }}</small>
                 </span>
-                <small class="faint">{{ [s.client, s.site_name].filter(Boolean).join(' · ') }}</small>
+                <small class="faint">{{ [s.client, s.site_name, s.client_region].filter(Boolean).join(' · ') }}</small>
               </div>
               <small class="faint">{{ relativeTime(s.last_seen_at) }}</small>
+              <button
+                v-if="s.session_id"
+                type="button"
+                class="kick-one"
+                :disabled="kickingSessionId === s.session_id"
+                title="断开该设备"
+                aria-label="断开该设备"
+                @click="kickOne(s)"
+              >
+                <X />
+              </button>
             </li>
             <li v-if="!me.sessions?.length" class="faint none">没有设备登录</li>
           </ul>
@@ -367,6 +419,13 @@ async function changePassword() {
 .hero { margin-bottom: 36px; }
 .state { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-2); }
 h1 { margin: 10px 0 0; font-size: 26px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.25; }
+.net-alert { display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; padding: 12px 14px; border-radius: var(--radius); border: 1px solid color-mix(in srgb, var(--bad) 36%, var(--border)); background: color-mix(in srgb, var(--bad) 8%, var(--surface)); font-size: 13px; line-height: 1.55; }
+.net-alert .net-ico { width: 17px; height: 17px; color: var(--bad); flex: 0 0 17px; margin-top: 2px; }
+.net-alert strong { display: block; color: var(--bad); margin-bottom: 2px; }
+.net-alert p { margin: 0; color: var(--text-2); }
+.net-pill { display: inline-flex; align-items: center; gap: 8px; margin-top: 14px; padding: 7px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface); font-size: 12.5px; color: var(--text-2); }
+.net-pill .net-ico { width: 14px; height: 14px; color: var(--good); flex: 0 0 14px; }
+.net-pill strong { font-weight: 500; color: var(--text); }
 .usage { padding-bottom: 28px; border-bottom: 1px solid var(--border); }
 .label { font-size: 12.5px; color: var(--text-3); margin-bottom: 4px; }
 .big { font-size: 40px; font-weight: 600; letter-spacing: -0.035em; line-height: 1.1; margin-bottom: 14px; }
@@ -465,9 +524,13 @@ h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .devices svg { width: 16px; height: 16px; color: var(--text-3); flex: 0 0 16px; }
 .devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .devices small { font-size: 12px; }
-.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; }
+.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; background: var(--surface); color: var(--text-2); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.good { background: var(--good-soft); color: var(--good); }
+.kick-one { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; flex: 0 0 26px; }
+.kick-one:hover:not(:disabled) { background: var(--surface-hover); color: var(--bad); }
+.kick-one:disabled { opacity: 0.4; cursor: default; }
+.kick-one svg { width: 14px; height: 14px; color: inherit; }
 .none { font-size: 13px; padding: 6px 0; }
 .pw { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
 .pw-actions { display: flex; justify-content: flex-end; gap: 8px; }

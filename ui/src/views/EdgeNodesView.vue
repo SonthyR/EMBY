@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown } from '@lucide/vue'
+import { Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
@@ -40,6 +40,7 @@ const errors = reactive<Record<string, string>>({})
 
 const installOpen = ref(false)
 const installNode = ref<EdgeNode | null>(null)
+const upgradingId = ref<number | null>(null)
 
 const STATUS_LABEL: Record<EdgeNodeStatus, string> = {
   online: '在线',
@@ -63,6 +64,60 @@ function formatBps(bps: number | undefined): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} Mbps`
   if (value >= 1_000) return `${(value / 1_000).toFixed(0)} Kbps`
   return `${value} bps`
+}
+
+function formatUptime(sec: number | undefined): string {
+  const s = Math.max(0, Math.floor(Number(sec) || 0))
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (d > 0) return `${d} 天 ${h} 小时`
+  if (h > 0) return `${h} 小时 ${m} 分`
+  return `${Math.max(1, m)} 分钟`
+}
+
+function latencyTone(ms: number): string {
+  if (ms < 0) return 'bad'
+  if (ms < 150) return 'good'
+  if (ms < 400) return 'warn'
+  return 'bad'
+}
+
+function upgradeStatusInfo(node: EdgeNode): { text: string; tone: string } | null {
+  const raw = (node.upgrade_status || '').trim()
+  if (!raw) return null
+  if (raw === 'queued') return { text: `已下发升级指令（${node.upgrade_target || node.master_version || '最新版'}），等待从机响应…`, tone: 'warn' }
+  if (raw === 'updating') return { text: `从机正在下载并校验 ${node.upgrade_target || node.master_version || '更新'}…`, tone: 'warn' }
+  if (raw === 'restarting') return { text: '新版本已就绪，从机正在重启…', tone: 'good' }
+  if (raw.startsWith('failed:')) return { text: `升级失败：${raw.slice(7).trim()}`, tone: 'bad' }
+  return { text: raw, tone: 'warn' }
+}
+
+function isUpgradeBusy(node: EdgeNode): boolean {
+  const st = (node.upgrade_status || '').trim()
+  return st === 'queued' || st === 'updating' || st === 'restarting'
+}
+
+async function upgradeNode(node: EdgeNode) {
+  const target = node.master_version || '最新版本'
+  if (
+    !(await confirm({
+      title: `远程升级「${node.name}」到 ${target}？`,
+      message: `从机将自动从 GitHub Release 下载 ${target} 并完成 SHA-256 校验后原子替换重启，期间正在播放的视频会短暂中断。`,
+      confirmText: '立即升级',
+    }))
+  )
+    return
+  upgradingId.value = node.id
+  try {
+    await edgeApi.upgrade(node.id, node.master_version || '')
+    toast.success(`已向「${node.name}」下发升级指令`)
+    await load(true)
+  } catch (error) {
+    toast.error(errorMessage(error, '下发升级指令失败'))
+  } finally {
+    upgradingId.value = null
+  }
 }
 
 async function load(silent = false) {
@@ -372,7 +427,20 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
             <span v-if="node.public_url" class="mono">{{ node.public_url }}</span>
             <span v-else class="faint">等待从机首次心跳自动上报公网 IP（端口 {{ node.public_port }}）</span>
             <span v-if="node.last_seen_at" class="faint sep">最近心跳 {{ relativeTime(node.last_seen_at) }}</span>
+            <span v-if="node.online && node.memory_bytes" class="faint sep">内存 {{ formatBytes(node.memory_bytes) }}</span>
+            <span v-if="node.online && node.uptime_sec" class="faint sep">运行 {{ formatUptime(node.uptime_sec) }}</span>
           </div>
+
+          <div v-if="node.online && node.upstream_latencies?.length" class="latency-row">
+            <span class="faint lat-label">回源延迟</span>
+            <span v-for="lat in node.upstream_latencies" :key="lat.site_name" class="lat-pill" :class="latencyTone(lat.latency_ms)">
+              {{ lat.site_name }} {{ lat.latency_ms >= 0 ? `${lat.latency_ms}ms` : '不通' }}
+            </span>
+          </div>
+
+          <p v-if="upgradeStatusInfo(node)" class="upgrade-note" :class="upgradeStatusInfo(node)!.tone">
+            {{ upgradeStatusInfo(node)!.text }}
+          </p>
 
           <p v-if="node.note" class="note">{{ node.note }}</p>
         </div>
@@ -392,7 +460,18 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
         </div>
 
         <div class="card-actions">
-          <UiButton size="sm" variant="primary" @click="showInstallCommand(node)"><Terminal />安装命令</UiButton>
+          <UiButton
+            v-if="node.online && node.upgrade_available && !isUpgradeBusy(node)"
+            size="sm"
+            variant="primary"
+            :loading="upgradingId === node.id"
+            @click="upgradeNode(node)"
+          >
+            <ArrowUpCircle />升级 {{ node.master_version }}
+          </UiButton>
+          <UiButton size="sm" :variant="node.online && node.upgrade_available && !isUpgradeBusy(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
+            <Terminal />安装命令
+          </UiButton>
           <UiButton size="sm" @click="openEdit(node)"><Pencil />编辑</UiButton>
           <UiButton size="sm" variant="ghost" :title="node.enabled ? '停用节点' : '启用节点'" @click="toggleEnabled(node)">
             <Power />
@@ -565,6 +644,16 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 .mono { font-family: var(--mono); color: var(--text-2); word-break: break-all; }
 .faint { color: var(--text-3); }
 .sep::before { content: '·'; margin-right: 10px; }
+.latency-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; font-size: 11.5px; }
+.lat-label { margin-right: 2px; }
+.lat-pill { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 5px; font-family: var(--mono); font-size: 11px; background: var(--surface); color: var(--text-2); }
+.lat-pill.good { color: var(--good); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.lat-pill.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.lat-pill.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.upgrade-note { margin: 7px 0 0; font-size: 12px; }
+.upgrade-note.warn { color: var(--warn); }
+.upgrade-note.good { color: var(--good); }
+.upgrade-note.bad { color: var(--bad); }
 .note { margin: 6px 0 0; font-size: 12.5px; color: var(--text-3); }
 
 .card-metrics { display: flex; flex-direction: column; gap: 8px; }

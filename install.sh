@@ -59,6 +59,7 @@ COSIGN_BIN=""
 AGENT_SERVICE_NAME="${MERIDIAN_AGENT_SERVICE_NAME:-meridian-agent}"
 AGENT_SERVICE_FILE="${MERIDIAN_AGENT_SERVICE_FILE:-/etc/systemd/system/meridian-agent.service}"
 AGENT_CONFIG_DIR="${MERIDIAN_AGENT_CONFIG_DIR:-/etc/meridian-agent}"
+AGENT_BIN_DIR="${MERIDIAN_AGENT_BIN_DIR:-/opt/meridian-agent}"
 AGENT_MASTER=""
 AGENT_NODE_ID=""
 AGENT_TOKEN=""
@@ -2920,13 +2921,14 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 UMask=0077
 EnvironmentFile=${AGENT_CONFIG_DIR}/env
-ExecStart=${INSTALL_DIR}/${BIN_NAME} agent
+ExecStart=${AGENT_BIN_DIR}/${BIN_NAME} agent
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ReadWritePaths=${AGENT_BIN_DIR}
 ProtectHome=true
 ProtectHostname=true
 ProtectKernelTunables=true
@@ -2963,9 +2965,11 @@ write_agent_openrc_service() {
 
 name="Meridian Edge Agent"
 description="Meridian Edge Agent (Yundu media relay)"
-command="${INSTALL_DIR}/${BIN_NAME}"
+command="${AGENT_BIN_DIR}/${BIN_NAME}"
 command_args="agent"
 command_background="yes"
+supervisor="supervise-daemon"
+respawn_delay=3
 pidfile="/run/${AGENT_SERVICE_NAME}.pid"
 output_log="/var/log/${AGENT_SERVICE_NAME}.log"
 error_log="/var/log/${AGENT_SERVICE_NAME}.log"
@@ -2994,6 +2998,7 @@ do_agent() (
     init_privilege
     validate_install_dir
     validate_safe_directory "$AGENT_CONFIG_DIR" "从机配置目录"
+    validate_safe_directory "$AGENT_BIN_DIR" "从机程序目录"
 
     if [ "$AGENT_UNINSTALL" = "1" ]; then
         if is_systemd && [ -f "$AGENT_SERVICE_FILE" ]; then
@@ -3009,7 +3014,7 @@ do_agent() (
             fi
             as_root rm -f -- "/etc/init.d/${AGENT_SERVICE_NAME}"
         fi
-        as_root rm -rf -- "$AGENT_CONFIG_DIR"
+        as_root rm -rf -- "$AGENT_CONFIG_DIR" "$AGENT_BIN_DIR"
         ok "Meridian Edge Agent 已卸载"
         exit 0
     fi
@@ -3031,9 +3036,9 @@ do_agent() (
 
     latest=$(resolve_latest_version)
     download_release_binary "$latest" "$tmp_dir"
-    as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$INSTALL_DIR"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${INSTALL_DIR}/${BIN_NAME}.new"
-    as_root mv -f "${INSTALL_DIR}/${BIN_NAME}.new" "${INSTALL_DIR}/${BIN_NAME}"
+    as_root install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$AGENT_BIN_DIR"
+    as_root install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${AGENT_BIN_DIR}/${BIN_NAME}.new"
+    as_root mv -f "${AGENT_BIN_DIR}/${BIN_NAME}.new" "${AGENT_BIN_DIR}/${BIN_NAME}"
 
     as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$AGENT_CONFIG_DIR"
     env_tmp="${tmp_dir}/agent.env"
@@ -3071,7 +3076,7 @@ ENVEOF
             fail "从机 Agent 启动失败，请检查 /var/log/${AGENT_SERVICE_NAME}.log"
         fi
     else
-        ok "二进制与配置已就绪，请手动运行: ${INSTALL_DIR}/${BIN_NAME} agent --master ${AGENT_MASTER} --id ${AGENT_NODE_ID} --port ${AGENT_PORT} --token <TOKEN>"
+        ok "二进制与配置已就绪，请手动运行: ${AGENT_BIN_DIR}/${BIN_NAME} agent --master ${AGENT_MASTER} --id ${AGENT_NODE_ID} --port ${AGENT_PORT} --token <TOKEN>"
     fi
 )
 
