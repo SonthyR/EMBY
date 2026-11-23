@@ -6,7 +6,7 @@ import type {
   IP2RegionDBStatus,
   IP2RegionLookupResult,
   IP2RegionStatus,
-  ISPRouteGroup,
+  ISPRoutesResponse,
   ShareUser,
   ShareUserInput,
   Site,
@@ -269,9 +269,13 @@ export const edgeApi = {
 }
 
 export const ispRoutesApi = {
-  get: () => api.get<{ groups: ISPRouteGroup[] }>('/api/isp-routes'),
+  get: () => api.get<ISPRoutesResponse>('/api/isp-routes'),
   update: (group: string, nodes: { node_id: number; enabled: boolean }[]) =>
-    api.put<{ groups: ISPRouteGroup[] }>('/api/isp-routes', { group, nodes }),
+    api.put<ISPRoutesResponse>('/api/isp-routes', { group, nodes }),
+  setGroupBlock: (group: string, blockConnect: boolean) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { group, block_connect: blockConnect }),
+  setBlockNonMainland: (blockNonMainland: boolean) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { block_non_mainland: blockNonMainland }),
 }
 
 export const ip2regionApi = {

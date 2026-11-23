@@ -156,7 +156,13 @@ export interface ISPRouteNode {
 export interface ISPRouteGroup {
   group: 'ct' | 'cu' | 'cm' | 'other' | string
   label: string
+  block_connect: boolean
   nodes: ISPRouteNode[]
+}
+
+export interface ISPRoutesResponse {
+  block_non_mainland: boolean
+  groups: ISPRouteGroup[]
 }
 
 export interface IP2RegionDBStatus {
@@ -178,7 +184,10 @@ export interface IP2RegionLookupResult {
   isp: string
   isp_group: string
   isp_label: string
+  non_mainland_cn?: boolean
   node_id: number
   node_name: string
   public_url?: string
+  blocked?: boolean
+  block_reason?: 'non_mainland' | 'group' | string
 }

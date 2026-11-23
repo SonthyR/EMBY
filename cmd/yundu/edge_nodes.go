@@ -38,6 +38,7 @@ const (
 	edgeHeartbeatBodyLimit   = 1 << 20
 	edgeNodeDefaultPort      = 19090
 	edgeInstallScriptRawBase = "https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh"
+	ispSettingNonMainlandKey = "_non_mainland"
 )
 
 const edgeNodeSchemaSQL = `
@@ -70,6 +71,11 @@ CREATE TABLE IF NOT EXISTS isp_route_rules (
 	enabled INTEGER NOT NULL DEFAULT 1,
 	PRIMARY KEY(isp_group, node_id)
 );
+CREATE TABLE IF NOT EXISTS isp_group_settings (
+	isp_group TEXT PRIMARY KEY,
+	block_connect INTEGER NOT NULL DEFAULT 0,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
@@ -80,6 +86,12 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_route_rules(isp_group, node_id, sort_order, enabled) VALUES(?, 0, 1, 1)`, group); err != nil {
 			return err
 		}
+		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect) VALUES(?, 0)`, group); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect) VALUES(?, 0)`, ispSettingNonMainlandKey); err != nil {
+		return err
 	}
 	return nil
 }
@@ -387,10 +399,12 @@ type edgeNodeRuntime struct {
 	pm        *ProxyManager
 	ip2region *ip2regionManager
 
-	mu      sync.RWMutex
-	nodes   map[int64]*edgeNodeLiveState
-	routes  map[string][]ispRouteRule // isp_group -> ordered rules
-	flushMu sync.Mutex
+	mu               sync.RWMutex
+	nodes            map[int64]*edgeNodeLiveState
+	routes           map[string][]ispRouteRule // isp_group -> ordered rules
+	blocked          map[string]bool           // isp_group -> block_connect enabled
+	blockNonMainland bool
+	flushMu          sync.Mutex
 }
 
 func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNodeRuntime {
@@ -400,6 +414,7 @@ func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNo
 		ip2region: ip2,
 		nodes:     make(map[int64]*edgeNodeLiveState),
 		routes:    make(map[string][]ispRouteRule),
+		blocked:   make(map[string]bool),
 	}
 	if db != nil {
 		if err := rt.reload(); err != nil {
@@ -464,6 +479,23 @@ func (rt *edgeNodeRuntime) reload() error {
 		return err
 	}
 	routeRows.Close()
+
+	blocked := make(map[string]bool, len(allISPGroups))
+	blockNonMainland := false
+	if settingRows, err := rt.db.db.Query(`SELECT isp_group, block_connect FROM isp_group_settings`); err == nil {
+		for settingRows.Next() {
+			var group string
+			var block int
+			if err := settingRows.Scan(&group, &block); err == nil && block != 0 {
+				if group == ispSettingNonMainlandKey {
+					blockNonMainland = true
+				} else if validISPGroup(group) {
+					blocked[group] = true
+				}
+			}
+		}
+		settingRows.Close()
+	}
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -532,18 +564,40 @@ func (rt *edgeNodeRuntime) reload() error {
 		routes[group] = filtered
 	}
 	rt.routes = routes
+	rt.blocked = blocked
+	rt.blockNonMainland = blockNonMainland
 	return nil
 }
 
 type edgeRouteDecision struct {
-	ISPGroup  string
-	ISPLabel  string
-	Region    string
-	ISP       string
-	NodeID    int64 // 0 = master
-	NodeName  string
-	PublicURL string
-	Token     string
+	ISPGroup      string
+	ISPLabel      string
+	Region        string
+	ISP           string
+	NonMainlandCN bool
+	NodeID        int64 // 0 = master, -1 = blocked
+	NodeName      string
+	PublicURL     string
+	Token         string
+	Blocked       bool
+	BlockReason   string // "non_mainland" or "group"
+}
+
+// isClientBlocked checks whether the client IP should be rejected on Emby site
+// proxy routes. Fast-paths to false when no block policy is enabled, and never
+// blocks private/loopback/unparseable addresses.
+func (rt *edgeNodeRuntime) isClientBlocked(clientIP string) (bool, string) {
+	if rt == nil {
+		return false, ""
+	}
+	rt.mu.RLock()
+	active := rt.blockNonMainland || len(rt.blocked) > 0
+	rt.mu.RUnlock()
+	if !active {
+		return false, ""
+	}
+	decision := rt.selectNodeForIP(clientIP)
+	return decision.Blocked, decision.BlockReason
 }
 
 // selectNodeForIP picks the highest-priority online node for the client IP's ISP.
@@ -558,16 +612,37 @@ func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
 	if rt == nil {
 		return decision
 	}
+	addr, parseErr := netip.ParseAddr(strings.TrimSpace(clientIP))
+	isPublic := parseErr == nil && dynamicIPIsPublic(addr.Unmap())
+	var lookupFound bool
 	if rt.ip2region != nil {
 		res := rt.ip2region.Lookup(clientIP)
+		lookupFound = res.Found
 		decision.ISPGroup = res.ISPGroup
 		decision.ISPLabel = res.ISPLabel
 		decision.Region = res.Region
 		decision.ISP = res.ISP
+		decision.NonMainlandCN = res.NonMainlandCN
 	}
 	now := time.Now()
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
+	if isPublic {
+		if rt.blockNonMainland && lookupFound && decision.NonMainlandCN {
+			decision.Blocked = true
+			decision.BlockReason = "non_mainland"
+			decision.NodeID = -1
+			decision.NodeName = "已禁止连接（非中国大陆）"
+			return decision
+		}
+		if rt.blocked[decision.ISPGroup] {
+			decision.Blocked = true
+			decision.BlockReason = "group"
+			decision.NodeID = -1
+			decision.NodeName = "已禁止连接（分组已禁）"
+			return decision
+		}
+	}
 	rules := rt.routes[decision.ISPGroup]
 	for _, rule := range rules {
 		if !rule.Enabled {
@@ -1031,9 +1106,23 @@ type ispRouteNodeView struct {
 }
 
 type ispRouteGroupView struct {
-	Group string             `json:"group"`
-	Label string             `json:"label"`
-	Nodes []ispRouteNodeView `json:"nodes"`
+	Group        string             `json:"group"`
+	Label        string             `json:"label"`
+	BlockConnect bool               `json:"block_connect"`
+	Nodes        []ispRouteNodeView `json:"nodes"`
+}
+
+func (a *App) buildISPRoutesPayload() map[string]any {
+	blockNonMainland := false
+	if a.pm != nil && a.pm.edges != nil {
+		a.pm.edges.mu.RLock()
+		blockNonMainland = a.pm.edges.blockNonMainland
+		a.pm.edges.mu.RUnlock()
+	}
+	return map[string]any{
+		"block_non_mainland": blockNonMainland,
+		"groups":             a.buildISPRouteGroups(),
+	}
 }
 
 func (a *App) buildISPRouteGroups() []ispRouteGroupView {
@@ -1046,8 +1135,9 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 	defer a.pm.edges.mu.RUnlock()
 	for _, group := range allISPGroups {
 		rules := a.pm.edges.routes[group]
+		blockConnect := a.pm.edges.blocked[group]
 		nodes := make([]ispRouteNodeView, 0, len(rules))
-		activeAssigned := false
+		activeAssigned := blockConnect
 		for _, rule := range rules {
 			if rule.NodeID == 0 {
 				isActive := false
@@ -1086,7 +1176,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 				PublicURL: node.publicURL(),
 			})
 		}
-		if !activeAssigned {
+		if !blockConnect && !activeAssigned {
 			// Fallback indicator on Master if every enabled edge node is offline.
 			for i := range nodes {
 				if nodes[i].NodeID == 0 {
@@ -1096,9 +1186,10 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			}
 		}
 		result = append(result, ispRouteGroupView{
-			Group: group,
-			Label: ispGroupLabel(group),
-			Nodes: nodes,
+			Group:        group,
+			Label:        ispGroupLabel(group),
+			BlockConnect: blockConnect,
+			Nodes:        nodes,
 		})
 	}
 	return result
@@ -1109,11 +1200,13 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	switch r.Method {
 	case http.MethodGet:
-		a.jsonOK(w, map[string]any{"groups": a.buildISPRouteGroups()})
+		a.jsonOK(w, a.buildISPRoutesPayload())
 	case http.MethodPut:
 		var req struct {
-			Group string `json:"group"`
-			Nodes []struct {
+			BlockNonMainland *bool  `json:"block_non_mainland"`
+			Group            string `json:"group"`
+			BlockConnect     *bool  `json:"block_connect"`
+			Nodes            []struct {
 				NodeID  int64 `json:"node_id"`
 				Enabled bool  `json:"enabled"`
 			} `json:"nodes"`
@@ -1123,16 +1216,35 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Group = strings.ToLower(strings.TrimSpace(req.Group))
-		if !validISPGroup(req.Group) || len(req.Nodes) == 0 {
+		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil
+		if !hasGroupOp && req.BlockNonMainland == nil {
+			a.jsonErr(w, http.StatusBadRequest, "线路配置参数无效")
+			return
+		}
+		if hasGroupOp && (!validISPGroup(req.Group) || (len(req.Nodes) == 0 && req.BlockConnect == nil)) {
 			a.jsonErr(w, http.StatusBadRequest, "线路分组参数无效")
 			return
 		}
 		tx, err := a.db.db.Begin()
 		if err != nil {
-			a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
+			a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
 			return
 		}
 		defer tx.Rollback()
+		if req.BlockNonMainland != nil {
+			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
+				ispSettingNonMainlandKey, sqliteBool(*req.BlockNonMainland)); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
+				return
+			}
+		}
+		if req.BlockConnect != nil {
+			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
+				req.Group, sqliteBool(*req.BlockConnect)); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
+				return
+			}
+		}
 		seen := make(map[int64]bool, len(req.Nodes))
 		for idx, item := range req.Nodes {
 			if item.NodeID < 0 || seen[item.NodeID] {
@@ -1154,13 +1266,13 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := tx.Commit(); err != nil {
-			a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
+			a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
 			return
 		}
 		if a.pm != nil && a.pm.edges != nil {
 			_ = a.pm.edges.reload()
 		}
-		a.jsonOK(w, map[string]any{"groups": a.buildISPRouteGroups()})
+		a.jsonOK(w, a.buildISPRoutesPayload())
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1241,14 +1353,17 @@ func (a *App) handleIP2Region(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.jsonOK(w, map[string]any{
-			"ip":         ip,
-			"region":     decision.Region,
-			"isp":        decision.ISP,
-			"isp_group":  decision.ISPGroup,
-			"isp_label":  decision.ISPLabel,
-			"node_id":    decision.NodeID,
-			"node_name":  decision.NodeName,
-			"public_url": decision.PublicURL,
+			"ip":              ip,
+			"region":          decision.Region,
+			"isp":             decision.ISP,
+			"isp_group":       decision.ISPGroup,
+			"isp_label":       decision.ISPLabel,
+			"non_mainland_cn": decision.NonMainlandCN,
+			"node_id":         decision.NodeID,
+			"node_name":       decision.NodeName,
+			"public_url":      decision.PublicURL,
+			"blocked":         decision.Blocked,
+			"block_reason":    decision.BlockReason,
 		})
 	default:
 		a.jsonErr(w, http.StatusNotFound, "not found")

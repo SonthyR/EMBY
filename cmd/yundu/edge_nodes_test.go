@@ -600,6 +600,139 @@ func TestShareLoginPasswordFallback(t *testing.T) {
 	}
 }
 
+func TestISPBlockNonMainlandAndPerGroupBlock(t *testing.T) {
+	var upstreamHits int
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer emby.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "block.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	ipDir := filepath.Join(t.TempDir(), "ip2region")
+	if err := os.MkdirAll(ipDir, 0o700); err != nil {
+		t.Fatalf("mkdir ip2region: %v", err)
+	}
+	v4Raw := buildSyntheticXDB(t, xdbIPv4VersionNo, []testXDBSegment{
+		{start: netip.MustParseAddr("1.2.3.0"), end: netip.MustParseAddr("1.2.3.255"), region: "中国|广东省|深圳市|电信|CN"},
+		{start: netip.MustParseAddr("5.6.7.0"), end: netip.MustParseAddr("5.6.7.255"), region: "中国|江苏省|南京市|联通|CN"},
+		{start: netip.MustParseAddr("8.8.8.0"), end: netip.MustParseAddr("8.8.8.255"), region: "美国|0|0|Google|US"},
+		{start: netip.MustParseAddr("11.12.13.0"), end: netip.MustParseAddr("11.12.13.255"), region: "中国|湖北省|武汉市|广电|CN"},
+		{start: netip.MustParseAddr("45.46.47.0"), end: netip.MustParseAddr("45.46.47.255"), region: "中国|香港|香港|PCCW|HK"},
+		{start: netip.MustParseAddr("60.61.62.0"), end: netip.MustParseAddr("60.61.62.255"), region: "中国|台湾|台北|中华电信|TW"},
+	})
+	if err := os.WriteFile(filepath.Join(ipDir, "ip2region_v4.xdb"), v4Raw, 0o600); err != nil {
+		t.Fatalf("write xdb: %v", err)
+	}
+	ipMgr := newIP2RegionManager(ipDir, nil)
+	defer ipMgr.Close()
+
+	pm := NewProxyManager(db, bytes.Repeat([]byte{0x33}, 32))
+	_, loopbackCIDR, _ := net.ParseCIDR("127.0.0.1/32")
+	pm.SetTrustedProxies([]*net.IPNet{loopbackCIDR})
+	edgeRT := newEdgeNodeRuntime(db, pm, ipMgr)
+	pm.SetEdgeRuntime(edgeRT)
+	app := &App{db: db, dbPath: dbPath, pm: pm, ip2region: ipMgr}
+
+	site, err := db.CreateSiteRecord(Site{
+		Name:        "BlockTest",
+		ListenPort:  0,
+		IngressMode: ingressModePath,
+		PathPrefix:  "/blocktest",
+		TargetURL:   emby.URL,
+		Enabled:     true,
+		UAMode:      "passthrough",
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord: %v", err)
+	}
+	if err := pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	defer pm.GracefulShutdown(context.Background())
+
+	siteHandler, ok := pm.SiteHandler(site.ID)
+	if !ok {
+		t.Fatalf("site handler missing")
+	}
+
+	probe := func(ip, reqPath string) int {
+		req := httptest.NewRequest(http.MethodGet, reqPath, nil)
+		req.RemoteAddr = "127.0.0.1:41000"
+		if ip != "" {
+			req.Header.Set("X-Real-IP", ip)
+		}
+		rec := httptest.NewRecorder()
+		siteHandler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// 1. Enable block_non_mainland
+	putRec := httptest.NewRecorder()
+	app.handleISPRoutes(putRec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"block_non_mainland":true}`)))
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("enable block_non_mainland status=%d body=%s", putRec.Code, putRec.Body.String())
+	}
+
+	upstreamHits = 0
+	for _, overseasIP := range []string{"8.8.8.8", "45.46.47.48", "60.61.62.63"} {
+		if code := probe(overseasIP, "/emby/System/Info/Public"); code != http.StatusForbidden {
+			t.Fatalf("expected 403 for non-mainland IP %s, got %d", overseasIP, code)
+		}
+		if code := probe(overseasIP, "/emby/Videos/1/stream.mkv"); code != http.StatusForbidden {
+			t.Fatalf("expected 403 for non-mainland video %s, got %d", overseasIP, code)
+		}
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("blocked non-mainland requests must not touch upstream, got %d hits", upstreamHits)
+	}
+
+	// Mainland minor ISP (广电 -> other), Telecom, and Loopback MUST still be allowed
+	for _, allowedIP := range []string{"11.12.13.14", "1.2.3.4", "127.0.0.1"} {
+		if code := probe(allowedIP, "/emby/System/Info/Public"); code != http.StatusOK {
+			t.Fatalf("expected 200 for allowed IP %s, got %d", allowedIP, code)
+		}
+	}
+
+	// Lookup API reports blocked + non_mainland_cn accurately
+	lookupRec := httptest.NewRecorder()
+	app.handleIP2Region(lookupRec, httptest.NewRequest(http.MethodPost, "/api/ip2region/lookup", strings.NewReader(`{"ip":"45.46.47.48"}`)))
+	var lookupResp struct {
+		Blocked       bool   `json:"blocked"`
+		BlockReason   string `json:"block_reason"`
+		NonMainlandCN bool   `json:"non_mainland_cn"`
+	}
+	if err := json.Unmarshal(lookupRec.Body.Bytes(), &lookupResp); err != nil {
+		t.Fatalf("decode lookup: %v", err)
+	}
+	if !lookupResp.Blocked || lookupResp.BlockReason != "non_mainland" || !lookupResp.NonMainlandCN {
+		t.Fatalf("unexpected lookup response for HK IP: %+v", lookupResp)
+	}
+
+	// 2. Enable per-group block on Unicom (cu)
+	putRec2 := httptest.NewRecorder()
+	app.handleISPRoutes(putRec2, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"group":"cu","block_connect":true}`)))
+	if putRec2.Code != http.StatusOK {
+		t.Fatalf("enable cu block status=%d body=%s", putRec2.Code, putRec2.Body.String())
+	}
+	if code := probe("5.6.7.8", "/emby/System/Info/Public"); code != http.StatusForbidden {
+		t.Fatalf("expected 403 for blocked cu group IP 5.6.7.8, got %d", code)
+	}
+	if code := probe("1.2.3.4", "/emby/System/Info/Public"); code != http.StatusOK {
+		t.Fatalf("expected 200 for unblocked ct group IP 1.2.3.4, got %d", code)
+	}
+	if code := probe("127.0.0.1", "/emby/System/Info/Public"); code != http.StatusOK {
+		t.Fatalf("loopback IP must never be blocked, got %d", code)
+	}
+}
+
 func jsonInt(v int) string {
 	b, _ := json.Marshal(v)
 	return string(b)

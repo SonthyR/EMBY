@@ -361,6 +361,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			requestCancel()
 		}()
 		r = r.WithContext(requestCtx)
+		if pm.edges != nil {
+			if blocked, reason := pm.edges.isClientBlocked(requestLogEntry.ClientIP); blocked {
+				msg := "当前运营商线路已禁止连接"
+				if reason == "non_mainland" {
+					msg = "当前地区（非中国大陆）已禁止连接，请关闭代理后重试"
+				}
+				writeShareJSONError(w, http.StatusForbidden, msg)
+				return
+			}
+		}
 		trafficMeter := newRequestTrafficMeter(inst)
 		defer trafficMeter.finish(time.Now())
 		r = r.WithContext(context.WithValue(r.Context(), requestTrafficMeterContextKey{}, trafficMeter))

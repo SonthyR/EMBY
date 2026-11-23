@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { ArrowUpToLine, Database, Download, GripVertical, RefreshCw, Trash2 } from '@lucide/vue'
+import { ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldBan, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
@@ -17,6 +17,8 @@ import { errorMessage, toast } from '@/stores/toast'
 import { formatBytes } from '@/utils/format'
 
 const groups = ref<ISPRouteGroup[]>([])
+const blockNonMainland = ref(false)
+const savingNonMainland = ref(false)
 const dbStatus = ref<IP2RegionStatus>({
   v4: { version: 'v4', downloaded: false, size_bytes: 0 },
   v6: { version: 'v6', downloaded: false, size_bytes: 0 },
@@ -46,11 +48,12 @@ function formatTimestamp(raw?: string): string {
 }
 
 async function load(silent = false) {
-  if (dragState.value || savingGroup.value) return
+  if (dragState.value || savingGroup.value || savingNonMainland.value) return
   if (!silent) loading.value = true
   try {
     const [routeRes, ipStatus] = await Promise.all([ispRoutesApi.get(), ip2regionApi.status()])
     groups.value = routeRes.groups || []
+    blockNonMainland.value = !!routeRes.block_non_mainland
     dbStatus.value = ipStatus
     loadError.value = ''
   } catch (error) {
@@ -173,6 +176,53 @@ async function toggleNodeEnabled(groupKey: string, node: ISPRouteNode, value: bo
   await persistGroup(groupKey)
 }
 
+async function toggleBlockNonMainland(value: boolean) {
+  if (value && !dbStatus.value.v4.downloaded) {
+    const ok = await confirm({
+      title: '尚未下载 IPv4 地区库',
+      message: '未下载 IPv4 地区库时，系统无法识别 IPv4 访客是否来自海外，开启后该规则暂不会对 IPv4 生效。建议先在下方下载 IPv4 地区库，仍要现在开启吗？',
+      confirmText: '仍要开启',
+    })
+    if (!ok) return
+  }
+  savingNonMainland.value = true
+  try {
+    const res = await ispRoutesApi.setBlockNonMainland(value)
+    blockNonMainland.value = !!res.block_non_mainland
+    groups.value = res.groups || []
+    toast.success(value ? '已开启：海外 / 非中国大陆 IP 将禁止连接 Emby' : '已关闭海外 / 非中国大陆 IP 拦截')
+  } catch (error) {
+    toast.error(errorMessage(error, '保存配置失败'))
+    await load(true)
+  } finally {
+    savingNonMainland.value = false
+  }
+}
+
+async function toggleGroupBlock(group: ISPRouteGroup, value: boolean) {
+  if (value && group.group === 'other' && !dbStatus.value.v4.downloaded) {
+    const ok = await confirm({
+      title: '尚未下载 IPv4 地区库，确定禁止「其他」分组？',
+      message: '在未下载 IPv4 地区库时，所有 IPv4 访客都会被归入「其他」分组；现在开启将拦截所有 IPv4 Emby 客户端连接（管理面板和内网不受影响）。确认继续吗？',
+      confirmText: '确认禁止',
+      danger: true,
+    })
+    if (!ok) return
+  }
+  savingGroup.value = group.group
+  try {
+    const res = await ispRoutesApi.setGroupBlock(group.group, value)
+    blockNonMainland.value = !!res.block_non_mainland
+    groups.value = res.groups || []
+    toast.success(value ? `已禁止「${group.label}」分组连接 Emby` : `已恢复「${group.label}」分组连接`)
+  } catch (error) {
+    toast.error(errorMessage(error, '保存配置失败'))
+    await load(true)
+  } finally {
+    savingGroup.value = null
+  }
+}
+
 function nodeStatusText(node: ISPRouteNode): string {
   if (node.is_master) return '兜底主机'
   switch (node.status) {
@@ -269,17 +319,49 @@ async function deleteIPDB(version: 'v4' | 'v6') {
           <p class="faint">控制面（登录、浏览、海报）始终在主机完成；视频播放请求按客户端 IP 运营商自动 307 调度到首位可用节点。</p>
         </div>
 
+        <div class="guard-bar" :class="{ active: blockNonMainland }">
+          <div class="guard-meta">
+            <ShieldBan class="guard-icon" />
+            <div>
+              <div class="guard-title">
+                <strong>禁止海外 / 非中国大陆 IP 连接 Emby</strong>
+                <span v-if="blockNonMainland" class="blocked-chip">已开启 · 拦截非大陆</span>
+              </div>
+              <p class="faint guard-desc">
+                拒绝来自海外及港澳台（常见代理/梯子节点）的 Emby 客户端连接（HTTP 403），防止忘关代理消耗双份流量；国内广电、教育网等小宽带仍正常走「其他」组。管理面板网页、朋友自助页、从机心跳及内网 IP 永远放行。
+              </p>
+            </div>
+          </div>
+          <UiSwitch
+            :model-value="blockNonMainland"
+            :disabled="savingNonMainland"
+            @update:model-value="toggleBlockNonMainland"
+          />
+        </div>
+
         <div class="grid">
-          <article v-for="group in groups" :key="group.group" class="group-card">
+          <article v-for="group in groups" :key="group.group" class="group-card" :class="{ blocked: group.block_connect }">
             <header class="group-head">
               <div class="group-title">
                 <h3>{{ group.label }}</h3>
-                <span class="active-chip">当前：{{ activeNodeLabel(group) }}</span>
+                <span v-if="group.block_connect" class="blocked-chip">已禁止连接</span>
+                <span v-else class="active-chip">当前：{{ activeNodeLabel(group) }}</span>
               </div>
-              <span class="faint hint">拖动排序</span>
+              <div class="group-controls">
+                <span class="faint block-label">禁止连接</span>
+                <UiSwitch
+                  :model-value="group.block_connect"
+                  :disabled="savingGroup === group.group"
+                  @update:model-value="toggleGroupBlock(group, $event)"
+                />
+              </div>
             </header>
 
-            <TransitionGroup name="list" tag="ul" class="node-list">
+            <p v-if="group.block_connect" class="block-banner">
+              已拒绝「{{ group.label }}」分组的 Emby 客户端连接（HTTP 403），不会消耗主机或从机流量；面板网页与内网不受影响。
+            </p>
+
+            <TransitionGroup name="list" tag="ul" class="node-list" :class="{ dimmed: group.block_connect }">
               <li
                 v-for="(node, idx) in group.nodes"
                 :key="node.node_id"
@@ -356,19 +438,28 @@ async function deleteIPDB(version: 'v4' | 'v6') {
             <button type="button" @click="runLookup('202.96.128.86')">电信示例</button>
             <button type="button" @click="runLookup('221.6.4.66')">联通示例</button>
             <button type="button" @click="runLookup('221.179.155.161')">移动示例</button>
+            <button type="button" @click="runLookup('8.8.8.8')">海外示例</button>
           </div>
         </form>
 
         <p v-if="testError" class="err">{{ testError }}</p>
         <div v-else-if="testResult" class="test-result">
           <div><span class="k">查询 IP</span><strong class="mono">{{ testResult.ip }}</strong></div>
-          <div><span class="k">归属地</span><strong>{{ testResult.region || '未识别（请先下载地区库）' }}</strong></div>
+          <div>
+            <span class="k">归属地</span>
+            <strong>
+              {{ testResult.region || '未识别（请先下载地区库）' }}
+              <span v-if="testResult.non_mainland_cn" class="tag-overseas">非中国大陆</span>
+            </strong>
+          </div>
           <div><span class="k">运营商</span><strong>{{ testResult.isp || '—' }}</strong></div>
           <div><span class="k">匹配线路</span><strong>{{ testResult.isp_label }}</strong></div>
           <div>
             <span class="k">命中节点</span>
-            <strong class="good">{{ testResult.node_name }}</strong>
-            <span v-if="testResult.public_url" class="mono faint"> ({{ testResult.public_url }})</span>
+            <strong :class="testResult.blocked ? 'bad' : 'good'">
+              {{ testResult.blocked ? `${testResult.node_name} (403)` : testResult.node_name }}
+            </strong>
+            <span v-if="!testResult.blocked && testResult.public_url" class="mono faint"> ({{ testResult.public_url }})</span>
           </div>
         </div>
       </section>
@@ -487,16 +578,31 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .faint { color: var(--text-3); }
 .mono { font-family: var(--font-mono); }
 
+.guard-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.guard-bar.active { border-color: color-mix(in srgb, var(--bad) 38%, var(--border)); background: color-mix(in srgb, var(--bad) 4%, var(--bg-elev)); }
+.guard-meta { display: flex; align-items: flex-start; gap: 10px; flex: 1; min-width: 0; }
+.guard-icon { width: 18px; height: 18px; margin-top: 2px; color: var(--text-2); flex-shrink: 0; }
+.guard-bar.active .guard-icon { color: var(--bad); }
+.guard-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.guard-desc { margin: 4px 0 0; font-size: 12.5px; line-height: 1.55; }
+
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.group-card { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
+.group-card { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); transition: border-color var(--dur) var(--ease); }
+.group-card.blocked { border-color: color-mix(in srgb, var(--bad) 35%, var(--border)); }
 .group-card.skeleton { height: 180px; }
 .group-card.skeleton span { display: block; width: 40%; height: 14px; border-radius: 6px; background: var(--surface); }
 
-.group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .group-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .group-title h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.group-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.block-label { font-size: 12px; }
 .active-chip { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 11.5px; background: color-mix(in srgb, var(--good) 12%, transparent); color: var(--good); font-weight: 500; }
-.hint { font-size: 12px; }
+.blocked-chip { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 11.5px; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-weight: 500; }
+.block-banner { margin: 0; padding: 8px 10px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--bad) 8%, transparent); color: var(--bad); font-size: 12px; line-height: 1.5; }
+.node-list.dimmed { opacity: 0.48; }
+.tag-overseas { display: inline-flex; align-items: center; margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 500; background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+.test-result .bad { color: var(--bad); }
 
 .node-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .node-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), opacity var(--dur) var(--ease); }

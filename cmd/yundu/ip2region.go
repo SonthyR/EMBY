@@ -44,12 +44,14 @@ var ip2regionMirrorBases = []string{
 }
 
 type ip2regionResult struct {
-	Found    bool   `json:"found"`
-	Raw      string `json:"raw,omitempty"`
-	Region   string `json:"region"`
-	ISP      string `json:"isp"`
-	ISPGroup string `json:"isp_group"`
-	ISPLabel string `json:"isp_label"`
+	Found         bool   `json:"found"`
+	Raw           string `json:"raw,omitempty"`
+	Region        string `json:"region"`
+	ISP           string `json:"isp"`
+	ISPGroup      string `json:"isp_group"`
+	ISPLabel      string `json:"isp_label"`
+	ISOCode       string `json:"iso_code,omitempty"`
+	NonMainlandCN bool   `json:"non_mainland_cn"`
 }
 
 func ispGroupLabel(group string) string {
@@ -117,6 +119,35 @@ func isISOCountryCode(s string) bool {
 	return s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z'
 }
 
+func isNonMainlandChina(country string, regionParts []string, isoCode string) bool {
+	if isoCode != "" {
+		if isoCode == "HK" || isoCode == "MO" || isoCode == "TW" || isoCode != "CN" {
+			return true
+		}
+	}
+	for _, part := range regionParts {
+		lower := strings.ToLower(part)
+		switch {
+		case strings.Contains(lower, "香港"),
+			strings.Contains(lower, "澳门"),
+			strings.Contains(lower, "澳門"),
+			strings.Contains(lower, "台湾"),
+			strings.Contains(lower, "台灣"),
+			strings.Contains(lower, "hong kong"),
+			strings.Contains(lower, "hongkong"),
+			strings.Contains(lower, "macau"),
+			strings.Contains(lower, "macao"),
+			strings.Contains(lower, "taiwan"):
+			return true
+		}
+	}
+	country = strings.TrimSpace(country)
+	if country == "" || country == "中国" || strings.EqualFold(country, "china") || strings.Contains(country, "内网") || strings.EqualFold(country, "local") {
+		return false
+	}
+	return true
+}
+
 // parseIP2RegionRaw parses ip2region's pipe-delimited record into a clean region
 // label and ISP name. Supports modern 5-field (Country|Province|City|ISP|ISO),
 // legacy 5-field (Country|Area|Province|City|ISP), and 4-field
@@ -135,10 +166,18 @@ func parseIP2RegionRaw(raw string) ip2regionResult {
 		return s
 	}
 	// Modern ip2region_v4.xdb / ip2region_v6.xdb append a 2-letter ISO country
-	// code as the final column (e.g. "中国|北京市|北京市|移动|CN"). Strip it so
-	// the preceding column is parsed as ISP rather than Region.
-	if len(fields) >= 5 && isISOCountryCode(clean(fields[len(fields)-1])) {
-		fields = fields[:len(fields)-1]
+	// code as the final column (e.g. "中国|北京市|北京市|移动|CN"). Capture and
+	// strip it so the preceding column is parsed as ISP rather than Region.
+	var isoCode string
+	if len(fields) >= 5 {
+		if tail := clean(fields[len(fields)-1]); isISOCountryCode(tail) {
+			isoCode = tail
+			fields = fields[:len(fields)-1]
+		}
+	}
+	var country string
+	if len(fields) > 0 {
+		country = clean(fields[0])
 	}
 	var regionParts []string
 	var isp string
@@ -168,14 +207,17 @@ func parseIP2RegionRaw(raw string) ip2regionResult {
 			}
 		}
 	}
+	found := len(regionParts) > 0 || isp != "" || isoCode != ""
 	group := classifyISPGroup(isp)
 	return ip2regionResult{
-		Found:    len(regionParts) > 0 || isp != "",
-		Raw:      raw,
-		Region:   strings.Join(regionParts, " · "),
-		ISP:      isp,
-		ISPGroup: group,
-		ISPLabel: ispGroupLabel(group),
+		Found:         found,
+		Raw:           raw,
+		Region:        strings.Join(regionParts, " · "),
+		ISP:           isp,
+		ISPGroup:      group,
+		ISPLabel:      ispGroupLabel(group),
+		ISOCode:       isoCode,
+		NonMainlandCN: found && isNonMainlandChina(country, regionParts, isoCode),
 	}
 }
 
