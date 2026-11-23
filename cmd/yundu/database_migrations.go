@@ -531,6 +531,12 @@ func (d *DB) migrateOnce() error {
 	if err := ensureEdgeNodeSchema(ctx, conn); err != nil {
 		return err
 	}
+	if err := ensureClientFilterAndAlertSchema(ctx, conn); err != nil {
+		return err
+	}
+	if err := ensureRedeemCodeSchema(ctx, conn); err != nil {
+		return err
+	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err

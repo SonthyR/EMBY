@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Copy } from '@lucide/vue'
+import { Plus, Search, Copy, Ticket } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import ShareUserForm from '@/components/share/ShareUserForm.vue'
 import ShareUserDetail from '@/components/share/ShareUserDetail.vue'
 import ShareTextDialog from '@/components/share/ShareTextDialog.vue'
+import RedeemCodesPanel from '@/components/share/RedeemCodesPanel.vue'
 import { shareApi, sitesApi, type ShareStatus, type ShareUser, type Site } from '@/api'
 import { copyText, daysUntil, dateOnly, formatBytes } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
@@ -21,6 +22,7 @@ const loading = ref(true)
 const loadError = ref('')
 const query = ref('')
 const filter = ref<'all' | ShareStatus>('all')
+const viewMode = ref<'users' | 'codes'>('users')
 
 const formOpen = ref(false)
 const editing = ref<ShareUser | null>(null)
@@ -145,9 +147,17 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 <template>
   <div>
     <PageHeader title="分享账号" description="给朋友发放登录账号，服务器会用你的源站账号代为登录。">
-      <UiButton variant="primary" @click="openCreate"><Plus />新建<kbd class="kbd-on-inverse">N</kbd></UiButton>
+      <div class="head-acts">
+        <UiButton :variant="viewMode === 'codes' ? 'primary' : 'secondary'" @click="viewMode = viewMode === 'codes' ? 'users' : 'codes'">
+          <Ticket />{{ viewMode === 'codes' ? '返回账号列表' : '兑换码' }}
+        </UiButton>
+        <UiButton v-if="viewMode === 'users'" variant="primary" @click="openCreate"><Plus />新建<kbd class="kbd-on-inverse">N</kbd></UiButton>
+      </div>
     </PageHeader>
 
+    <RedeemCodesPanel v-if="viewMode === 'codes'" :sites="sites" />
+
+    <template v-else>
     <dl class="stats">
       <div><dt>账号</dt><dd class="num">{{ counts.all }}</dd></div>
       <div><dt>正常</dt><dd class="num">{{ counts.active }}</dd></div>
@@ -223,6 +233,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
     </div>
 
     <button type="button" class="fab" aria-label="新建分享账号" @click="openCreate"><Plus /></button>
+    </template>
 
     <ShareUserDetail
       :open="!!selected && !formOpen"
@@ -244,6 +255,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 </template>
 
 <style scoped>
+.head-acts { display: flex; align-items: center; gap: 8px; }
 .kbd-on-inverse { margin-left: 4px; border-color: color-mix(in srgb, var(--inverse-text) 25%, transparent); color: color-mix(in srgb, var(--inverse-text) 60%, transparent); }
 .stats { display: flex; gap: 48px; margin: 0 0 32px; }
 .stats div { display: flex; flex-direction: column; gap: 2px; }

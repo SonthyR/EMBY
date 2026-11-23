@@ -1,3 +1,5 @@
 install.sh text eol=lf
 docker-entrypoint.sh text eol=lf
 tests/*.sh text eol=lf
+ui/** text eol=lf
+web/static/app/** text eol=lf

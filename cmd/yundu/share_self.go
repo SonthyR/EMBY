@@ -389,6 +389,8 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 		// Keep this browser signed in with the new password.
 		a.setShareSessionCookie(w, r, signShareSession(user.ID, string(newHash), time.Now()), int(shareSessionDuration.Seconds()))
 		a.jsonOK(w, map[string]bool{"changed": true})
+	case "redeem":
+		a.handleShareSelfRedeem(w, r, user)
 	default:
 		if strings.HasPrefix(action, "sessions/") && strings.HasSuffix(action, "/kick") {
 			if r.Method != http.MethodPost {

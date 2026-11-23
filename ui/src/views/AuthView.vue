@@ -4,11 +4,13 @@ import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { Eye, EyeOff } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
-import { ApiError } from '@/api'
+import { ApiError, redeemApi } from '@/api'
 import { checkSession, login, session, setup } from '@/stores/session'
+import { toast } from '@/stores/toast'
 
 const isSetup = computed(() => session.phase === 'setup')
-const form = reactive({ username: '', password: '', confirm: '', token: '' })
+const registerMode = ref(false)
+const form = reactive({ username: '', password: '', confirm: '', token: '', code: '' })
 const showPassword = ref(false)
 const busy = ref(false)
 const error = ref('')
@@ -32,6 +34,24 @@ onBeforeUnmount(() => clearInterval(timer))
 async function submit() {
   error.value = ''
   const username = form.username.trim()
+  if (registerMode.value && !isSetup.value) {
+    const code = form.code.trim()
+    if (!code) return (error.value = '请填写开号兑换码')
+    if (!username) return (error.value = '请填写用户名')
+    if ([...form.password].length < 4 || utf8Length(form.password) > 72) return (error.value = '密码需要 4–72 个字符')
+    busy.value = true
+    try {
+      await redeemApi.register(code, username, form.password)
+      toast.success('账号已开通，正在进入自助页')
+      await checkSession()
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 429 && err.retryAfter) startCountdown(err.retryAfter)
+      error.value = err instanceof Error ? err.message : '开号失败'
+    } finally {
+      busy.value = false
+    }
+    return
+  }
   if (!username) return (error.value = '请填写用户名')
   if (isSetup.value) {
     if (utf8Length(username) > 64) return (error.value = '用户名不能超过 64 字节')
@@ -72,19 +92,23 @@ async function submit() {
       </div>
 
       <form v-else class="form" novalidate @submit.prevent="submit">
-        <h2>{{ isSetup ? '创建管理员' : '登录' }}</h2>
-        <p v-if="!isSetup" class="lead">管理员和分享账号都在这里登录。</p>
-        <UiField label="用户名" for="auth-user" :help="isSetup ? '1–64 字节，只能有一个管理员。' : ''">
-          <input id="auth-user" v-model="form.username" class="input" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus />
+        <h2>{{ isSetup ? '创建管理员' : registerMode ? '卡密自助开号' : '登录' }}</h2>
+        <p v-if="!isSetup && !registerMode" class="lead">管理员和分享账号都在这里登录。</p>
+        <p v-else-if="!isSetup && registerMode" class="lead">输入开号兑换码，自定义你的用户名和密码即可立即使用。</p>
+        <UiField v-if="!isSetup && registerMode" label="开号兑换码" for="auth-code">
+          <input id="auth-code" v-model="form.code" class="input mono" maxlength="64" autocapitalize="characters" spellcheck="false" placeholder="例如 YD-XXXX-XXXX-XXXX" autofocus />
         </UiField>
-        <UiField label="密码" for="auth-pass" :help="isSetup ? '至少 6 个字符。' : ''">
+        <UiField label="用户名" for="auth-user" :help="isSetup ? '1–64 字节，只能有一个管理员。' : registerMode ? 'Emby 客户端和自助页通用，不含空格。' : ''">
+          <input id="auth-user" v-model="form.username" class="input" autocomplete="username" autocapitalize="none" spellcheck="false" :autofocus="!registerMode" />
+        </UiField>
+        <UiField label="密码" for="auth-pass" :help="isSetup ? '至少 6 个字符。' : registerMode ? '至少 4 个字符。' : ''">
           <div class="secret">
             <input
               id="auth-pass"
               v-model="form.password"
               class="input"
               :type="showPassword ? 'text' : 'password'"
-              :autocomplete="isSetup ? 'new-password' : 'current-password'"
+              :autocomplete="isSetup || registerMode ? 'new-password' : 'current-password'"
             />
             <button type="button" class="eye" :aria-label="showPassword ? '隐藏密码' : '显示密码'" @click="showPassword = !showPassword">
               <EyeOff v-if="showPassword" /><Eye v-else />
@@ -100,7 +124,22 @@ async function submit() {
           </UiField>
         </template>
         <p v-if="error" class="error" role="alert">{{ error }}<template v-if="retryIn">（{{ retryIn }} 秒后可重试）</template></p>
-        <UiButton type="submit" variant="primary" block :loading="busy" :disabled="retryIn > 0">{{ isSetup ? '创建并进入' : '登录' }}</UiButton>
+        <UiButton type="submit" variant="primary" block :loading="busy" :disabled="retryIn > 0">
+          {{ isSetup ? '创建并进入' : registerMode ? '兑换并开通账号' : '登录' }}
+        </UiButton>
+        <button
+          v-if="!isSetup"
+          type="button"
+          class="switch-mode"
+          @click="
+            () => {
+              registerMode = !registerMode
+              error = ''
+            }
+          "
+        >
+          {{ registerMode ? '已有账号？返回登录' : '有开号兑换码？自助开号' }}
+        </button>
         <p v-if="session.ephemeralSecret" class="note">当前未固定 JWT_SECRET，服务重启后需要重新登录。</p>
       </form>
     </div>
@@ -141,6 +180,8 @@ async function submit() {
 }
 .eye svg { width: 18px; height: 18px; }
 .error { margin: 0; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--bad-soft); color: var(--bad); font-size: 13px; }
+.switch-mode { align-self: center; padding: 4px 8px; border: 0; background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer; }
+.switch-mode:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
 .note { margin: 0; color: var(--warn); font-size: 12px; }
 .state { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; color: var(--text-2); }
 .state p { margin: 0; }

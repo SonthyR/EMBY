@@ -83,10 +83,29 @@ function latencyTone(ms: number): string {
   return 'bad'
 }
 
+function supportsRemoteUpgrade(version: string | undefined): boolean {
+  const raw = (version || '').trim().replace(/^v/i, '')
+  const parts = raw.split('.').map(n => Number.parseInt(n, 10))
+  if (parts.length < 2 || parts.some(Number.isNaN)) return false
+  if (parts[0] > 1) return true
+  if (parts[0] < 1) return false
+  return parts[1] >= 2
+}
+
 function upgradeStatusInfo(node: EdgeNode): { text: string; tone: string } | null {
   const raw = (node.upgrade_status || '').trim()
-  if (!raw) return null
-  if (raw === 'queued') return { text: `已下发升级指令（${node.upgrade_target || node.master_version || '最新版'}），等待从机响应…`, tone: 'warn' }
+  if (!raw) {
+    if (node.online && node.upgrade_available && !supportsRemoteUpgrade(node.agent_version)) {
+      return { text: `当前从机为旧版 ${node.agent_version}，不支持远程自更新；请点击「安装命令」在从机重跑一次升级到 ${node.master_version || '最新版'}。`, tone: 'warn' }
+    }
+    return null
+  }
+  if (raw === 'pending' || raw === 'queued') {
+    if (!supportsRemoteUpgrade(node.agent_version)) {
+      return { text: `旧版从机（${node.agent_version || '未知版本'}）无法接收远程升级指令，请点击「安装命令」在从机重跑一次即可原地升级。`, tone: 'warn' }
+    }
+    return { text: `已下发升级指令（${node.upgrade_target || node.master_version || '最新版'}），等待从机响应…`, tone: 'warn' }
+  }
   if (raw === 'updating') return { text: `从机正在下载并校验 ${node.upgrade_target || node.master_version || '更新'}…`, tone: 'warn' }
   if (raw === 'restarting') return { text: '新版本已就绪，从机正在重启…', tone: 'good' }
   if (raw.startsWith('failed:')) return { text: `升级失败：${raw.slice(7).trim()}`, tone: 'bad' }
@@ -95,7 +114,7 @@ function upgradeStatusInfo(node: EdgeNode): { text: string; tone: string } | nul
 
 function isUpgradeBusy(node: EdgeNode): boolean {
   const st = (node.upgrade_status || '').trim()
-  return st === 'queued' || st === 'updating' || st === 'restarting'
+  return st === 'pending' || st === 'queued' || st === 'updating' || st === 'restarting'
 }
 
 async function upgradeNode(node: EdgeNode) {
@@ -461,7 +480,7 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 
         <div class="card-actions">
           <UiButton
-            v-if="node.online && node.upgrade_available && !isUpgradeBusy(node)"
+            v-if="node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node)"
             size="sm"
             variant="primary"
             :loading="upgradingId === node.id"
@@ -469,7 +488,7 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
           >
             <ArrowUpCircle />升级 {{ node.master_version }}
           </UiButton>
-          <UiButton size="sm" :variant="node.online && node.upgrade_available && !isUpgradeBusy(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
+          <UiButton size="sm" :variant="node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
             <Terminal />安装命令
           </UiButton>
           <UiButton size="sm" @click="openEdit(node)"><Pencil />编辑</UiButton>

@@ -265,7 +265,7 @@ async function save() {
               </div>
             </div>
             <select v-if="selected[site.id]?.on" v-model.number="selected[site.id].account" class="select compact" :disabled="!usable(site.id).length" aria-label="代登用的源站账号">
-              <option :value="0">自动选择源站账号</option>
+              <option :value="0">自动均衡源站账号（推荐，支持 401/429 故障切换）</option>
               <option v-for="account in usable(site.id)" :key="account.id" :value="account.id">{{ account.account_name || account.username }}</option>
             </select>
             <p v-if="selected[site.id]?.on && accounts[site.id] && !usable(site.id).length" class="warn">这个站点还没保存带密码的源站账号，朋友会登录失败。</p>

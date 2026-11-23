@@ -7,6 +7,7 @@ import PageHeader from '@/components/ui/PageHeader.vue'
 import TlsSettings from '@/components/settings/TlsSettings.vue'
 import TelegramSettings from '@/components/settings/TelegramSettings.vue'
 import UpdateSettings from '@/components/settings/UpdateSettings.vue'
+import ClientFilterSettings from '@/components/settings/ClientFilterSettings.vue'
 import { api, sitesApi } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -14,6 +15,7 @@ import { errorMessage, toast } from '@/stores/toast'
 type Settings = Record<string, any>
 const SECTIONS = [
   { key: 'general', label: '流量与时间' },
+  { key: 'client-filter', label: '客户端限制' },
   { key: 'logs', label: '请求日志' },
   { key: 'backup', label: '备份与恢复' },
   { key: 'tls', label: '面板地址与证书' },
@@ -223,6 +225,7 @@ async function doRestore() {
           </section>
         </template>
 
+        <ClientFilterSettings v-if="section === 'client-filter'" />
         <TlsSettings v-if="section === 'tls'" />
         <TelegramSettings v-if="section === 'telegram'" />
         <UpdateSettings v-if="section === 'update'" />

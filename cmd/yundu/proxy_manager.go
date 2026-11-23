@@ -91,6 +91,7 @@ type ProxyManager struct {
 	imageCacheRuntime       *imageCacheRuntime
 	shares                  *shareUserRuntime
 	edges                   *edgeNodeRuntime
+	clientFilter            *clientFilterRuntime
 }
 
 // siteIngressClosedError means StopSite passed the irreversible boundary: new
@@ -283,6 +284,7 @@ func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
 	if db != nil {
 		pm.shares = newShareUserRuntime(db, pm)
+		pm.clientFilter = newClientFilterRuntime(db)
 	}
 	return pm
 }

@@ -16,6 +16,7 @@ import { STATUS_LABEL, STATUS_TONE } from '@/components/share/shareStatus'
 const me = ref<MyAccount | null>(null)
 const loadError = ref('')
 const pw = reactive({ open: false, current: '', next: '', busy: false, error: '' })
+const redeem = reactive({ code: '', busy: false, error: '' })
 
 const draggingId = ref<number | null>(null)
 const dragOrderBefore = ref<number[]>([])
@@ -196,6 +197,23 @@ async function kickOne(sessionItem: ShareSession) {
     toast.error(errorMessage(error))
   } finally {
     kickingSessionId.value = ''
+  }
+}
+
+async function submitRedeem() {
+  redeem.error = ''
+  const code = redeem.code.trim()
+  if (!code) return (redeem.error = '请输入续期兑换码')
+  redeem.busy = true
+  try {
+    const res = await meApi.redeem(code)
+    me.value = res
+    redeem.code = ''
+    toast.success(res.redeem_summary || '兑换成功')
+  } catch (error) {
+    redeem.error = errorMessage(error, '兑换失败')
+  } finally {
+    redeem.busy = false
   }
 }
 
@@ -385,6 +403,23 @@ async function changePassword() {
         </section>
 
         <section class="block">
+          <h2>兑换码续期</h2>
+          <p class="faint hint">输入分享人发放的续期码，可立即为当前账号续期或更新流量额度。</p>
+          <form class="redeem-form" @submit.prevent="submitRedeem">
+            <input
+              v-model="redeem.code"
+              class="input mono"
+              maxlength="64"
+              autocapitalize="characters"
+              spellcheck="false"
+              placeholder="例如 YD-XXXX-XXXX-XXXX"
+            />
+            <UiButton variant="primary" type="submit" :loading="redeem.busy">兑换</UiButton>
+          </form>
+          <p v-if="redeem.error" class="err redeem-err">{{ redeem.error }}</p>
+        </section>
+
+        <section class="block">
           <div class="block-head">
             <h2>密码</h2>
             <UiButton v-if="!pw.open" variant="ghost" size="sm" @click="pw.open = true">修改</UiButton>
@@ -534,6 +569,9 @@ h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .none { font-size: 13px; padding: 6px 0; }
 .pw { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
 .pw-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.redeem-form { display: flex; gap: 8px; }
+.redeem-form .input { flex: 1; }
+.redeem-err { margin-top: 8px; }
 .err { margin: 0; color: var(--bad); font-size: 13px; }
 @media (max-width: 560px) {
   .content { padding-top: 32px; }

@@ -62,7 +62,7 @@ export interface ShareSession {
 
 export interface LiveShareSession {
   session_id: string
-  user_id: number
+  share_user_id: number
   username: string
   site_id: number
   site_name: string
@@ -73,7 +73,7 @@ export interface LiveShareSession {
   node_name?: string
   playing?: boolean
   draining?: boolean
-  created_at: string
+  created_at?: string
   last_seen_at: string
 }
 
@@ -235,4 +235,55 @@ export interface IP2RegionLookupResult {
   public_url?: string
   blocked?: boolean
   block_reason?: 'non_mainland' | 'group' | string
+}
+
+export type RedeemCodeKind = 'renew' | 'register'
+export type RedeemCodeStatus = 'unused' | 'used' | 'revoked' | 'expired'
+
+export interface ShareRedeemCode {
+  id: number
+  code: string
+  kind: RedeemCodeKind | string
+  days: number
+  traffic_quota: number
+  traffic_reset_day: number
+  max_devices: number
+  speed_limit: number
+  site_ids: number[]
+  site_names?: string[]
+  expires_at: string
+  note: string
+  status: RedeemCodeStatus | string
+  used_by_user_id?: number
+  used_by_username?: string
+  used_at?: string
+  created_at: string
+}
+
+export interface ShareRedeemCodeCreateInput {
+  kind: RedeemCodeKind
+  count: number
+  days: number
+  traffic_quota: number
+  traffic_reset_day: number
+  max_devices: number
+  speed_limit: number
+  site_ids: number[]
+  expires_at: string
+  note: string
+}
+
+export type ClientFilterMode = 'off' | 'blacklist' | 'whitelist'
+
+export interface ClientFilterConfig {
+  mode: ClientFilterMode | string
+  rules: string[]
+  blacklist_presets?: string[]
+  whitelist_presets?: string[]
+}
+
+export interface ShareAlertSettings {
+  enabled: boolean
+  expiry_days: number
+  quota_warning_pct: number
 }

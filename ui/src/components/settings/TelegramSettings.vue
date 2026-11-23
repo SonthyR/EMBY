@@ -3,7 +3,7 @@ import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
-import { api } from '@/api'
+import { api, shareAlertsApi } from '@/api'
 import { errorMessage, toast } from '@/stores/toast'
 
 const currentOrigin = window.location.origin
@@ -14,10 +14,11 @@ const status = ref({ state: 'disabled', message: '' })
 const busy = ref('')
 const errors = reactive<Record<string, string>>({})
 const form = reactive({ token: '', botEnabled: false, adminIDs: '', publicURL: '', reportEnabled: false, chatID: '', frequency: 'daily', weekday: 1, time: '20:00' })
+const alerts = reactive({ enabled: true, expiry_days: 3, quota_warning_pct: 80 })
 
 async function load() {
   try {
-    const s = await api.get<any>('/api/telegram-report')
+    const [s, sa] = await Promise.all([api.get<any>('/api/telegram-report'), shareAlertsApi.get().catch(() => null)])
     const bot = s.bot || {}
     tokenConfigured.value = !!s.bot_token_configured
     secretStable.value = s.secret_stable !== false
@@ -32,6 +33,13 @@ async function load() {
       weekday: Number.isInteger(s.weekday) ? s.weekday : 1,
       time: s.schedule_time || '20:00',
     })
+    if (sa) {
+      Object.assign(alerts, {
+        enabled: !!sa.enabled,
+        expiry_days: Number(sa.expiry_days) || 3,
+        quota_warning_pct: Number(sa.quota_warning_pct) || 80,
+      })
+    }
     status.value = { state: bot.status || 'disabled', message: bot.enabled ? bot.status_message || '' : '' }
     loaded.value = true
   } catch (error) {
@@ -88,6 +96,13 @@ async function submit(test: boolean) {
   busy.value = test ? 'test' : 'save'
   try {
     await api.post('/api/telegram-report', payload)
+    if (!test) {
+      await shareAlertsApi.update({
+        enabled: alerts.enabled,
+        expiry_days: Math.min(30, Math.max(1, Number(alerts.expiry_days) || 3)),
+        quota_warning_pct: Math.min(99, Math.max(50, Number(alerts.quota_warning_pct) || 80)),
+      })
+    }
     toast.success(test ? '日报已发送' : 'Telegram 设置已保存')
     if (!test) load()
   } catch (error) {
@@ -136,6 +151,22 @@ const WEEKDAYS = [[1, '星期一'], [2, '星期二'], [3, '星期三'], [4, '星
           <select id="tg-wd" v-model.number="form.weekday" class="select"><option v-for="[v, l] in WEEKDAYS" :key="v" :value="v">{{ l }}</option></select>
         </UiField>
         <UiField label="时间" for="tg-time" help="按设置里的时区"><input id="tg-time" v-model="form.time" class="input" type="time" /></UiField>
+      </div>
+    </section>
+    <section class="group">
+      <h2>分享账号与从机告警</h2>
+      <UiSwitch
+        v-model="alerts.enabled"
+        label="分享账号临期与流量预警"
+        description="复用上方 Bot Token 与接收 Chat ID，当分享账号即将到期、已到期或流量达到预警/耗尽阈值时自动汇总推送（按周期去重，不刷屏）。从机离线、恢复与流量达 80%/100% 也会自动推送到此 Chat ID。"
+      />
+      <div v-if="alerts.enabled" class="grid">
+        <UiField label="临期提前提醒（天）" for="sa-days" help="1–30 天">
+          <input id="sa-days" v-model.number="alerts.expiry_days" class="input num" type="number" min="1" max="30" />
+        </UiField>
+        <UiField label="流量预警阈值（%）" for="sa-pct" help="50–99%，达 100% 必发">
+          <input id="sa-pct" v-model.number="alerts.quota_warning_pct" class="input num" type="number" min="50" max="99" />
+        </UiField>
       </div>
     </section>
     <div class="actions">

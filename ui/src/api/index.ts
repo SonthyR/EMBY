@@ -1,6 +1,7 @@
 import { api } from './client'
 import type {
   AuthCheck,
+  ClientFilterConfig,
   EdgeNode,
   EdgeNodeInput,
   IP2RegionDBStatus,
@@ -8,6 +9,9 @@ import type {
   IP2RegionStatus,
   ISPRoutesResponse,
   LiveShareSession,
+  ShareAlertSettings,
+  ShareRedeemCode,
+  ShareRedeemCodeCreateInput,
   ShareSelfNetwork,
   ShareUser,
   ShareUserInput,
@@ -182,6 +186,10 @@ export interface MyAccountOrderResponse extends MyAccount {
   draining: number
 }
 
+export interface MyAccountRedeemResponse extends MyAccount {
+  redeem_summary: string
+}
+
 export const meApi = {
   login: (username: string, password: string) => api.post<{ username: string; share_account: boolean }>('/api/me/login', { username, password }),
   logout: () => api.post<{ logged_out: boolean }>('/api/me/logout'),
@@ -189,6 +197,7 @@ export const meApi = {
   reorderSites: (siteIds: number[]) => api.put<MyAccountOrderResponse>('/api/me/sites/order', { site_ids: siteIds }),
   kick: () => api.post<{ revoked: number }>('/api/me/kick'),
   kickSession: (sessionId: string) => api.post<{ revoked: boolean }>(`/api/me/sessions/${encodeURIComponent(sessionId)}/kick`),
+  redeem: (code: string) => api.post<MyAccountRedeemResponse>('/api/me/redeem', { code }),
   password: (current: string, next: string) => api.post<{ changed: boolean }>('/api/me/password', { current_password: current, new_password: next }),
 }
 
@@ -291,4 +300,23 @@ export const ip2regionApi = {
   update: (version: 'v4' | 'v6') => api.post<{ item: IP2RegionDBStatus; status: IP2RegionStatus }>('/api/ip2region/update', { version }),
   remove: (version: 'v4' | 'v6') => api.del<IP2RegionStatus>(`/api/ip2region?version=${encodeURIComponent(version)}`),
   lookup: (ip: string) => api.post<IP2RegionLookupResult>('/api/ip2region/lookup', { ip }),
+}
+
+export const redeemApi = {
+  list: () => api.get<ShareRedeemCode[]>('/api/redeem-codes'),
+  create: (input: ShareRedeemCodeCreateInput) => api.post<ShareRedeemCode[]>('/api/redeem-codes', input),
+  revoke: (codeId: number) => api.post<{ revoked: boolean }>(`/api/redeem-codes/${id(codeId)}/revoke`),
+  remove: (codeId: number) => api.del<{ deleted: boolean }>(`/api/redeem-codes/${id(codeId)}`),
+  register: (code: string, username: string, password: string) =>
+    api.post<{ username: string; route_prefix: string; route_url: string; share_account: boolean }>('/api/redeem/register', { code, username, password }),
+}
+
+export const clientFilterApi = {
+  get: () => api.get<ClientFilterConfig>('/api/client-filter'),
+  update: (mode: string, rules: string[]) => api.put<ClientFilterConfig>('/api/client-filter', { mode, rules }),
+}
+
+export const shareAlertsApi = {
+  get: () => api.get<ShareAlertSettings>('/api/share-alerts'),
+  update: (input: ShareAlertSettings) => api.put<ShareAlertSettings>('/api/share-alerts', input),
 }

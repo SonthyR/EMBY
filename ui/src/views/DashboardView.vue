@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { MonitorSmartphone, X } from '@lucide/vue'
+import { ChevronDown, MonitorSmartphone, X } from '@lucide/vue'
 import AreaChart from '@/components/charts/AreaChart.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
@@ -15,6 +15,7 @@ const insights = ref<DashboardInsights | null>(null)
 const shares = ref<ShareUser[]>([])
 const liveSessions = ref<LiveShareSession[]>([])
 const kickingSessionId = ref('')
+const showAllSessions = ref(false)
 const trend = ref<TrendResponse | null>(null)
 const range = ref('realtime')
 const siteId = ref('all')
@@ -34,10 +35,10 @@ const loadSnapshot = async () => {
   if (live.status === 'fulfilled') liveSessions.value = live.value
 }
 async function kickLiveSession(item: LiveShareSession) {
-  if (!item.session_id || kickingSessionId.value) return
+  if (!item.session_id || !item.share_user_id || kickingSessionId.value) return
   kickingSessionId.value = item.session_id
   try {
-    await shareApi.kickSession(item.user_id, item.session_id)
+    await shareApi.kickSession(item.share_user_id, item.session_id)
     toast.success(`已断开 ${item.username} 的「${item.device_name || '该设备'}」`)
     liveSessions.value = liveSessions.value.filter(s => s.session_id !== item.session_id)
   } catch (error) {
@@ -116,7 +117,9 @@ const current = computed(() => {
   return { down: last?.download_bps || 0, up: last?.upload_bps || 0 }
 })
 const online = computed(() => liveSessions.value.length || shares.value.reduce((n, u) => n + (u.session_count || 0), 0))
-const playingCount = computed(() => liveSessions.value.filter(s => s.playing).length)
+const playingSessions = computed(() => liveSessions.value.filter(s => s.playing))
+const playingCount = computed(() => playingSessions.value.length)
+const displayedSessions = computed(() => (showAllSessions.value ? liveSessions.value : playingSessions.value))
 const sites = computed(() => [...(snapshot.value?.live_sites || [])].sort((a, b) => (b.monthly_traffic || 0) - (a.monthly_traffic || 0)))
 const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_requests || [0])))
 </script>
@@ -129,13 +132,45 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
       <div><dt>运行中站点</dt><dd class="num">{{ snapshot ? snapshot.running_sites : '—' }}<small>/ {{ snapshot?.total_sites ?? '—' }}</small></dd></div>
       <div><dt>本周期流量</dt><dd class="num">{{ snapshot ? formatBytes(snapshot.monthly_traffic) : '—' }}</dd></div>
       <div><dt>当前下行</dt><dd class="num">{{ rate(current.down) }}</dd></div>
-      <div><dt>分享账号在线</dt><dd class="num">{{ online }}<small>{{ playingCount ? `台 · ${playingCount} 播放中` : '台' }}</small></dd></div>
+      <div><dt>已登录设备</dt><dd class="num">{{ online }}<small>{{ playingCount ? `台 · ${playingCount} 播放中` : '台' }}</small></dd></div>
     </dl>
 
+    <section class="section">
+      <div class="section-head">
+        <div class="tabs" role="tablist" aria-label="时间范围">
+          <button v-for="r in RANGES" :key="r.key" type="button" role="tab" :aria-selected="range === r.key" :class="{ on: range === r.key }" @click="range = r.key">{{ r.label }}</button>
+        </div>
+        <div class="controls">
+          <button type="button" class="link" :class="{ on: metric === 'speed' }" @click="metric = 'speed'">速度</button>
+          <button type="button" class="link" :class="{ on: metric === 'volume' }" @click="metric = 'volume'">流量</button>
+          <select v-model="siteId" class="select mini" aria-label="站点">
+            <option value="all">全部站点</option>
+            <option v-for="s in snapshot?.live_sites || []" :key="s.id" :value="String(s.id)">{{ s.name }}</option>
+          </select>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i class="sw down" />下行</span>
+        <span><i class="sw up" />上行</span>
+      </div>
+      <AreaChart v-if="trend && trend.points.length" :labels="chart.labels" :series="chart.series" :format="chart.format" :time-format="timeFormat" :height="260" />
+      <p v-else class="faint none">暂无数据</p>
+    </section>
+
     <section v-if="liveSessions.length" class="section">
-      <h2>实时在线与观影 <span class="faint sub-count">{{ liveSessions.length }} 台在线<template v-if="playingCount"> · {{ playingCount }} 台播放中</template></span></h2>
-      <ul class="live-list">
-        <li v-for="s in liveSessions" :key="s.session_id">
+      <div class="live-head">
+        <h2>
+          正在观影
+          <span v-if="playingCount" class="pill good">{{ playingCount }} 台播放中</span>
+          <span v-else class="faint sub-count">当前无人播放</span>
+        </h2>
+        <button type="button" class="live-toggle" :class="{ open: showAllSessions }" @click="showAllSessions = !showAllSessions">
+          <span>{{ showAllSessions ? '收起历史设备' : `查看全部 ${liveSessions.length} 台已登录设备` }}</span>
+          <ChevronDown />
+        </button>
+      </div>
+      <ul v-if="displayedSessions.length" class="live-list">
+        <li v-for="s in displayedSessions" :key="s.session_id">
           <MonitorSmartphone class="dev-ico" />
           <div class="live-main">
             <div class="live-title">
@@ -162,28 +197,6 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
           </button>
         </li>
       </ul>
-    </section>
-
-    <section class="section">
-      <div class="section-head">
-        <div class="tabs" role="tablist" aria-label="时间范围">
-          <button v-for="r in RANGES" :key="r.key" type="button" role="tab" :aria-selected="range === r.key" :class="{ on: range === r.key }" @click="range = r.key">{{ r.label }}</button>
-        </div>
-        <div class="controls">
-          <button type="button" class="link" :class="{ on: metric === 'speed' }" @click="metric = 'speed'">速度</button>
-          <button type="button" class="link" :class="{ on: metric === 'volume' }" @click="metric = 'volume'">流量</button>
-          <select v-model="siteId" class="select mini" aria-label="站点">
-            <option value="all">全部站点</option>
-            <option v-for="s in snapshot?.live_sites || []" :key="s.id" :value="String(s.id)">{{ s.name }}</option>
-          </select>
-        </div>
-      </div>
-      <div class="legend">
-        <span><i class="sw down" />下行</span>
-        <span><i class="sw up" />上行</span>
-      </div>
-      <AreaChart v-if="trend && trend.points.length" :labels="chart.labels" :series="chart.series" :format="chart.format" :time-format="timeFormat" :height="260" />
-      <p v-else class="faint none">暂无数据</p>
     </section>
 
     <div class="cols">
@@ -246,6 +259,12 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
 .none { padding: 80px 0; text-align: center; font-size: 13.5px; }
 .cols { display: grid; grid-template-columns: 1.5fr 1fr; gap: 56px; }
 h2 { margin: 0 0 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 500; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
+.live-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.live-head h2 { margin: 0; padding: 0; border-bottom: 0; }
+.live-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 12.5px; cursor: pointer; transition: color var(--dur) var(--ease); }
+.live-toggle:hover { color: var(--text); }
+.live-toggle svg { width: 14px; height: 14px; transition: transform 180ms var(--ease); }
+.live-toggle.open svg { transform: rotate(180deg); }
 .sub-count { font-size: 12px; font-weight: 400; }
 .live-list { margin: 0; padding: 0; list-style: none; }
 .live-list li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }

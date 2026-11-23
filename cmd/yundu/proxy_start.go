@@ -371,6 +371,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 		}
+		if pm.clientFilter != nil {
+			if blocked, _ := pm.clientFilter.isBlocked(r); blocked {
+				writeShareJSONError(w, http.StatusForbidden, "当前客户端已被禁止连接")
+				return
+			}
+		}
 		trafficMeter := newRequestTrafficMeter(inst)
 		defer trafficMeter.finish(time.Now())
 		r = r.WithContext(context.WithValue(r.Context(), requestTrafficMeterContextKey{}, trafficMeter))
@@ -524,11 +530,6 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 		}
 		rw = pm.shares.wrapWriter(rw, r, shareUser, site.ID, shareSessionHash)
-		var shareCapture *shareLoginCapture
-		if shareLogin != nil {
-			shareCapture = newShareLoginCapture(rw)
-			rw = shareCapture
-		}
 		finalProxy := http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 			proxy.ServeHTTP(responseWriter, request)
 		})
@@ -539,16 +540,30 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				}))
 			})
 		}
-		if inst.progress != nil && inst.progress.ServeHTTP(rw, r, finalProxy) {
-			if shareCapture != nil {
+		if shareLogin != nil {
+			for {
+				shareCapture := newShareLoginCapture(rw)
+				if inst.progress != nil && inst.progress.ServeHTTP(shareCapture, r, finalProxy) {
+					shareCapture.finish(shareLogin)
+					return
+				}
+				finalProxy.ServeHTTP(shareCapture, r)
+				if shareCapture.shouldFailover() {
+					prevID := shareLogin.currentAccountID()
+					if shareLogin.advanceCandidate(r) {
+						log.Printf("[%s] share login account #%d returned HTTP %d; failing over to account #%d",
+							site.Name, prevID, shareCapture.status, shareLogin.currentAccountID())
+						continue
+					}
+				}
 				shareCapture.finish(shareLogin)
+				return
 			}
+		}
+		if inst.progress != nil && inst.progress.ServeHTTP(rw, r, finalProxy) {
 			return
 		}
 		finalProxy.ServeHTTP(rw, r)
-		if shareCapture != nil {
-			shareCapture.finish(shareLogin)
-		}
 	})
 
 	inst.handler = handler

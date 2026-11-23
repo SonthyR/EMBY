@@ -101,6 +101,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_users", "route_prefix", "ALTER TABLE share_users ADD COLUMN route_prefix TEXT NOT NULL DEFAULT ''"},
 		{"share_user_sites", "sort_order", "ALTER TABLE share_user_sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
+		{"share_user_sessions", "site_account_id", "ALTER TABLE share_user_sessions ADD COLUMN site_account_id INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+column.table+"') WHERE name=?", column.name).Scan(&exists); err != nil {
@@ -238,6 +239,7 @@ type shareUserRuntime struct {
 	capMu        sync.Mutex
 	capabilities map[string]shareCapabilityOwner
 	loadError    error
+	accountRR    atomic.Uint64
 }
 
 func newShareUserRuntime(db *DB, pm *ProxyManager) *shareUserRuntime {
@@ -1078,14 +1080,55 @@ func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
 // ---------------------------------------------------------------------------
 // Proxy interception
 
+type shareUpstreamCandidate struct {
+	accountID int64
+	username  string
+	password  string
+}
+
 type shareLoginPending struct {
-	rt       *shareUserRuntime
-	user     *shareUserState
-	siteID   int64
-	deviceID string
-	device   string
-	client   string
-	clientIP string
+	rt           *shareUserRuntime
+	user         *shareUserState
+	siteID       int64
+	siteName     string
+	deviceID     string
+	device       string
+	client       string
+	clientIP     string
+	parsed       *shareLoginBody
+	candidates   []shareUpstreamCandidate
+	candidateIdx int
+}
+
+func (p *shareLoginPending) currentAccountID() int64 {
+	if p == nil || p.candidateIdx < 0 || p.candidateIdx >= len(p.candidates) {
+		return 0
+	}
+	return p.candidates[p.candidateIdx].accountID
+}
+
+func (p *shareLoginPending) applyCandidate(r *http.Request) {
+	if p == nil || p.candidateIdx < 0 || p.candidateIdx >= len(p.candidates) {
+		return
+	}
+	cand := p.candidates[p.candidateIdx]
+	body, contentType := p.parsed.rewrite(cand.username, cand.password)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.TransferEncoding = nil
+	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	r.Header.Set("Content-Type", contentType)
+	// The login response is parsed for the access token, so keep it plain.
+	r.Header.Set("Accept-Encoding", "identity")
+}
+
+func (p *shareLoginPending) advanceCandidate(r *http.Request) bool {
+	if p == nil || p.candidateIdx+1 >= len(p.candidates) {
+		return false
+	}
+	p.candidateIdx++
+	p.applyCandidate(r)
+	return true
 }
 
 // intercept runs before a proxied request is forwarded. It returns the request
@@ -1286,20 +1329,12 @@ func (rt *shareUserRuntime) interceptLogin(w http.ResponseWriter, r *http.Reques
 		writeShareJSONError(w, http.StatusUnauthorized, shareBlockMessage(reason))
 		return r, nil, nil, true
 	}
-	upstreamUser, upstreamPassword, err := rt.upstreamCredentials(site.ID, preferredAccount)
+	candidates, err := rt.upstreamCredentialCandidates(site.ID, preferredAccount)
 	if err != nil {
 		log.Printf("[%s] share login for %s: %v", site.Name, lookup, err)
 		writeShareJSONError(w, http.StatusServiceUnavailable, shareBlockMessage("account"))
 		return r, nil, nil, true
 	}
-	body, contentType := parsed.rewrite(upstreamUser, upstreamPassword)
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.TransferEncoding = nil
-	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	r.Header.Set("Content-Type", contentType)
-	// The login response is parsed for the access token, so keep it plain.
-	r.Header.Set("Accept-Encoding", "identity")
 	device := embyRequestAuthorizationAttribute(r, "Device")
 	if device == "" {
 		device = r.Header.Get("X-Emby-Device-Name")
@@ -1315,7 +1350,20 @@ func (rt *shareUserRuntime) interceptLogin(w http.ResponseWriter, r *http.Reques
 	if deviceID == "" {
 		deviceID = r.Header.Get("X-Emby-Device-Id")
 	}
-	return r, &shareLoginPending{rt: rt, user: state, siteID: site.ID, deviceID: truncateShareText(deviceID, 128), device: truncateShareText(device, 128), client: truncateShareText(client, 128), clientIP: clientIP}, state, false
+	pending := &shareLoginPending{
+		rt:         rt,
+		user:       state,
+		siteID:     site.ID,
+		siteName:   site.Name,
+		deviceID:   truncateShareText(deviceID, 128),
+		device:     truncateShareText(device, 128),
+		client:     truncateShareText(client, 128),
+		clientIP:   clientIP,
+		parsed:     parsed,
+		candidates: candidates,
+	}
+	pending.applyCandidate(r)
+	return r, pending, state, false
 }
 
 func truncateShareText(value string, limit int) string {
@@ -1326,43 +1374,106 @@ func truncateShareText(value string, limit int) string {
 	return value
 }
 
-// upstreamCredentials picks the saved account used to sign in upstream.
-func (rt *shareUserRuntime) upstreamCredentials(siteID, preferredAccount int64) (string, string, error) {
+// upstreamCredentialCandidates returns an ordered list of valid upstream
+// accounts for a site: if preferredAccount > 0 it is placed first with other
+// accounts as failover backups; when preferredAccount == 0 (auto-balance) all
+// non-expired accounts are ordered by fewest active sessions with round-robin
+// tie-breaking, followed by any expired accounts as last resort.
+func (rt *shareUserRuntime) upstreamCredentialCandidates(siteID, preferredAccount int64) ([]shareUpstreamCandidate, error) {
 	accounts, err := rt.db.listSiteAccounts(siteID)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	pick := func(item storedSiteAccount) (string, string, bool) {
+	activeCounts := make(map[int64]int)
+	if rows, err := rt.db.db.Query(`SELECT site_account_id, COUNT(*) FROM share_user_sessions WHERE site_id=? AND site_account_id>0 GROUP BY site_account_id`, siteID); err == nil {
+		for rows.Next() {
+			var accID int64
+			var cnt int
+			if scanErr := rows.Scan(&accID, &cnt); scanErr == nil {
+				activeCounts[accID] = cnt
+			}
+		}
+		_ = rows.Close()
+	}
+	now := time.Now()
+	type scoredCandidate struct {
+		cand    shareUpstreamCandidate
+		expired bool
+		active  int
+	}
+	var preferred *scoredCandidate
+	others := make([]scoredCandidate, 0, len(accounts))
+	for _, item := range accounts {
 		if item.Username == "" || item.PasswordCiphertext == "" {
-			return "", "", false
+			continue
 		}
-		password, err := decryptSiteAccountSecret(item.PasswordCiphertext)
-		if err != nil || password == "" {
-			return "", "", false
+		password, decErr := decryptSiteAccountSecret(item.PasswordCiphertext)
+		if decErr != nil || password == "" {
+			continue
 		}
-		return item.Username, password, true
+		expired := false
+		if exp := rt.db.shareExpiryTime(item.ExpiresAt); !exp.IsZero() && !now.Before(exp) {
+			expired = true
+		}
+		sc := scoredCandidate{
+			cand: shareUpstreamCandidate{
+				accountID: item.ID,
+				username:  item.Username,
+				password:  password,
+			},
+			expired: expired,
+			active:  activeCounts[item.ID],
+		}
+		if preferredAccount > 0 && item.ID == preferredAccount {
+			preferred = &sc
+		} else {
+			others = append(others, sc)
+		}
 	}
-	if preferredAccount > 0 {
-		for _, item := range accounts {
-			if item.ID == preferredAccount {
-				if username, password, ok := pick(item); ok {
-					return username, password, nil
-				}
+	if len(others) > 1 {
+		rr := rt.accountRR.Add(1)
+		sort.SliceStable(others, func(i, j int) bool {
+			if others[i].expired != others[j].expired {
+				return !others[i].expired
+			}
+			if others[i].active != others[j].active {
+				return others[i].active < others[j].active
+			}
+			return others[i].cand.accountID < others[j].cand.accountID
+		})
+		// Rotate equal-priority leading accounts so concurrent or zero-session logins spread evenly.
+		sameEnd := 1
+		for sameEnd < len(others) && others[sameEnd].expired == others[0].expired && others[sameEnd].active == others[0].active {
+			sameEnd++
+		}
+		if sameEnd > 1 {
+			shift := int(rr % uint64(sameEnd)) // #nosec G115 -- sameEnd is positive and bounded by len(others).
+			if shift > 0 {
+				rotated := append([]scoredCandidate{}, others[shift:sameEnd]...)
+				rotated = append(rotated, others[:shift]...)
+				copy(others[:sameEnd], rotated)
 			}
 		}
 	}
-	for _, item := range accounts {
-		if username, password, ok := pick(item); ok {
-			return username, password, nil
-		}
+	result := make([]shareUpstreamCandidate, 0, len(others)+1)
+	if preferred != nil {
+		result = append(result, preferred.cand)
 	}
-	return "", "", errors.New("site has no saved account with a password")
+	for _, sc := range others {
+		result = append(result, sc.cand)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("site has no saved account with a password")
+	}
+	return result, nil
 }
 
 // shareLoginCapture buffers the upstream login response so the access token
-// can be recorded before the response reaches the client.
+// can be recorded before the response reaches the client, and headers stay
+// isolated until flushed so 401/403/429 account failover never leaks stale headers.
 type shareLoginCapture struct {
 	target      http.ResponseWriter
+	headers     http.Header
 	status      int
 	buffer      bytes.Buffer
 	passthrough bool
@@ -1370,10 +1481,29 @@ type shareLoginCapture struct {
 }
 
 func newShareLoginCapture(target http.ResponseWriter) *shareLoginCapture {
-	return &shareLoginCapture{target: target}
+	return &shareLoginCapture{target: target, headers: make(http.Header)}
 }
 
-func (c *shareLoginCapture) Header() http.Header { return c.target.Header() }
+func (c *shareLoginCapture) Header() http.Header {
+	if c.passthrough {
+		return c.target.Header()
+	}
+	return c.headers
+}
+
+func (c *shareLoginCapture) copyHeadersToTarget() {
+	dst := c.target.Header()
+	for k, vals := range c.headers {
+		dst[k] = append([]string(nil), vals...)
+	}
+}
+
+func (c *shareLoginCapture) shouldFailover() bool {
+	if c.passthrough {
+		return false
+	}
+	return c.status == http.StatusUnauthorized || c.status == http.StatusForbidden || c.status == http.StatusTooManyRequests
+}
 
 func (c *shareLoginCapture) WriteHeader(status int) {
 	if c.wroteHeader {
@@ -1392,6 +1522,7 @@ func (c *shareLoginCapture) Write(b []byte) (int, error) {
 	}
 	if c.buffer.Len()+len(b) > shareLoginResponseLimit {
 		c.passthrough = true
+		c.copyHeadersToTarget()
 		c.target.WriteHeader(c.status)
 		if _, err := c.target.Write(c.buffer.Bytes()); err != nil { // #nosec G705 -- relays the upstream Emby login response unchanged, with its own headers and content type.
 			return 0, err
@@ -1423,6 +1554,7 @@ func (c *shareLoginCapture) finish(pending *shareLoginPending) {
 			}
 		}
 	}
+	c.copyHeadersToTarget()
 	c.target.WriteHeader(status)
 	_, _ = c.target.Write(c.buffer.Bytes()) // #nosec G705 -- relays the upstream Emby login response unchanged, with its own headers and content type.
 }
@@ -1433,8 +1565,9 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 		return err
 	}
 	hash := shareTokenHash(token)
-	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
-		hash, pending.user.id, pending.siteID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
+	accountID := pending.currentAccountID()
+	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
+		hash, pending.user.id, pending.siteID, accountID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
 		return err
 	}
 	// Upstreams may hand the same token back to a device that signs in again.
