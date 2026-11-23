@@ -1302,7 +1302,7 @@ install_cli_packages() {
 }
 
 ensure_cli_dependencies() {
-    local action="$1" manager command_name
+    local action="${1:-install}" manager command_name
     local required=(curl awk grep cmp install mktemp sed tr)
     local missing=()
     if [ "$action" = update ] || [ "$action" = password ]; then
@@ -2951,6 +2951,42 @@ SVCEOF
     as_root systemctl enable "$AGENT_SERVICE_NAME" >/dev/null
 }
 
+is_openrc() {
+    [ "$(uname -s)" = "Linux" ] && command -v rc-service >/dev/null 2>&1 && [ -d /etc/init.d ]
+}
+
+write_agent_openrc_service() {
+    local tmp_dir="$1" svc_tmp
+    svc_tmp="${tmp_dir}/meridian-agent.openrc"
+    cat > "$svc_tmp" <<RCEOF
+#!/sbin/openrc-run
+
+name="Meridian Edge Agent"
+description="Meridian Edge Agent (Yundu media relay)"
+command="${INSTALL_DIR}/${BIN_NAME}"
+command_args="agent"
+command_background="yes"
+pidfile="/run/${AGENT_SERVICE_NAME}.pid"
+output_log="/var/log/${AGENT_SERVICE_NAME}.log"
+error_log="/var/log/${AGENT_SERVICE_NAME}.log"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    if [ -f "${AGENT_CONFIG_DIR}/env" ]; then
+        set -a
+        # shellcheck disable=SC1090,SC1091
+        . "${AGENT_CONFIG_DIR}/env"
+        set +a
+    fi
+}
+RCEOF
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$svc_tmp" "/etc/init.d/${AGENT_SERVICE_NAME}"
+    command -v rc-update >/dev/null 2>&1 && as_root rc-update add "$AGENT_SERVICE_NAME" default >/dev/null 2>&1 || true
+}
+
 do_agent() (
     local tmp_dir latest env_tmp
     init_privilege
@@ -2963,6 +2999,11 @@ do_agent() (
             as_root systemctl disable "$AGENT_SERVICE_NAME" 2>/dev/null || true
             as_root rm -f -- "$AGENT_SERVICE_FILE"
             as_root systemctl daemon-reload
+        fi
+        if is_openrc && [ -f "/etc/init.d/${AGENT_SERVICE_NAME}" ]; then
+            as_root rc-service "$AGENT_SERVICE_NAME" stop 2>/dev/null || true
+            command -v rc-update >/dev/null 2>&1 && as_root rc-update del "$AGENT_SERVICE_NAME" default 2>/dev/null || true
+            as_root rm -f -- "/etc/init.d/${AGENT_SERVICE_NAME}"
         fi
         as_root rm -rf -- "$AGENT_CONFIG_DIR"
         ok "Meridian Edge Agent 已卸载"
@@ -2977,8 +3018,8 @@ do_agent() (
     AGENT_PORT=$(normalize_port "$AGENT_PORT") \
         || fail "--port 无效: ${AGENT_PORT}（必须是 1-65535 的整数）"
 
+    ensure_cli_dependencies agent
     need_cmd curl
-    ensure_cli_dependencies
     ensure_service_user
 
     tmp_dir=$(mktemp -d)
@@ -3013,6 +3054,17 @@ ENVEOF
         else
             as_root systemctl status "$AGENT_SERVICE_NAME" --no-pager || true
             fail "从机 Agent 启动失败，请检查上述日志"
+        fi
+    elif is_openrc; then
+        write_agent_openrc_service "$tmp_dir"
+        as_root rc-service "$AGENT_SERVICE_NAME" restart
+        sleep 1
+        if as_root rc-service "$AGENT_SERVICE_NAME" status >/dev/null 2>&1; then
+            ok "从机 Agent 已通过 OpenRC 启动（节点 #${AGENT_NODE_ID}，监听 ${AGENT_BIND}:${AGENT_PORT}）"
+            info "查看日志: tail -f /var/log/${AGENT_SERVICE_NAME}.log"
+            info "卸载从机: bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/master/install.sh) agent --uninstall"
+        else
+            fail "从机 Agent 启动失败，请检查 /var/log/${AGENT_SERVICE_NAME}.log"
         fi
     else
         ok "二进制与配置已就绪，请手动运行: ${INSTALL_DIR}/${BIN_NAME} agent --master ${AGENT_MASTER} --id ${AGENT_NODE_ID} --port ${AGENT_PORT} --token <TOKEN>"

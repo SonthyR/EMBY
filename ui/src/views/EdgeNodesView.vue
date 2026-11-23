@@ -26,17 +26,17 @@ const showAdvanced = ref(false)
 
 const form = reactive({
   name: '',
-  public_port: 19090,
-  listen_port: 0,
+  public_port: '19090',
+  listen_port: '',
   public_host: '',
   public_ip: '',
   tls_mode: 'auto' as 'auto' | 'external' | 'http',
   enabled: true,
-  quota_gb: 0,
-  traffic_reset_day: 1,
+  quota_gb: '',
+  traffic_reset_day: 0,
   note: '',
 })
-const formError = ref('')
+const errors = reactive<Record<string, string>>({})
 
 const installOpen = ref(false)
 const installNode = ref<EdgeNode | null>(null)
@@ -105,20 +105,24 @@ const visible = computed(() => {
   })
 })
 
+function clearErrors() {
+  for (const key of Object.keys(errors)) delete errors[key]
+}
+
 function openCreate() {
   editing.value = null
-  formError.value = ''
+  clearErrors()
   showAdvanced.value = false
   Object.assign(form, {
     name: '',
-    public_port: 19090,
-    listen_port: 0,
+    public_port: '19090',
+    listen_port: '',
     public_host: '',
     public_ip: '',
     tls_mode: 'auto',
     enabled: true,
-    quota_gb: 0,
-    traffic_reset_day: 1,
+    quota_gb: '',
+    traffic_reset_day: 0,
     note: '',
   })
   formOpen.value = true
@@ -126,7 +130,7 @@ function openCreate() {
 
 function openEdit(node: EdgeNode) {
   editing.value = node
-  formError.value = ''
+  clearErrors()
   showAdvanced.value = !!(
     node.public_host ||
     node.public_ip ||
@@ -136,13 +140,13 @@ function openEdit(node: EdgeNode) {
   )
   Object.assign(form, {
     name: node.name,
-    public_port: node.public_port || 19090,
-    listen_port: node.listen_port && node.listen_port !== node.public_port ? node.listen_port : 0,
+    public_port: String(node.public_port || 19090),
+    listen_port: node.listen_port && node.listen_port !== node.public_port ? String(node.listen_port) : '',
     public_host: node.public_host || '',
     public_ip: node.public_ip || '',
     tls_mode: (node.tls_mode === 'external' || node.tls_mode === 'http' ? node.tls_mode : 'auto') as 'auto' | 'external' | 'http',
     enabled: node.enabled,
-    quota_gb: node.traffic_quota > 0 ? Math.round((node.traffic_quota / GB) * 100) / 100 : 0,
+    quota_gb: node.traffic_quota > 0 ? String(Math.round((node.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: node.traffic_reset_day || 0,
     note: node.note || '',
   })
@@ -150,23 +154,36 @@ function openEdit(node: EdgeNode) {
 }
 
 async function saveForm() {
-  formError.value = ''
+  clearErrors()
   const name = form.name.trim()
-  const publicPort = Number(form.public_port)
-  if (!name) {
-    formError.value = '请输入从机名称'
-    return
-  }
+  if (!name) errors.name = '请填写从机名称'
+
+  const publicPort = Number(String(form.public_port).trim())
   if (!Number.isInteger(publicPort) || publicPort < 1 || publicPort > 65535) {
-    formError.value = '对外端口必须在 1-65535 之间'
-    return
+    errors.public_port = '请输入 1–65535 的整数端口'
   }
-  const listenPort = Number(form.listen_port) || 0
-  if (listenPort !== 0 && (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535)) {
-    formError.value = '本机监听端口必须在 1-65535 之间，或留空默认同对外端口'
-    return
+
+  const rawListen = String(form.listen_port).trim()
+  let listenPort = 0
+  if (rawListen !== '') {
+    listenPort = Number(rawListen)
+    if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+      errors.listen_port = '请输入 1–65535 的整数，或留空'
+    }
   }
-  const quotaBytes = Number(form.quota_gb) > 0 ? Math.round(Number(form.quota_gb) * GB) : 0
+
+  const rawQuota = String(form.quota_gb).trim()
+  let quotaGB = 0
+  if (rawQuota !== '') {
+    quotaGB = Number(rawQuota)
+    if (!Number.isFinite(quotaGB) || quotaGB < 0) {
+      errors.quota_gb = '请输入有效的数字'
+    }
+  }
+
+  if (Object.keys(errors).length) return
+
+  const quotaBytes = quotaGB > 0 ? Math.round(quotaGB * GB) : 0
   const payload: EdgeNodeInput = {
     name,
     public_port: publicPort,
@@ -190,13 +207,13 @@ async function saveForm() {
     } else {
       const created = await edgeApi.create(payload)
       formOpen.value = false
-      toast.success('从机已创建，请复制一键安装命令到目标机器执行')
+      toast.success('从机已创建')
       await load(true)
       installNode.value = created
       installOpen.value = true
     }
   } catch (error) {
-    formError.value = errorMessage(error, '保存失败')
+    toast.error(errorMessage(error, '保存失败'))
   } finally {
     saving.value = false
   }
@@ -302,10 +319,10 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
     </PageHeader>
 
     <dl class="stats">
-      <div><dt>从机总数</dt><dd class="num">{{ counts.all }}</dd></div>
-      <div><dt>在线节点</dt><dd class="num">{{ counts.online }}</dd></div>
+      <div><dt>从机</dt><dd class="num">{{ counts.all }}</dd></div>
+      <div><dt>在线</dt><dd class="num">{{ counts.online }}</dd></div>
       <div><dt>当前播放流</dt><dd class="num">{{ totalStreams }}</dd></div>
-      <div><dt>实时总带宽</dt><dd class="num">{{ formatBps(totalBps) }}</dd></div>
+      <div><dt>实时带宽</dt><dd class="num">{{ formatBps(totalBps) }}</dd></div>
     </dl>
 
     <div class="toolbar">
@@ -316,7 +333,7 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
       </nav>
       <label class="search">
         <Search />
-        <input v-model="query" data-page-search type="search" placeholder="搜索节点名称、IP 或域名" aria-label="搜索从机" />
+        <input v-model="query" data-page-search type="search" placeholder="搜索" aria-label="搜索从机" />
       </label>
     </div>
 
@@ -393,64 +410,89 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
       </article>
     </div>
 
-    <UiDrawer :open="formOpen" :title="editing ? `编辑从机 · ${editing.name}` : '添加从机'" subtitle="默认仅需名称与对外端口，无需域名也能直接接入。" @close="formOpen = false">
-      <form id="edge-node-form" class="form" @submit.prevent="saveForm">
-        <UiField label="从机名称" required>
-          <input v-model="form.name" autofocus placeholder="例如：香港 CN2、日本 NAT、新加坡移动" />
-        </UiField>
+    <UiDrawer
+      :open="formOpen"
+      :title="editing ? '编辑从机' : '添加从机'"
+      :subtitle="editing ? editing.name : '默认仅需名称与对外端口，无需域名也能直接接入'"
+      :width="520"
+      :dismissible="!saving"
+      @close="formOpen = false"
+    >
+      <form class="form" novalidate @submit.prevent="saveForm">
+        <fieldset>
+          <legend>基础信息</legend>
+          <UiField label="从机名称" for="en-name" :error="errors.name">
+            <input id="en-name" v-model="form.name" class="input" maxlength="64" autofocus placeholder="例如：香港 CN2、日本 NAT、新加坡移动" />
+          </UiField>
+          <UiField
+            label="对外端口"
+            for="en-port"
+            :error="errors.public_port"
+            help="普通 VPS 填从机监听端口（默认 19090）；NAT 小鸡填服务商分配的公网映射端口。"
+          >
+            <input id="en-port" v-model="form.public_port" class="input num" type="number" min="1" max="65535" inputmode="numeric" />
+          </UiField>
+        </fieldset>
 
-        <UiField label="对外端口" required hint="普通 VPS 填从机监听端口（默认 19090）；NAT 小鸡填服务商分配的公网映射端口。">
-          <input v-model.number="form.public_port" type="number" min="1" max="65535" />
-        </UiField>
-
-        <div class="advanced" :class="{ open: showAdvanced }">
-          <button type="button" class="adv-toggle" @click="showAdvanced = !showAdvanced">
-            <ChevronDown class="chev" />更多选项（域名 / HTTPS / NAT 内部端口 / 流量配额）
+        <fieldset>
+          <button type="button" class="adv-toggle" :class="{ open: showAdvanced }" @click="showAdvanced = !showAdvanced">
+            <ChevronDown class="chev" />
+            <span>更多选项</span>
+            <small class="faint">域名 / HTTPS / NAT 内网端口 / 流量配额</small>
           </button>
-          <div v-if="showAdvanced" class="adv-body">
-            <UiField label="绑定域名（可选）" hint="留空则从机首次心跳自动上报公网 IP（http://IP:端口）。若填主机泛域名下的子域名（如 hk.example.com），从机将自动同步主机泛域名证书实现零配置 HTTPS。">
-              <input v-model="form.public_host" placeholder="可选，例如 hk.example.com" />
+
+          <template v-if="showAdvanced">
+            <UiField
+              label="绑定域名"
+              for="en-host"
+              help="留空则首次心跳自动上报公网 IP（http://IP:端口）。若填主机泛域名下的子域名（如 hk.example.com），可自动同步泛域名证书实现 HTTPS。"
+            >
+              <input id="en-host" v-model="form.public_host" class="input mono" autocapitalize="none" spellcheck="false" placeholder="可选，例如 hk.example.com" />
             </UiField>
 
-            <UiField v-if="form.public_host.trim()" label="TLS 模式">
-              <select v-model="form.tls_mode">
+            <UiField v-if="form.public_host.trim()" label="TLS 模式" for="en-tls">
+              <select id="en-tls" v-model="form.tls_mode" class="select">
                 <option value="auto">自动同步主机泛域名证书（推荐，支持任意端口 HTTPS）</option>
                 <option value="external">外部反代 HTTPS（Nginx / Caddy 等）</option>
                 <option value="http">仅 HTTP</option>
               </select>
             </UiField>
 
-            <UiField label="NAT 本机监听端口（可选）" hint="仅当 NAT 机器内部监听端口与外部映射端口不一致时填写；留空默认与对外端口一致。">
-              <input v-model.number="form.listen_port" type="number" min="0" max="65535" placeholder="留空表示同对外端口" />
-            </UiField>
-
-            <UiField label="公网 IP（可选覆盖）" hint="留空时由从机连接主机自动识别；仅当从机出站与入站 IP 不同时手动指定。">
-              <input v-model="form.public_ip" placeholder="留空自动识别" />
-            </UiField>
-
-            <div class="two-col">
-              <UiField label="月流量限额 (GB)" hint="0 表示不限">
-                <input v-model.number="form.quota_gb" type="number" min="0" step="1" />
+            <div class="grid">
+              <UiField label="NAT 本机监听端口" for="en-listen" :error="errors.listen_port" help="内外端口不同时填写，留空同对外端口">
+                <input id="en-listen" v-model="form.listen_port" class="input num" type="number" min="1" max="65535" inputmode="numeric" placeholder="同对外端口" />
               </UiField>
-              <UiField label="每月重置日 (1-28)" hint="0 表示不自动重置">
-                <input v-model.number="form.traffic_reset_day" type="number" min="0" max="28" />
+              <UiField label="公网 IP 覆盖" for="en-ip" help="留空自动识别，出入口 IP 不同时填写">
+                <input id="en-ip" v-model="form.public_ip" class="input mono" autocapitalize="none" spellcheck="false" placeholder="自动识别" />
               </UiField>
             </div>
 
-            <UiField label="备注">
-              <input v-model="form.note" placeholder="可选，例如线路说明、机房位置" />
+            <div class="grid">
+              <UiField label="流量额度" for="en-quota" :error="errors.quota_gb" help="GB，超额自动降级到其他节点">
+                <input id="en-quota" v-model="form.quota_gb" class="input num" type="number" min="0" step="1" inputmode="decimal" placeholder="不限" />
+              </UiField>
+              <UiField label="每月重置" for="en-reset" help="到这天清零已用流量">
+                <select id="en-reset" v-model.number="form.traffic_reset_day" class="select">
+                  <option :value="0">不重置</option>
+                  <option v-for="day in 28" :key="day" :value="day">每月 {{ day }} 日</option>
+                </select>
+              </UiField>
+            </div>
+
+            <UiField label="备注" for="en-note">
+              <input id="en-note" v-model="form.note" class="input" maxlength="200" placeholder="可选，例如线路说明、机房位置" />
             </UiField>
 
-            <UiSwitch v-if="editing" v-model="form.enabled" label="启用该从机" description="停用后不会参与三网分流。" />
-          </div>
-        </div>
+            <UiSwitch v-if="editing" v-model="form.enabled" label="启用" description="关闭后该节点不会参与三网分流" />
+          </template>
+        </fieldset>
 
-        <p v-if="formError" class="err">{{ formError }}</p>
+        <button type="submit" hidden />
       </form>
       <template #footer>
-        <UiButton @click="formOpen = false">取消</UiButton>
-        <UiButton type="submit" form="edge-node-form" variant="primary" :loading="saving">
-          {{ editing ? '保存' : '创建并生成安装命令' }}
+        <UiButton :disabled="saving" @click="formOpen = false">取消</UiButton>
+        <UiButton variant="primary" :loading="saving" @click="saveForm">
+          {{ editing ? '保存更改' : '创建并生成安装命令' }}
         </UiButton>
       </template>
     </UiDrawer>
@@ -479,28 +521,33 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 </template>
 
 <style scoped>
-.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 0 0 22px; }
-.stats > div { padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
-.stats dt { font-size: 12.5px; color: var(--text-3); margin-bottom: 6px; }
+.stats { display: flex; gap: 48px; margin: 0 0 32px; }
+.stats div { display: flex; flex-direction: column; gap: 2px; }
+.stats dt { font-size: 12.5px; color: var(--text-3); }
 .stats dd { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
 
-.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
-.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-.tabs button { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 11px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer; transition: background var(--dur) var(--ease), color var(--dur) var(--ease); }
-.tabs button:hover { background: var(--surface); color: var(--text); }
-.tabs button.on { background: var(--inverse-bg); color: var(--inverse-text); font-weight: 500; }
-.tabs .n { font-size: 11.5px; opacity: 0.72; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.tabs { display: flex; gap: 22px; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; white-space: nowrap; cursor: pointer; transition: color var(--dur) var(--ease); }
+.tabs button:hover { color: var(--text-2); }
+.tabs button.on { color: var(--text); }
+.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.n { font-size: 11.5px; color: var(--text-3); }
 
-.search { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 11px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text-3); min-width: 240px; }
-.search svg { width: 15px; height: 15px; flex: 0 0 auto; }
-.search input { flex: 1; border: 0; background: transparent; color: var(--text); font-size: 13px; outline: none; min-width: 0; }
+.search { display: flex; align-items: center; gap: 8px; width: 220px; height: 30px; padding: 0 8px; border-radius: var(--radius-sm); color: var(--text-3); transition: background var(--dur) var(--ease); }
+.search:focus-within { background: var(--surface-hover); }
+.search svg { width: 14px; height: 14px; flex: 0 0 auto; }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13.5px; color: var(--text); }
+.search input::placeholder { color: var(--text-3); }
 
 .list { display: flex; flex-direction: column; gap: 10px; }
 .card { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(200px, 1fr) auto; align-items: center; gap: 16px; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); transition: border-color var(--dur) var(--ease); }
 .card:hover { border-color: var(--border-strong); }
 .card.muted { opacity: 0.65; }
 .card.skeleton { height: 84px; }
-.card.skeleton span { display: block; width: 45%; height: 14px; border-radius: 6px; background: var(--surface); }
+.card.skeleton span { display: block; width: 45%; height: 14px; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.4; } }
 
 .title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .title-row h3 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -511,11 +558,11 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 .status-pill.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
 .status-pill.muted { color: var(--text-3); }
 
-.tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 5px; font-size: 11px; background: var(--surface); color: var(--text-2); font-family: var(--font-mono); }
+.tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 5px; font-size: 11px; background: var(--surface); color: var(--text-2); font-family: var(--mono); }
 .tag.good { color: var(--good); background: color-mix(in srgb, var(--good) 10%, transparent); font-family: inherit; }
 
 .addr-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; font-size: 12.5px; flex-wrap: wrap; }
-.mono { font-family: var(--font-mono); color: var(--text-2); word-break: break-all; }
+.mono { font-family: var(--mono); color: var(--text-2); word-break: break-all; }
 .faint { color: var(--text-3); }
 .sep::before { content: '·'; margin-right: 10px; }
 .note { margin: 6px 0 0; font-size: 12.5px; color: var(--text-3); }
@@ -527,30 +574,37 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 
 .card-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 
-.empty { padding: 48px 24px; text-align: center; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-2); }
-.empty h2 { margin: 0 0 8px; font-size: 16px; color: var(--text); }
-.empty p { margin: 0 auto 18px; max-width: 440px; font-size: 13.5px; color: var(--text-3); line-height: 1.6; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; text-align: center; }
+.empty h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.empty p { max-width: 400px; margin: 0 0 8px; color: var(--text-2); line-height: 1.6; }
 
-.form { display: flex; flex-direction: column; gap: 16px; }
-.advanced { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; background: var(--surface); }
-.adv-toggle { display: flex; align-items: center; gap: 6px; width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-2); text-align: left; }
-.advanced .chev { width: 15px; height: 15px; transition: transform 180ms var(--ease); }
-.advanced.open .chev { transform: rotate(180deg); }
-.adv-body { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.err { margin: 0; font-size: 13px; color: var(--bad); }
+/* Drawer form matches ShareUserForm.vue */
+.form { display: flex; flex-direction: column; gap: 4px; }
+fieldset { display: flex; flex-direction: column; gap: 14px; margin: 0; padding: 18px 0; border: 0; border-bottom: 1px solid var(--border); min-width: 0; }
+fieldset:first-of-type { padding-top: 0; }
+fieldset:last-of-type { border-bottom: 0; }
+legend { float: left; width: 100%; margin-bottom: 14px; padding: 0; font-size: 12px; font-weight: 500; color: var(--text-3); }
+legend + * { clear: both; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 14px; }
+
+.adv-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text); text-align: left; }
+.adv-toggle small { margin-left: auto; font-size: 12px; font-weight: 400; }
+.adv-toggle .chev { width: 15px; height: 15px; color: var(--text-3); transition: transform 180ms var(--ease); flex: 0 0 auto; }
+.adv-toggle.open .chev { transform: rotate(180deg); }
 
 .install-box p { margin: 0 0 12px; font-size: 13.5px; }
-.cmd { margin: 0 0 14px; padding: 14px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); overflow-x: auto; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
+.cmd { margin: 0 0 14px; padding: 14px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
 .tips { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-2); line-height: 1.55; }
-.tips code { font-family: var(--font-mono); font-size: 12px; padding: 1px 5px; border-radius: 4px; background: var(--surface); }
+.tips code { font-family: var(--mono); font-size: 12px; padding: 1px 5px; border-radius: 4px; background: var(--surface); }
 
-@media (max-width: 960px) {
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 860px) {
+  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; margin-bottom: 24px; }
+  .toolbar { flex-direction: column-reverse; align-items: stretch; gap: 8px; }
+  .search { width: 100%; height: 36px; background: var(--surface-hover); }
   .card { grid-template-columns: 1fr; }
   .card-actions { justify-content: flex-start; }
 }
-@media (max-width: 560px) {
-  .two-col { grid-template-columns: 1fr; }
+@media (max-width: 520px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
 }
 </style>

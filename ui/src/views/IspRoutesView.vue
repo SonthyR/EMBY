@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { ArrowUpToLine, Database, Download, GripVertical, RefreshCw, Search, Trash2 } from '@lucide/vue'
+import { ArrowUpToLine, Database, Download, GripVertical, RefreshCw, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
@@ -350,10 +350,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
         </div>
 
         <form class="test-bar" @submit.prevent="runLookup()">
-          <label class="test-input">
-            <Search />
-            <input v-model="testIP" placeholder="输入 IP 地址，例如 114.114.114.114 或 223.5.5.5" />
-          </label>
+          <input v-model="testIP" class="input mono test-input" placeholder="输入 IP 地址，例如 202.96.128.86 或 221.179.155.161" />
           <UiButton type="submit" variant="primary" :loading="testing">测试分流</UiButton>
           <div class="samples">
             <button type="button" @click="runLookup('202.96.128.86')">电信示例</button>
@@ -530,9 +527,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .card-panel { padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); }
 
 .test-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.test-input { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 240px; height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text-3); }
-.test-input svg { width: 15px; height: 15px; }
-.test-input input { flex: 1; border: 0; background: transparent; color: var(--text); font-size: 13.5px; outline: none; font-family: var(--font-mono); }
+.test-input { flex: 1; min-width: 240px; }
 
 .samples { display: flex; gap: 6px; flex-wrap: wrap; }
 .samples button { height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-2); font-size: 12px; cursor: pointer; }

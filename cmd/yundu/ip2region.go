@@ -107,9 +107,20 @@ func classifyISPGroup(isp string) string {
 	}
 }
 
+// isISOCountryCode reports whether s is a 2-letter uppercase ASCII ISO 3166-1
+// country code (e.g. "CN", "US", "HK") appended as the trailing column in
+// modern ip2region v4/v6 databases (Country|Province|City|ISP|ISO).
+func isISOCountryCode(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	return s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z'
+}
+
 // parseIP2RegionRaw parses ip2region's pipe-delimited record into a clean region
-// label and ISP name. Supports both 5-field (Country|Area|Province|City|ISP)
-// and 4-field (Country|Province|City|ISP) schemas.
+// label and ISP name. Supports modern 5-field (Country|Province|City|ISP|ISO),
+// legacy 5-field (Country|Area|Province|City|ISP), and 4-field
+// (Country|Province|City|ISP) schemas.
 func parseIP2RegionRaw(raw string) ip2regionResult {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -122,6 +133,12 @@ func parseIP2RegionRaw(raw string) ip2regionResult {
 			return ""
 		}
 		return s
+	}
+	// Modern ip2region_v4.xdb / ip2region_v6.xdb append a 2-letter ISO country
+	// code as the final column (e.g. "中国|北京市|北京市|移动|CN"). Strip it so
+	// the preceding column is parsed as ISP rather than Region.
+	if len(fields) >= 5 && isISOCountryCode(clean(fields[len(fields)-1])) {
+		fields = fields[:len(fields)-1]
 	}
 	var regionParts []string
 	var isp string

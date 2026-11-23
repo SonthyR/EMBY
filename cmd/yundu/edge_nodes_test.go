@@ -134,13 +134,13 @@ func TestIP2RegionXDBv4Andv6AndISPClassification(t *testing.T) {
 	v4Data := buildSyntheticXDB(t, xdbIPv4VersionNo, []testXDBSegment{
 		{start: netip.MustParseAddr("1.2.3.0"), end: netip.MustParseAddr("1.2.3.255"), region: "中国|0|广东省|深圳市|电信"},
 		{start: netip.MustParseAddr("5.6.7.0"), end: netip.MustParseAddr("5.6.7.255"), region: "中国|0|上海市|上海市|联通"},
-		{start: netip.MustParseAddr("9.10.11.0"), end: netip.MustParseAddr("9.10.11.255"), region: "中国|0|北京市|北京市|移动"},
-		{start: netip.MustParseAddr("8.8.8.0"), end: netip.MustParseAddr("8.8.8.255"), region: "美国|0|0|0|Google"},
+		{start: netip.MustParseAddr("9.10.11.0"), end: netip.MustParseAddr("9.10.11.255"), region: "中国|北京市|北京市|移动|CN"},
+		{start: netip.MustParseAddr("8.8.8.0"), end: netip.MustParseAddr("8.8.8.255"), region: "美国|0|0|Google|US"},
 	})
 	v6Data := buildSyntheticXDB(t, xdbIPv6VersionNo, []testXDBSegment{
-		{start: netip.MustParseAddr("240e:100::"), end: netip.MustParseAddr("240e:100::ffff"), region: "中国|0|广东省|广州市|电信"},
-		{start: netip.MustParseAddr("2408:200::"), end: netip.MustParseAddr("2408:200::ffff"), region: "中国|0|浙江省|杭州市|联通"},
-		{start: netip.MustParseAddr("2409:300::"), end: netip.MustParseAddr("2409:300::ffff"), region: "中国|0|江苏省|南京市|移动"},
+		{start: netip.MustParseAddr("240e:100::"), end: netip.MustParseAddr("240e:100::ffff"), region: "中国|广东省|广州市|电信|CN"},
+		{start: netip.MustParseAddr("2408:200::"), end: netip.MustParseAddr("2408:200::ffff"), region: "中国|浙江省|杭州市|联通|CN"},
+		{start: netip.MustParseAddr("2409:300::"), end: netip.MustParseAddr("2409:300::ffff"), region: "中国|江苏省|南京市|移动|CN"},
 	})
 
 	mirror1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
