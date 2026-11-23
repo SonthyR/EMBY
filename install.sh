@@ -2984,7 +2984,9 @@ start_pre() {
 }
 RCEOF
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$svc_tmp" "/etc/init.d/${AGENT_SERVICE_NAME}"
-    command -v rc-update >/dev/null 2>&1 && as_root rc-update add "$AGENT_SERVICE_NAME" default >/dev/null 2>&1 || true
+    if command -v rc-update >/dev/null 2>&1; then
+        as_root rc-update add "$AGENT_SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
 }
 
 do_agent() (
@@ -3002,7 +3004,9 @@ do_agent() (
         fi
         if is_openrc && [ -f "/etc/init.d/${AGENT_SERVICE_NAME}" ]; then
             as_root rc-service "$AGENT_SERVICE_NAME" stop 2>/dev/null || true
-            command -v rc-update >/dev/null 2>&1 && as_root rc-update del "$AGENT_SERVICE_NAME" default 2>/dev/null || true
+            if command -v rc-update >/dev/null 2>&1; then
+                as_root rc-update del "$AGENT_SERVICE_NAME" default 2>/dev/null || true
+            fi
             as_root rm -f -- "/etc/init.d/${AGENT_SERVICE_NAME}"
         fi
         as_root rm -rf -- "$AGENT_CONFIG_DIR"
