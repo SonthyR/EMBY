@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Check, Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X } from '@lucide/vue'
+import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X, GripVertical, Plus, ArrowUpToLine } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
@@ -25,9 +25,23 @@ const draftSites = ref<DraftSite[]>([])
 const baselineAccounts = ref<Record<number, number>>({})
 const busy = ref('')
 const reveal = ref(false)
+const draggingIdx = ref<number | null>(null)
+const dragOverIdx = ref<number | null>(null)
+const dragListEl = ref<HTMLElement | null>(null)
 let detailReqGen = 0
 
 const siteMap = computed(() => new Map(props.sites.map(s => [s.id, s])))
+
+const assignedSites = computed(() =>
+  draftSites.value
+    .map(d => ({ draft: d, site: siteMap.value.get(d.site_id) }))
+    .filter((entry): entry is { draft: DraftSite; site: Site } => !!entry.site),
+)
+
+const unassignedSites = computed(() => {
+  const assignedSet = new Set(draftSites.value.map(d => d.site_id))
+  return props.sites.filter(s => !assignedSet.has(s.id))
+})
 
 function syncDraftSites(u: ShareUser | null) {
   const next: DraftSite[] = []
@@ -134,31 +148,38 @@ async function copyRouteURL() {
   if (url && (await copyText(url))) toast.success('专属地址已复制')
 }
 
-function assignedIndex(siteId: number): number {
-  return draftSites.value.findIndex(s => s.site_id === siteId)
+function addDraftSite(site: Site) {
+  if (busy.value) return
+  if (draftSites.value.some(d => d.site_id === site.id)) return
+  const acct = baselineAccounts.value[site.id] || 0
+  draftSites.value = [...draftSites.value, { site_id: site.id, site_account_id: acct }]
 }
 
-function toggleDraftSite(site: Site) {
-  const idx = assignedIndex(site.id)
-  if (idx >= 0) {
-    const remaining = draftSites.value.filter(s => s.site_id !== site.id)
-    if (!remaining.length) {
-      toast.error('至少保留一个源站')
-      return
-    }
-    if (
-      detail.value?.route_prefix &&
-      site.enabled &&
-      !remaining.some(item => siteMap.value.get(item.site_id)?.enabled)
-    ) {
-      toast.error('专属入口账号至少保留一个已启用源站')
-      return
-    }
-    draftSites.value = remaining
-  } else {
-    const acct = baselineAccounts.value[site.id] || 0
-    draftSites.value = [...draftSites.value, { site_id: site.id, site_account_id: acct }]
+function removeDraftSite(site: Site) {
+  if (busy.value) return
+  const remaining = draftSites.value.filter(s => s.site_id !== site.id)
+  if (!remaining.length) {
+    toast.error('至少保留一个源站')
+    return
   }
+  if (
+    detail.value?.route_prefix &&
+    site.enabled &&
+    !remaining.some(item => siteMap.value.get(item.site_id)?.enabled)
+  ) {
+    toast.error('专属入口账号至少保留一个已启用源站')
+    return
+  }
+  draftSites.value = remaining
+}
+
+function reorderDraft(fromIndex: number, toIndex: number) {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return
+  if (fromIndex >= draftSites.value.length || toIndex >= draftSites.value.length) return
+  const next = [...draftSites.value]
+  const [moved] = next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, moved)
+  draftSites.value = next
 }
 
 function promoteDraftSite(siteId: number) {
@@ -166,9 +187,62 @@ function promoteDraftSite(siteId: number) {
     toast.error('已停用的源站无法设为首选生效站')
     return
   }
-  const existing = draftSites.value.find(s => s.site_id === siteId)
-  const target: DraftSite = existing || { site_id: siteId, site_account_id: baselineAccounts.value[siteId] || 0 }
-  draftSites.value = [target, ...draftSites.value.filter(s => s.site_id !== siteId)]
+  const idx = draftSites.value.findIndex(s => s.site_id === siteId)
+  if (idx > 0) reorderDraft(idx, 0)
+}
+
+function onDragStart(index: number, event: DragEvent) {
+  if (busy.value || draftSites.value.length < 2) return
+  draggingIdx.value = index
+  dragOverIdx.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+
+function onDragOver(index: number, event: DragEvent) {
+  event.preventDefault()
+  if (draggingIdx.value === null) return
+  dragOverIdx.value = index
+  if (draggingIdx.value !== index) {
+    reorderDraft(draggingIdx.value, index)
+    draggingIdx.value = index
+  }
+}
+
+function onDragEnd() {
+  draggingIdx.value = null
+  dragOverIdx.value = null
+}
+
+function onTouchStart(index: number) {
+  if (busy.value || draftSites.value.length < 2) return
+  draggingIdx.value = index
+  dragOverIdx.value = index
+}
+
+function onTouchMove(event: TouchEvent) {
+  if (draggingIdx.value === null || !dragListEl.value) return
+  const touch = event.touches[0]
+  if (!touch) return
+  const rows = Array.from(dragListEl.value.querySelectorAll<HTMLElement>('[data-drag-row]'))
+  for (let i = 0; i < rows.length; i++) {
+    const rect = rows[i].getBoundingClientRect()
+    if (touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
+      dragOverIdx.value = i
+      if (i !== draggingIdx.value) {
+        reorderDraft(draggingIdx.value, i)
+        draggingIdx.value = i
+      }
+      break
+    }
+  }
+}
+
+function onTouchEnd() {
+  draggingIdx.value = null
+  dragOverIdx.value = null
 }
 
 function resetDraftSites() {
@@ -178,7 +252,11 @@ function resetDraftSites() {
 async function saveSites() {
   const u = detail.value
   if (!u || !draftSites.value.length) return
-  const ok = await run('sites', () => shareApi.update(u.id, shareUserToInput(u, { sites: draftSites.value })), '源站分配已更新')
+  if (u.route_prefix && draftSites.value.length > 0 && !siteMap.value.get(draftSites.value[0].site_id)?.enabled) {
+    toast.error('首选生效 Emby 源站必须为已启用状态，请拖入已启用的源站到首位')
+    return
+  }
+  const ok = await run('sites', () => shareApi.update(u.id, shareUserToInput(u, { sites: draftSites.value })), '首选 Emby 服与源站分配已保存')
   if (ok && detail.value?.id === u.id) {
     syncDraftSites(detail.value)
   }
@@ -186,11 +264,14 @@ async function saveSites() {
 </script>
 
 <template>
-  <UiDrawer :open="open" :width="460" @close="emit('close')">
+  <UiDrawer :open="open" :width="470" @close="emit('close')">
     <template #title>
       <div v-if="detail" class="title">
         <h2>{{ detail.username }}</h2>
-        <span class="state"><span class="dot" :class="STATUS_TONE[detail.status]" />{{ STATUS_LABEL[detail.status] }}</span>
+        <span class="status-pill" :class="STATUS_TONE[detail.status]">
+          <span class="dot" :class="STATUS_TONE[detail.status]" />
+          {{ STATUS_LABEL[detail.status] }}
+        </span>
       </div>
     </template>
 
@@ -200,9 +281,9 @@ async function saveSites() {
         <UiButton icon aria-label="编辑" title="编辑" :disabled="!!busy" @click="emit('edit')"><Pencil /></UiButton>
       </div>
 
-      <section class="usage">
+      <section class="usage-card">
         <div class="big num">{{ formatBytes(detail.traffic_used) }}</div>
-        <div class="faint">{{ detail.traffic_quota ? `共 ${formatBytes(detail.traffic_quota)}` : '流量不限' }}<template v-if="detail.next_reset_at"> · {{ detail.next_reset_at }} 重置</template></div>
+        <div class="faint">{{ detail.traffic_quota ? `总额度 ${formatBytes(detail.traffic_quota)}` : '流量不限' }}<template v-if="detail.next_reset_at"> · {{ detail.next_reset_at }} 重置</template></div>
         <UiProgress v-if="detail.traffic_quota" :value="detail.traffic_used" :max="detail.traffic_quota" />
       </section>
 
@@ -216,64 +297,117 @@ async function saveSites() {
         </div>
         <div v-if="detail.route_prefix && detail.active_site_name">
           <dt>当前生效</dt>
-          <dd>{{ detail.active_site_name }}</dd>
+          <dd><span class="active-chip">{{ detail.active_site_name }}</span></dd>
         </div>
-        <div><dt>到期</dt><dd>{{ expiry.text }}<span v-if="expiry.sub" class="faint"> · {{ expiry.sub }}</span></dd></div>
+        <div><dt>到期时间</dt><dd>{{ expiry.text }}<span v-if="expiry.sub" class="faint"> · {{ expiry.sub }}</span></dd></div>
         <div><dt>在线设备</dt><dd class="num">{{ detail.session_count }}{{ detail.max_devices ? ` / ${detail.max_devices} 台` : ' 台' }}</dd></div>
-        <div><dt>限速</dt><dd>{{ detail.speed_limit ? `${detail.speed_limit} Mbps` : '不限' }}</dd></div>
+        <div><dt>全局限速</dt><dd>{{ detail.speed_limit ? `${detail.speed_limit} Mbps` : '不限' }}</dd></div>
         <div>
-          <dt>密码</dt>
+          <dt>登录密码</dt>
           <dd class="secret">
             <span class="mono">{{ reveal ? detail.password || '无法读取' : '••••••••' }}</span>
             <button type="button" :aria-label="reveal ? '隐藏' : '显示'" @click="reveal = !reveal"><EyeOff v-if="reveal" /><Eye v-else /></button>
             <button v-if="detail.password" type="button" aria-label="复制密码" @click="copyPassword"><Copy /></button>
           </dd>
         </div>
-        <div v-if="detail.note"><dt>备注</dt><dd>{{ detail.note }}</dd></div>
+        <div v-if="detail.note"><dt>备注信息</dt><dd>{{ detail.note }}</dd></div>
       </dl>
 
       <section class="block sites-block">
         <div class="block-head">
-          <h3>分配源站</h3>
-          <span v-if="detail.route_prefix && draftSites.length > 1" class="faint hint">首位为首选生效源站</span>
+          <h3>首选 Emby 服与源站优先级</h3>
+          <span class="faint hint">{{ assignedSites.length > 1 ? '按住拖拽排序 · 第 1 位为首选' : '点击下方可继续添加' }}</span>
         </div>
-        <div v-if="sites.length" class="site-list">
+
+        <div
+          v-if="assignedSites.length"
+          ref="dragListEl"
+          class="drag-list"
+          @touchmove.prevent="onTouchMove"
+          @touchend="onTouchEnd"
+          @touchcancel="onTouchEnd"
+        >
           <div
-            v-for="site in sites"
+            v-for="({ site }, index) in assignedSites"
             :key="site.id"
-            class="site-row"
-            :class="{ on: assignedIndex(site.id) >= 0, off: !site.enabled }"
+            data-drag-row
+            class="drag-row"
+            :class="{
+              first: index === 0,
+              off: !site.enabled,
+              draggable: assignedSites.length > 1 && !busy,
+              dragging: draggingIdx === index,
+              over: dragOverIdx === index && draggingIdx !== null && draggingIdx !== index,
+            }"
+            :draggable="assignedSites.length > 1 && !busy"
+            @dragstart="onDragStart(index, $event)"
+            @dragover="onDragOver(index, $event)"
+            @dragend="onDragEnd"
           >
-            <button
-              type="button"
-              class="site-toggle"
-              :disabled="!!busy"
-              @click="toggleDraftSite(site)"
+            <span
+              class="grip"
+              :title="assignedSites.length > 1 ? '按住拖拽调整顺序' : ''"
+              @touchstart.stop="onTouchStart(index)"
             >
-              <span class="site-check" :class="{ checked: assignedIndex(site.id) >= 0 }">
-                <Check v-if="assignedIndex(site.id) >= 0" />
-              </span>
+              <GripVertical />
+            </span>
+            <span class="rank-pill num" :class="{ primary: index === 0 }">
+              {{ index === 0 ? '首选' : `#${index + 1}` }}
+            </span>
+            <div class="site-info">
               <span class="site-name" :title="site.name">{{ site.name }}</span>
               <span v-if="!site.enabled" class="off-tag">停用</span>
-              <span v-else-if="detail.route_prefix && detail.active_site_id === site.id && assignedIndex(site.id) >= 0" class="active-tag">生效</span>
-              <span v-else-if="detail.route_prefix && draftSites.length > 1 && assignedIndex(site.id) === 0" class="prio-tag">首选</span>
-            </button>
-            <button
-              v-if="detail.route_prefix && draftSites.length > 1 && assignedIndex(site.id) > 0 && site.enabled"
-              type="button"
-              class="pin-btn"
-              :disabled="!!busy"
-              title="设为首选生效源站"
-              @click="promoteDraftSite(site.id)"
-            >
-              设为生效
-            </button>
+              <span v-else-if="detail.route_prefix && detail.active_site_id === site.id && !sitesDirty" class="active-tag">生效中</span>
+            </div>
+            <div class="row-tools">
+              <button
+                v-if="index > 0 && site.enabled"
+                type="button"
+                class="tool-btn"
+                :disabled="!!busy"
+                title="一键置顶为首选"
+                aria-label="置顶为首选"
+                @click="promoteDraftSite(site.id)"
+              >
+                <ArrowUpToLine />
+              </button>
+              <button
+                type="button"
+                class="tool-btn remove"
+                :disabled="!!busy"
+                title="移出该源站"
+                aria-label="移出该源站"
+                @click="removeDraftSite(site)"
+              >
+                <X />
+              </button>
+            </div>
           </div>
         </div>
         <p v-else class="faint none">{{ detail.sites.map(s => s.site_name).join('、') || '暂无可用源站' }}</p>
+
+        <div v-if="unassignedSites.length" class="unassigned-wrap">
+          <span class="unassigned-label">可添加其他 Emby 源站</span>
+          <div class="unassigned-chips">
+            <button
+              v-for="site in unassignedSites"
+              :key="site.id"
+              type="button"
+              class="add-chip"
+              :class="{ off: !site.enabled }"
+              :disabled="!!busy"
+              @click="addDraftSite(site)"
+            >
+              <Plus />
+              <span>{{ site.name }}</span>
+              <small v-if="!site.enabled">停用</small>
+            </button>
+          </div>
+        </div>
+
         <div v-if="sitesDirty" class="site-save-bar">
-          <UiButton size="sm" variant="primary" :loading="busy === 'sites'" :disabled="!!busy && busy !== 'sites'" @click="saveSites">保存源站分配</UiButton>
-          <UiButton size="sm" variant="ghost" :disabled="!!busy" @click="resetDraftSites">取消</UiButton>
+          <UiButton size="sm" variant="accent" :loading="busy === 'sites'" :disabled="!!busy && busy !== 'sites'" @click="saveSites">保存源站顺序</UiButton>
+          <UiButton size="sm" variant="ghost" :disabled="!!busy" @click="resetDraftSites">取消更改</UiButton>
         </div>
       </section>
 
@@ -309,7 +443,7 @@ async function saveSites() {
       </section>
 
       <section class="block">
-        <h3>管理</h3>
+        <h3>账号管理</h3>
         <div class="menu">
           <button type="button" :disabled="!!busy" @click="renew(30)">续期 30 天<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="renew(365)">续期 1 年<ChevronRight /></button>
@@ -324,66 +458,229 @@ async function saveSites() {
 </template>
 
 <style scoped>
-.title { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.title h2 { margin: 0; font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.state { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
-.primary-actions { display: flex; gap: 8px; margin-bottom: 24px; }
+.title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.title h2 { margin: 0; font-size: 17px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.status-pill.good { background: var(--good-soft); color: var(--good); }
+.status-pill.warn { background: var(--warn-soft); color: var(--warn); }
+.status-pill.bad { background: var(--bad-soft); color: var(--bad); }
+
+.primary-actions { display: flex; gap: 8px; margin-bottom: 18px; }
 .primary-actions > :first-child { flex: 1; }
-.usage { display: flex; flex-direction: column; gap: 6px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
-.big { font-size: 30px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.15; }
-.usage .faint { font-size: 13px; margin-bottom: 6px; }
-.props { margin: 0; padding: 8px 0; border-bottom: 1px solid var(--border); }
-.props div { display: flex; gap: 16px; padding: 9px 0; font-size: 13.5px; }
-.props dt { flex: 0 0 72px; color: var(--text-3); }
+
+.usage-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+.big { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.15; }
+.usage-card .faint { font-size: 12.5px; margin-bottom: 4px; }
+
+.props { margin: 0; padding: 6px 0 12px; border-bottom: 1px solid var(--border); }
+.props div { display: flex; align-items: center; gap: 14px; padding: 8px 0; font-size: 13.5px; }
+.props dt { flex: 0 0 72px; color: var(--text-3); font-size: 12.5px; }
 .props dd { flex: 1; margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.active-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
 .secret { display: flex; align-items: center; gap: 4px; }
 .secret .mono { flex: 1; }
-.secret button { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; }
+.secret button { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .secret button:hover { background: var(--surface-hover); color: var(--text); }
 .secret svg { width: 14px; height: 14px; }
+
 .block { padding-top: 20px; }
-.block-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.block-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .block-head h3 { margin: 0; }
 .hint { font-size: 11.5px; }
-h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
-.sites-block { padding-bottom: 18px; border-bottom: 1px solid var(--border); }
-.site-list { display: flex; flex-direction: column; gap: 6px; }
-.site-row { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
-.site-row:hover { border-color: var(--text-3); }
-.site-row.on { border-color: color-mix(in srgb, var(--text) 32%, var(--border)); background: var(--surface); }
-.site-row.off { opacity: 0.65; }
-.site-toggle { flex: 1; min-width: 0; height: 34px; display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--text-2); font-size: 13px; text-align: left; cursor: pointer; }
-.site-row.on .site-toggle { color: var(--text); font-weight: 500; }
-.site-toggle:disabled { opacity: 0.55; cursor: default; }
-.site-check { width: 15px; height: 15px; flex: 0 0 15px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); color: var(--bg); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
-.site-check.checked { border-color: var(--text); background: var(--text); }
-.site-check svg { width: 11px; height: 11px; }
-.site-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.active-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--good-soft); color: var(--good); font-weight: 500; }
-.prio-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-weight: 500; }
-.off-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-weight: 500; }
-.pin-btn { flex: 0 0 auto; height: 24px; padding: 0 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elev); color: var(--text-2); font-size: 11.5px; cursor: pointer; white-space: nowrap; }
-.pin-btn:hover:not(:disabled) { border-color: var(--text); color: var(--text); }
-.pin-btn:disabled { opacity: 0.5; cursor: default; }
-.site-save-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
-.devices { margin: 0; padding: 0; list-style: none; }
-.devices li { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
-.devices li:last-child { border-bottom: 0; }
+h3 { margin: 0 0 10px; font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+
+.sites-block { padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+.drag-list { display: flex; flex-direction: column; gap: 8px; }
+.drag-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  user-select: none;
+  transition: transform 160ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease), box-shadow 160ms var(--ease), opacity 160ms var(--ease);
+}
+.drag-row.draggable { cursor: grab; }
+.drag-row.draggable:active { cursor: grabbing; }
+.drag-row.first {
+  background: linear-gradient(90deg, var(--accent-soft) 0%, var(--surface) 75%);
+  border-color: var(--accent-border);
+}
+.drag-row.off { opacity: 0.62; }
+.drag-row.dragging {
+  opacity: 0.55;
+  transform: scale(0.985);
+  border-style: dashed;
+  border-color: var(--accent);
+}
+.drag-row.over {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.grip {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  touch-action: none;
+  flex: 0 0 auto;
+}
+.grip svg { width: 15px; height: 15px; }
+.rank-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+.rank-pill.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+.site-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.site-name { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.active-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: var(--good-soft); color: var(--good); font-weight: 600; }
+.off-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: var(--bad-soft); color: var(--bad); font-weight: 600; }
+
+.row-tools { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; }
+.tool-btn {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tool-btn:hover:not(:disabled) { background: var(--surface); color: var(--accent); }
+.tool-btn.remove:hover:not(:disabled) { background: var(--bad-soft); color: var(--bad); }
+.tool-btn:disabled { opacity: 0.4; cursor: default; }
+.tool-btn svg { width: 14px; height: 14px; }
+
+.unassigned-wrap { margin-top: 12px; display: flex; flex-direction: column; gap: 7px; }
+.unassigned-label { font-size: 11.5px; color: var(--text-3); }
+.unassigned-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.add-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.add-chip:hover:not(:disabled) { border-style: solid; border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.add-chip.off { opacity: 0.6; }
+.add-chip svg { width: 13px; height: 13px; }
+.add-chip small { font-size: 10.5px; color: var(--bad); }
+
+.site-save-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+}
+
+.devices { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.devices li {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13px;
+}
 .devices svg { width: 16px; height: 16px; color: var(--text-3); flex: 0 0 16px; }
-.devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.devices small { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; vertical-align: 1px; background: var(--surface); color: var(--text-2); }
+.devices div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.devices small { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 10.5px; font-weight: 600; vertical-align: 1px; background: var(--surface); color: var(--text-2); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.good { background: var(--good-soft); color: var(--good); }
-.kick-one { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; flex: 0 0 26px; }
-.kick-one:hover:not(:disabled) { background: var(--surface-hover); color: var(--bad); }
+.kick-one { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; flex: 0 0 26px; }
+.kick-one:hover:not(:disabled) { background: var(--bad-soft); color: var(--bad); }
 .kick-one:disabled { opacity: 0.4; cursor: default; }
 .kick-one svg { width: 14px; height: 14px; color: inherit; }
 .none { margin: 0; font-size: 13px; }
-.menu { display: flex; flex-direction: column; margin: 0 -10px; }
-.menu button { display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; border: 0; border-radius: var(--radius-sm); background: transparent; font-size: 13.5px; text-align: left; cursor: pointer; }
+
+.menu { display: flex; flex-direction: column; gap: 4px; }
+.menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
 .menu button:hover:not(:disabled) { background: var(--surface-hover); }
 .menu button:disabled { opacity: 0.4; cursor: default; }
 .menu svg { width: 15px; height: 15px; color: var(--text-3); }
 .menu .danger { color: var(--bad); }
+.menu .danger:hover:not(:disabled) { background: var(--bad-soft); }
 </style>

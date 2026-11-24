@@ -1003,22 +1003,22 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .st-wrap { display: flex; flex-direction: column; gap: 16px; }
-.st-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--border); }
-.st-tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 38px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; cursor: pointer; }
-.st-tabs button.on { color: var(--text); font-weight: 500; }
-.st-tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.st-tabs { display: inline-flex; align-self: flex-start; gap: 3px; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); }
+.st-tabs button { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px; border: 0; border-radius: 999px; background: transparent; color: var(--text-2); font-size: 13px; font-weight: 500; cursor: pointer; transition: all var(--dur) var(--ease); }
+.st-tabs button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
+.st-tabs button.on .ico { color: var(--accent); }
 .st-tabs .ico { width: 15px; height: 15px; }
 
-.controls-box { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.controls-box { display: flex; flex-direction: column; gap: 14px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .row-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .target-field { min-width: 0; margin: 0; padding: 0; border: 0; }
 .target-field legend { margin-bottom: 6px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }
-.target-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.target-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; padding: 3px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
 .target-options label { position: relative; min-width: 0; cursor: pointer; }
 .target-options input { position: absolute; width: 1px; height: 1px; opacity: 0; }
-.target-options span { display: grid; place-items: center; min-height: 29px; padding: 3px 6px; border-radius: var(--radius-xs); color: var(--text-2); font-size: 13px; text-align: center; }
-.target-options input:checked + span { background: var(--bg-elev); color: var(--text); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
-.target-options input:focus-visible + span { outline: 2px solid var(--text-2); outline-offset: -2px; }
+.target-options span { display: grid; place-items: center; min-height: 30px; padding: 3px 8px; border-radius: 999px; color: var(--text-2); font-size: 13px; font-weight: 500; text-align: center; transition: all var(--dur) var(--ease); }
+.target-options input:checked + span { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.target-options input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
 .target-field:disabled .target-options { opacity: 0.6; }
 .target-field:disabled .target-options label { cursor: default; }
 .picker { display: flex; flex-direction: column; gap: 8px; }
@@ -1030,9 +1030,9 @@ onBeforeUnmount(() => {
 .link-btn:disabled { opacity: 0.45; cursor: default; }
 
 .chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip { height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elev); color: var(--text-2); font-size: 12px; cursor: pointer; }
-.chip.on { border-color: var(--text); background: var(--surface); color: var(--text); font-weight: 500; }
-.chip.isp.on { border-color: var(--good); color: var(--good); background: var(--good-soft); }
+.chip { height: 28px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text-2); font-size: 12px; font-weight: 500; cursor: pointer; transition: all var(--dur) var(--ease); }
+.chip.on { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.chip.isp.on { border-color: color-mix(in srgb, var(--good) 40%, transparent); color: var(--good); background: var(--good-soft); }
 
 .include-custom { display: inline-flex; align-items: center; align-self: flex-start; gap: 6px; color: var(--text-2); font-size: 12.5px; }
 .custom-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--border); }

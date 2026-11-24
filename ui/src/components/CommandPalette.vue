@@ -23,8 +23,12 @@ const commands = computed<Command[]>(() => [
   { id: 'go-dashboard', group: '前往', label: '仪表盘', hint: 'G D', run: () => router.push('/dashboard') },
   { id: 'go-sites', group: '前往', label: '站点', hint: 'G S', run: () => router.push('/sites') },
   { id: 'go-share', group: '前往', label: '分享账号', hint: 'G U', run: () => router.push('/share') },
-  { id: 'go-logs', group: '前往', label: '日志', run: () => router.push('/logs') },
-  { id: 'go-settings', group: '前往', label: '设置', run: () => router.push('/settings') },
+  { id: 'go-nodes', group: '前往', label: '从机节点', run: () => router.push('/nodes') },
+  { id: 'go-routes', group: '前往', label: '运营商线路', run: () => router.push('/routes') },
+  { id: 'go-logs', group: '前往', label: '系统日志', run: () => router.push('/logs') },
+  { id: 'go-diagnostics', group: '前往', label: '连接诊断', run: () => router.push('/diagnostics') },
+  { id: 'go-settings', group: '前往', label: '系统设置', run: () => router.push('/settings') },
+  { id: 'go-account', group: '前往', label: '管理员账户', run: () => router.push('/account') },
   { id: 'new-share', group: '操作', label: '新建分享账号', hint: 'N', run: () => router.push({ path: '/share', query: { new: '1' } }) },
   { id: 'new-site', group: '操作', label: '添加站点', run: () => router.push({ path: '/sites', query: { new: '1' } }) },
   { id: 'theme', group: '操作', label: '切换主题', run: cycleTheme },
@@ -129,14 +133,15 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onGlobal))
 </template>
 
 <style scoped>
-.layer { position: fixed; inset: 0; z-index: 150; display: flex; justify-content: center; padding-top: 14vh; background: var(--overlay); }
-.palette { width: min(560px, calc(100% - 24px)); height: fit-content; background: var(--bg-elev); border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden; }
-.search { display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 1px solid var(--border); }
-.search svg { width: 17px; height: 17px; color: var(--text-3); }
-.search input { flex: 1; height: 52px; border: 0; background: transparent; outline: none; font-size: 15px; }
-.list { max-height: 360px; overflow: auto; margin: 0; padding: 6px; list-style: none; }
-.list li { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 14px; }
-.list li.active { background: var(--surface-hover); }
+.layer { position: fixed; inset: 0; z-index: 150; display: flex; justify-content: center; padding-top: 13vh; background: var(--overlay); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.palette { width: min(560px, calc(100% - 24px)); height: fit-content; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden; }
+.search { display: flex; align-items: center; gap: 10px; padding: 0 18px; border-bottom: 1px solid var(--border); }
+.search svg { width: 17px; height: 17px; color: var(--accent); }
+.search input { flex: 1; height: 54px; border: 0; background: transparent; outline: none; font-size: 15px; }
+.list { max-height: 360px; overflow: auto; margin: 0; padding: 8px; list-style: none; }
+.list li { display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 13.5px; transition: background var(--dur) var(--ease); }
+.list li.active { background: var(--accent-soft); color: var(--text); }
+.list li.active .enter { color: var(--accent); }
 .group { width: 36px; font-size: 12px; color: var(--text-3); }
 .label { flex: 1; }
 .hint { display: flex; gap: 3px; }

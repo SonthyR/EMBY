@@ -150,93 +150,103 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 
 <template>
   <div>
-    <PageHeader title="分享账号" description="给朋友发放登录账号，服务器会用你的源站账号代为登录。">
+    <PageHeader title="分享账号" description="给朋友发放登录账号，服务器会用你的源站账号代为登录。点击账号可拖拽调整首选 Emby 服。">
       <div class="head-acts">
         <UiButton :variant="viewMode === 'codes' ? 'primary' : 'secondary'" @click="viewMode = viewMode === 'codes' ? 'users' : 'codes'">
           <Ticket />{{ viewMode === 'codes' ? '返回账号列表' : '兑换码' }}
         </UiButton>
-        <UiButton v-if="viewMode === 'users'" variant="primary" @click="openCreate"><Plus />新建<kbd class="kbd-on-inverse">N</kbd></UiButton>
+        <UiButton v-if="viewMode === 'users'" variant="primary" @click="openCreate"><Plus />新建账号<kbd class="kbd-on-inverse">N</kbd></UiButton>
       </div>
     </PageHeader>
 
     <RedeemCodesPanel v-if="viewMode === 'codes'" :sites="sites" />
 
     <template v-else>
-    <dl class="stats">
-      <div><dt>账号</dt><dd class="num">{{ counts.all }}</dd></div>
-      <div><dt>正常</dt><dd class="num">{{ counts.active }}</dd></div>
-      <div><dt>在线设备</dt><dd class="num">{{ online }}</dd></div>
-      <div><dt>本周期流量</dt><dd class="num">{{ formatBytes(traffic) }}</dd></div>
-    </dl>
+      <dl class="kpi-grid">
+        <div class="kpi-card"><dt>分享账号</dt><dd class="num">{{ counts.all }}</dd></div>
+        <div class="kpi-card"><dt><span class="dot good" />正常可用</dt><dd class="num">{{ counts.active }}</dd></div>
+        <div class="kpi-card"><dt>在线设备</dt><dd class="num">{{ online }}</dd></div>
+        <div class="kpi-card"><dt>本周期流量</dt><dd class="num">{{ formatBytes(traffic) }}</dd></div>
+      </dl>
 
-    <div class="toolbar">
-      <nav class="tabs" aria-label="按状态筛选">
-        <button v-for="f in FILTERS" :key="f.key" type="button" :class="{ on: filter === f.key }" @click="filter = f.key">
-          {{ f.label }}<span v-if="counts[f.key]" class="n">{{ counts[f.key] }}</span>
-        </button>
-      </nav>
-      <label class="search">
-        <Search />
-        <input v-model="query" data-page-search type="search" placeholder="搜索" aria-label="搜索分享账号" />
-        <kbd>/</kbd>
-      </label>
-    </div>
-
-    <div v-if="loading" class="table">
-      <div v-for="n in 4" :key="n" class="row skeleton"><span /></div>
-    </div>
-    <div v-else-if="loadError" class="empty">
-      <p>{{ loadError }}</p>
-      <UiButton @click="load()">重试</UiButton>
-    </div>
-    <div v-else-if="!users.length" class="empty">
-      <h2>还没有分享账号</h2>
-      <p>新建一个账号发给朋友，他就能在 Emby 客户端里登录你的服务器。</p>
-      <UiButton variant="primary" @click="openCreate"><Plus />新建分享账号</UiButton>
-    </div>
-    <div v-else class="table" role="table" aria-label="分享账号列表">
-      <div class="row head" role="row">
-        <span role="columnheader">账号</span>
-        <span role="columnheader">状态</span>
-        <span role="columnheader">流量</span>
-        <span role="columnheader">剩余</span>
-        <span role="columnheader">设备</span>
-        <span role="columnheader" class="sr-only">操作</span>
-      </div>
-      <TransitionGroup name="list">
-        <div
-          v-for="user in visible"
-          :key="user.id"
-          class="row item"
-          :class="{ active: selectedId === user.id, dim: user.status !== 'active' }"
-          role="row"
-          tabindex="0"
-          @click="selectedId = user.id"
-          @keydown.enter="selectedId = user.id"
-        >
-          <span class="who" role="cell">
-            <span class="name">{{ user.username }}</span>
-            <span class="sub">{{ [user.route_prefix, user.note || user.active_site_name || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
-          </span>
-          <span class="status" role="cell"><span class="dot" :class="STATUS_TONE[user.status]" />{{ STATUS_LABEL[user.status] }}</span>
-          <span class="traffic" role="cell">
-            <span class="num">{{ formatBytes(user.traffic_used) }}<span class="faint"> / {{ user.traffic_quota ? formatBytes(user.traffic_quota) : '∞' }}</span></span>
-            <UiProgress v-if="user.traffic_quota" :value="user.traffic_used" :max="user.traffic_quota" />
-          </span>
-          <span class="num expiry" role="cell" :class="expiryText(user).tone">{{ expiryText(user).text }}</span>
-          <span class="num devices" role="cell">{{ user.session_count }}<span class="faint">{{ user.max_devices ? ` / ${user.max_devices}` : '' }}</span></span>
-          <span class="act" role="cell">
-            <UiButton variant="ghost" size="sm" icon aria-label="复制分享信息" title="复制分享信息" @click.stop="copyShare(user)"><Copy /></UiButton>
-          </span>
-          <span class="mobile-meta" aria-hidden="true">
-            {{ formatBytes(user.traffic_used) }}{{ user.traffic_quota ? ' / ' + formatBytes(user.traffic_quota) : '' }} · {{ expiryText(user).text }} · {{ user.session_count }} 台在线
-          </span>
+      <div class="bento-table-card">
+        <div class="toolbar">
+          <nav class="seg" aria-label="按状态筛选">
+            <button v-for="f in FILTERS" :key="f.key" type="button" :class="{ on: filter === f.key }" @click="filter = f.key">
+              {{ f.label }}<span v-if="counts[f.key]" class="n">{{ counts[f.key] }}</span>
+            </button>
+          </nav>
+          <label class="search">
+            <Search />
+            <input v-model="query" data-page-search type="search" placeholder="搜索账号、备注或源站…" aria-label="搜索分享账号" />
+            <kbd>/</kbd>
+          </label>
         </div>
-      </TransitionGroup>
-      <p v-if="!visible.length" class="none">没有符合条件的账号</p>
-    </div>
 
-    <button type="button" class="fab" aria-label="新建分享账号" @click="openCreate"><Plus /></button>
+        <div v-if="loading" class="table">
+          <div v-for="n in 4" :key="n" class="row skeleton"><span /></div>
+        </div>
+        <div v-else-if="loadError" class="empty">
+          <p>{{ loadError }}</p>
+          <UiButton @click="load()">重试</UiButton>
+        </div>
+        <div v-else-if="!users.length" class="empty">
+          <h2>还没有分享账号</h2>
+          <p>新建一个账号发给朋友，他就能在 Emby 客户端里登录你的服务器。</p>
+          <UiButton variant="primary" @click="openCreate"><Plus />新建分享账号</UiButton>
+        </div>
+        <div v-else class="table" role="table" aria-label="分享账号列表">
+          <div class="row head" role="row">
+            <span role="columnheader">账号与首选 Emby 服</span>
+            <span role="columnheader">状态</span>
+            <span role="columnheader">流量</span>
+            <span role="columnheader">剩余</span>
+            <span role="columnheader">设备</span>
+            <span role="columnheader" class="sr-only">操作</span>
+          </div>
+          <TransitionGroup name="list">
+            <div
+              v-for="user in visible"
+              :key="user.id"
+              class="row item"
+              :class="{ active: selectedId === user.id, dim: user.status !== 'active' }"
+              role="row"
+              tabindex="0"
+              @click="selectedId = user.id"
+              @keydown.enter="selectedId = user.id"
+            >
+              <span class="who" role="cell">
+                <span class="who-top">
+                  <span class="name">{{ user.username }}</span>
+                  <span v-if="user.active_site_name || user.sites[0]?.site_name" class="emby-chip">
+                    {{ user.active_site_name || user.sites[0]?.site_name }}
+                  </span>
+                </span>
+                <span class="sub">{{ [user.route_prefix, user.note || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
+              </span>
+              <span class="status" role="cell">
+                <span class="status-pill" :class="STATUS_TONE[user.status]">
+                  <span class="dot" :class="STATUS_TONE[user.status]" />
+                  {{ STATUS_LABEL[user.status] }}
+                </span>
+              </span>
+              <span class="traffic" role="cell">
+                <span class="num">{{ formatBytes(user.traffic_used) }}<span class="faint"> / {{ user.traffic_quota ? formatBytes(user.traffic_quota) : '∞' }}</span></span>
+                <UiProgress v-if="user.traffic_quota" :value="user.traffic_used" :max="user.traffic_quota" />
+              </span>
+              <span class="num expiry" role="cell" :class="expiryText(user).tone">{{ expiryText(user).text }}</span>
+              <span class="num devices" role="cell">{{ user.session_count }}<span class="faint">{{ user.max_devices ? ` / ${user.max_devices}` : '' }}</span></span>
+              <span class="act" role="cell">
+                <UiButton variant="ghost" size="sm" icon aria-label="复制分享信息" title="复制分享信息" @click.stop="copyShare(user)"><Copy /></UiButton>
+              </span>
+              <span class="mobile-meta" aria-hidden="true">
+                {{ formatBytes(user.traffic_used) }}{{ user.traffic_quota ? ' / ' + formatBytes(user.traffic_quota) : '' }} · {{ expiryText(user).text }} · {{ user.session_count }} 台在线
+              </span>
+            </div>
+          </TransitionGroup>
+          <p v-if="!visible.length" class="none">没有符合条件的账号</p>
+        </div>
+      </div>
     </template>
 
     <ShareUserDetail
@@ -261,67 +271,145 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 
 <style scoped>
 .head-acts { display: flex; align-items: center; gap: 8px; }
-.kbd-on-inverse { margin-left: 4px; border-color: color-mix(in srgb, var(--inverse-text) 25%, transparent); color: color-mix(in srgb, var(--inverse-text) 60%, transparent); }
-.stats { display: flex; gap: 48px; margin: 0 0 32px; }
-.stats div { display: flex; flex-direction: column; gap: 2px; }
-.stats dt { font-size: 12.5px; color: var(--text-3); }
-.stats dd { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+.kbd-on-inverse { margin-left: 4px; background: transparent; border-color: color-mix(in srgb, var(--inverse-text) 28%, transparent); color: color-mix(in srgb, var(--inverse-text) 72%, transparent); }
 
-.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); }
-.tabs { display: flex; gap: 22px; overflow-x: auto; scrollbar-width: none; }
-.tabs::-webkit-scrollbar { display: none; }
-.tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; white-space: nowrap; cursor: pointer; transition: color var(--dur) var(--ease); }
-.tabs button:hover { color: var(--text-2); }
-.tabs button.on { color: var(--text); }
-.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 0 0 18px; }
+.kpi-card { padding: 16px 20px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); display: flex; flex-direction: column; gap: 6px; }
+.kpi-card dt { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.kpi-card dd { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.025em; }
+
+.bento-table-card {
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.seg::-webkit-scrollbar { display: none; }
+.seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
 .n { font-size: 11.5px; color: var(--text-3); }
-.search { display: flex; align-items: center; gap: 8px; width: 220px; height: 30px; padding: 0 8px; border-radius: var(--radius-sm); color: var(--text-3); transition: background var(--dur) var(--ease); }
-.search:focus-within { background: var(--surface-hover); }
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 240px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.search:focus-within { background: var(--surface); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .search svg { width: 14px; height: 14px; }
-.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13.5px; color: var(--text); }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13px; color: var(--text); }
 .search input::placeholder { color: var(--text-3); }
 
-.table { position: relative; }
-.row { display: grid; grid-template-columns: minmax(0, 2.2fr) 100px minmax(0, 1.6fr) 90px 70px 40px; align-items: center; gap: 16px; padding: 0 12px; }
-.row.head { height: 38px; font-size: 12px; color: var(--text-3); }
-.row.item { height: 60px; margin: 0 -12px; padding: 0 24px; border-radius: var(--radius); cursor: pointer; outline: none; transition: background var(--dur) var(--ease); }
+.table { position: relative; padding: 6px 10px 10px; }
+.row { display: grid; grid-template-columns: minmax(0, 2.3fr) 108px minmax(0, 1.5fr) 86px 76px 40px; align-items: center; gap: 14px; padding: 0 12px; }
+.row.head { height: 36px; font-size: 12px; font-weight: 600; color: var(--text-3); }
+.row.item { min-height: 62px; padding: 10px 12px; border-radius: var(--radius-sm); cursor: pointer; outline: none; transition: background var(--dur) var(--ease); }
 .row.item + .row.item { box-shadow: inset 0 1px 0 var(--border); }
-.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-hover); box-shadow: none; }
+.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-2); box-shadow: none; }
 .row.item:hover + .row.item, .row.item.active + .row.item { box-shadow: none; }
 .row.dim .who .name { color: var(--text-2); }
-.who { display: flex; flex-direction: column; min-width: 0; }
-.name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sub { font-size: 12.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+
+.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.who-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.emby-chip {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 23px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.status-pill.good { background: var(--good-soft); color: var(--good); }
+.status-pill.warn { background: var(--warn-soft); color: var(--warn); }
+.status-pill.bad { background: var(--bad-soft); color: var(--bad); }
+
 .traffic { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
-.expiry, .devices { font-size: 13px; }
+.expiry, .devices { font-size: 13px; font-weight: 500; }
 .expiry.warn { color: var(--warn); }
 .expiry.bad { color: var(--bad); }
-.act { opacity: 0; transition: opacity var(--dur) var(--ease); }
+.act { opacity: 0.45; transition: opacity var(--dur) var(--ease); }
 .row.item:hover .act, .row.item.active .act, .row.item:focus-within .act { opacity: 1; }
 .mobile-meta { display: none; }
 .skeleton { height: 60px; }
-.skeleton span { grid-column: 1 / -1; height: 14px; width: 40%; border-radius: 4px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
+.skeleton span { grid-column: 1 / -1; height: 14px; width: 42%; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.4; } }
-.none { padding: 32px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
-.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; text-align: center; }
-.empty h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.none { padding: 36px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 64px 20px; text-align: center; }
+.empty h2 { margin: 0; font-size: 17px; font-weight: 700; }
 .empty p { max-width: 380px; margin: 0 0 8px; color: var(--text-2); }
-.fab { display: none; }
 
-@media (max-width: 860px) {
-  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; margin-bottom: 24px; }
-  .toolbar { flex-direction: column-reverse; align-items: stretch; gap: 8px; }
-  .search { width: 100%; height: 36px; background: var(--surface-hover); }
+@media (max-width: 900px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .toolbar { flex-direction: column-reverse; align-items: stretch; }
+  .search { width: 100%; }
   .search kbd { display: none; }
   .row.head { display: none; }
-  .row.item { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'who status' 'meta meta'; height: auto; gap: 4px 12px; padding: 13px 16px; margin: 0 -16px; border-radius: 0; }
+  .row.item { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'who status' 'meta meta'; gap: 6px 12px; padding: 12px; }
   .who { grid-area: who; }
   .status { grid-area: status; }
   .traffic, .expiry, .devices, .act { display: none; }
   .who .sub { display: none; }
-  .mobile-meta { grid-area: meta; display: block; font-size: 12.5px; color: var(--text-3); }
-  .fab { position: fixed; right: 18px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 25; display: grid; place-items: center; width: 52px; height: 52px; border: 0; border-radius: 50%; background: var(--inverse-bg); color: var(--inverse-text); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3); cursor: pointer; }
-  .fab svg { width: 22px; height: 22px; }
+  .mobile-meta { grid-area: meta; display: block; font-size: 12px; color: var(--text-3); }
 }
 </style>

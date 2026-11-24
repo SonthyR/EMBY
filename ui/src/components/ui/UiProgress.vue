@@ -12,9 +12,9 @@ const tone = computed(() => (percent.value >= 100 ? 'bad' : percent.value >= 85 
 </template>
 
 <style scoped>
-.progress { height: 3px; border-radius: 999px; background: var(--border); overflow: hidden; }
+.progress { height: 5px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
 span { display: block; height: 100%; border-radius: inherit; transition: width 500ms var(--ease); }
-.normal { background: var(--text-2); }
+.normal { background: var(--accent); }
 .warn { background: var(--warn); }
 .bad { background: var(--bad); }
 </style>

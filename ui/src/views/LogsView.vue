@@ -111,41 +111,43 @@ async function copy(value: string) {
       </UiMenu>
     </PageHeader>
 
-    <div class="toolbar">
-      <nav class="tabs">
-        <button v-for="r in RANGES" :key="r.key" type="button" :class="{ on: range === r.key }" @click="range = r.key">{{ r.label }}</button>
-      </nav>
-      <div class="filters">
-        <select v-model="category" class="select mini" aria-label="资源类别">
-          <option value="">全部类别</option>
-          <option v-for="(label, key) in CATEGORIES" :key="key" :value="key">{{ label }}</option>
-        </select>
-        <select v-model="status" class="select mini" aria-label="状态">
-          <option value="">全部状态</option>
-          <option value="2xx">成功 2xx</option>
-          <option value="3xx">跳转 3xx</option>
-          <option value="4xx">客户端错误 4xx</option>
-          <option value="5xx">服务端错误 5xx</option>
-        </select>
-        <label class="search"><Search /><input v-model="query" data-page-search type="search" placeholder="搜索路径、IP、UA" aria-label="搜索日志" /></label>
+    <div class="bento-log-card">
+      <div class="toolbar">
+        <nav class="tabs">
+          <button v-for="r in RANGES" :key="r.key" type="button" :class="{ on: range === r.key }" @click="range = r.key">{{ r.label }}</button>
+        </nav>
+        <div class="filters">
+          <select v-model="category" class="select mini" aria-label="资源类别">
+            <option value="">全部类别</option>
+            <option v-for="(label, key) in CATEGORIES" :key="key" :value="key">{{ label }}</option>
+          </select>
+          <select v-model="status" class="select mini" aria-label="状态">
+            <option value="">全部状态</option>
+            <option value="2xx">成功 2xx</option>
+            <option value="3xx">跳转 3xx</option>
+            <option value="4xx">客户端错误 4xx</option>
+            <option value="5xx">服务端错误 5xx</option>
+          </select>
+          <label class="search"><Search /><input v-model="query" data-page-search type="search" placeholder="搜索路径、IP、UA…" aria-label="搜索日志" /></label>
+        </div>
       </div>
-    </div>
-    <div class="meta">
-      <span class="faint">{{ loading ? '正在读取…' : summary }}<template v-if="dropped"> · 有 {{ dropped }} 条因队列满未写入</template></span>
-      <UiSwitch v-model="live" label="自动刷新" />
-    </div>
+      <div class="meta">
+        <span class="faint">{{ loading ? '正在读取…' : summary }}<template v-if="dropped"> · 有 {{ dropped }} 条因队列满未写入</template></span>
+        <UiSwitch v-model="live" label="自动刷新" />
+      </div>
 
-    <div class="table" role="table">
-      <div class="row head" role="row"><span>时间</span><span>状态</span><span>请求</span><span>站点</span><span>类别</span><span>客户端</span></div>
-      <div v-for="log in logs" :key="log.id" class="row item" role="row" tabindex="0" :class="{ active: selected?.id === log.id }" @click="selected = log" @keydown.enter="selected = log">
-        <span class="num faint">{{ time(log.recorded_at_ms) }}</span>
-        <span class="num code" :class="tone(log.status_code)">{{ log.status_code }}</span>
-        <span class="req"><span class="method">{{ log.method }}</span><span class="mono path">{{ log.path }}</span></span>
-        <span class="site">{{ log.site_name }}</span>
-        <span class="faint">{{ CATEGORIES[log.resource_category] || log.resource_category }}</span>
-        <span class="mono client faint">{{ log.client_ip }}</span>
+      <div class="table" role="table">
+        <div class="row head" role="row"><span>时间</span><span>状态</span><span>请求</span><span>站点</span><span>类别</span><span>客户端</span></div>
+        <div v-for="log in logs" :key="log.id" class="row item" role="row" tabindex="0" :class="{ active: selected?.id === log.id }" @click="selected = log" @keydown.enter="selected = log">
+          <span class="num faint">{{ time(log.recorded_at_ms) }}</span>
+          <span class="num code" :class="tone(log.status_code)">{{ log.status_code }}</span>
+          <span class="req"><span class="method">{{ log.method }}</span><span class="mono path">{{ log.path }}</span></span>
+          <span class="site">{{ log.site_name }}</span>
+          <span class="faint">{{ CATEGORIES[log.resource_category] || log.resource_category }}</span>
+          <span class="mono client faint">{{ log.client_ip }}</span>
+        </div>
+        <p v-if="!loading && !logs.length" class="none">这段时间没有符合条件的请求</p>
       </div>
-      <p v-if="!loading && !logs.length" class="none">这段时间没有符合条件的请求</p>
     </div>
 
     <UiDrawer :open="!!selected" title="请求详情" :subtitle="selected ? `${selected.method} · ${selected.status_code}` : ''" :width="480" @close="selected = null">
@@ -166,31 +168,30 @@ async function copy(value: string) {
 </template>
 
 <style scoped>
-.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-.tabs { display: flex; gap: 22px; }
-.tabs button { position: relative; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; cursor: pointer; white-space: nowrap; }
-.tabs button:hover { color: var(--text-2); }
-.tabs button.on { color: var(--text); }
-.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
-.filters { display: flex; align-items: center; gap: 4px; }
-.select.mini { width: auto; height: 30px; padding-left: 8px; font-size: 13px; border-color: transparent; }
-.select.mini:hover { border-color: var(--border-strong); }
-.search { display: flex; align-items: center; gap: 8px; width: 200px; height: 30px; padding: 0 8px; border-radius: var(--radius-sm); color: var(--text-3); }
-.search:focus-within { background: var(--surface-hover); }
+.bento-log-card { border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); overflow: hidden; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.tabs { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); }
+.tabs button { height: 30px; padding: 0 13px; border: 0; border-radius: 999px; background: transparent; color: var(--text-2); font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: all var(--dur) var(--ease); }
+.tabs button:hover { color: var(--text); }
+.tabs button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
+.filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.select.mini { width: auto; height: 34px; padding-left: 11px; font-size: 12.5px; border-radius: 999px; }
+.search { display: flex; align-items: center; gap: 8px; width: 220px; height: 34px; padding: 0 12px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-3); }
+.search:focus-within { background: var(--surface); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .search svg { width: 14px; height: 14px; }
-.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13.5px; color: var(--text); }
-.meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; font-size: 12.5px; }
-.meta :deep(.label) { font-size: 12.5px; color: var(--text-3); }
-.table { font-size: 13px; }
-.row { display: grid; grid-template-columns: 110px 52px minmax(0, 1fr) 120px 80px 130px; align-items: center; gap: 14px; padding: 0 12px; }
-.row.head { height: 34px; font-size: 12px; color: var(--text-3); border-bottom: 1px solid var(--border); }
-.row.item { height: 40px; margin: 0 -12px; padding: 0 24px; border-radius: var(--radius-sm); cursor: pointer; outline: none; }
-.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-hover); }
-.code { font-weight: 500; }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13px; color: var(--text); }
+.meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--surface-2); font-size: 12.5px; }
+.meta :deep(.label) { font-size: 12.5px; color: var(--text-2); }
+.table { font-size: 13px; padding: 6px 10px 10px; }
+.row { display: grid; grid-template-columns: 110px 56px minmax(0, 1fr) 126px 84px 134px; align-items: center; gap: 14px; padding: 0 12px; }
+.row.head { height: 36px; font-size: 12px; font-weight: 600; color: var(--text-3); }
+.row.item { height: 42px; border-radius: var(--radius-xs); cursor: pointer; outline: none; transition: background var(--dur) var(--ease); }
+.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-2); }
+.code { font-weight: 600; }
 .warn { color: var(--warn); }
 .bad { color: var(--bad); }
-.req { display: flex; gap: 8px; min-width: 0; }
-.method { flex: 0 0 auto; color: var(--text-3); font-size: 12px; }
+.req { display: flex; gap: 8px; min-width: 0; align-items: center; }
+.method { flex: 0 0 auto; color: var(--text-3); font-size: 11.5px; font-weight: 600; }
 .path, .site, .client { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .none { padding: 48px 0; text-align: center; color: var(--text-3); }
 .props { margin: 0; }
@@ -198,15 +199,14 @@ async function copy(value: string) {
 .props dt { flex: 0 0 80px; color: var(--text-3); }
 .props dd { flex: 1; margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .small { font-size: 12px; }
-.copy { display: inline-grid; place-items: center; width: 22px; height: 22px; margin-left: 4px; vertical-align: middle; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; }
+.copy { display: inline-grid; place-items: center; width: 22px; height: 22px; margin-left: 4px; vertical-align: middle; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .copy:hover { background: var(--surface-hover); color: var(--text); }
 .copy svg { width: 13px; height: 13px; }
 @media (max-width: 860px) {
-  .toolbar { flex-direction: column; align-items: stretch; gap: 6px; padding-bottom: 8px; }
-  .filters { flex-wrap: wrap; }
-  .search { flex: 1 1 100%; width: auto; background: var(--surface-hover); }
+  .toolbar { flex-direction: column; align-items: stretch; }
+  .search { flex: 1 1 100%; width: auto; }
   .row.head { display: none; }
-  .row.item { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: 'code req time' 'site site site'; height: auto; gap: 2px 10px; padding: 10px 16px; margin: 0 -16px; border-radius: 0; border-bottom: 1px solid var(--border); }
+  .row.item { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: 'code req time' 'site site site'; height: auto; gap: 2px 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); border-radius: 0; }
   .row.item > :nth-child(1) { grid-area: time; font-size: 12px; }
   .row.item > :nth-child(2) { grid-area: code; }
   .row.item > :nth-child(3) { grid-area: req; }

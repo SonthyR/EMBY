@@ -28,7 +28,7 @@ export function resolvedTheme(): 'light' | 'dark' {
 watchEffect(() => {
   const theme = resolvedTheme()
   document.documentElement.dataset.theme = theme
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'light' ? '#f4f6fa' : '#0b0d12')
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'light' ? '#f4f4f6' : '#070709')
   try {
     localStorage.setItem(KEY, themeMode.value)
   } catch {

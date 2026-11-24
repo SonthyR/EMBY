@@ -75,13 +75,13 @@ async function save() {
 </template>
 
 <style scoped>
-.page { max-width: 560px; }
-.form { display: flex; flex-direction: column; gap: 18px; padding-bottom: 32px; border-bottom: 1px solid var(--border); }
+.page { max-width: 620px; }
+.form { display: flex; flex-direction: column; gap: 18px; padding: 24px 26px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .actions { display: flex; justify-content: flex-end; }
 .err { margin: 0; color: var(--bad); font-size: 13px; }
-.danger { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 24px; }
-.danger strong { font-weight: 500; }
-.danger p { margin: 2px 0 0; font-size: 13px; }
+.danger { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 18px 22px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
+.danger strong { font-weight: 600; }
+.danger p { margin: 3px 0 0; font-size: 13px; }
 @media (max-width: 520px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

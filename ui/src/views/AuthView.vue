@@ -31,6 +31,11 @@ function startCountdown(seconds: number) {
 }
 onBeforeUnmount(() => clearInterval(timer))
 
+function setMode(register: boolean) {
+  registerMode.value = register
+  error.value = ''
+}
+
 async function submit() {
   error.value = ''
   const username = form.username.trim()
@@ -78,10 +83,10 @@ async function submit() {
   <div class="auth">
     <div class="card">
       <div class="brand">
-        <img :src="logo" alt="" />
+        <span class="brand-mark"><img :src="logo" alt="" /></span>
         <div>
           <h1>云渡</h1>
-          <p>Emby 分享与反代面板</p>
+          <p>Emby 分享与反代控制中心</p>
         </div>
       </div>
 
@@ -92,9 +97,15 @@ async function submit() {
       </div>
 
       <form v-else class="form" novalidate @submit.prevent="submit">
-        <h2>{{ isSetup ? '创建管理员' : registerMode ? '卡密自助开号' : '登录' }}</h2>
-        <p v-if="!isSetup && !registerMode" class="lead">管理员和分享账号都在这里登录。</p>
-        <p v-else-if="!isSetup && registerMode" class="lead">输入开号兑换码，自定义你的用户名和密码即可立即使用。</p>
+        <div v-if="!isSetup" class="seg" role="tablist" aria-label="登录方式">
+          <button type="button" role="tab" :aria-selected="!registerMode" :class="{ on: !registerMode }" @click="setMode(false)">账号登录</button>
+          <button type="button" role="tab" :aria-selected="registerMode" :class="{ on: registerMode }" @click="setMode(true)">卡密自助开号</button>
+        </div>
+        <h2 v-else>创建管理员</h2>
+
+        <p v-if="!isSetup && !registerMode" class="lead">管理员与朋友分享账号均可在此登录。</p>
+        <p v-else-if="!isSetup && registerMode" class="lead">输入开号兑换码，自定义你的用户名与密码即可立即观看。</p>
+
         <UiField v-if="!isSetup && registerMode" label="开号兑换码" for="auth-code">
           <input id="auth-code" v-model="form.code" class="input mono" maxlength="64" autocapitalize="characters" spellcheck="false" placeholder="例如 YD-XXXX-XXXX-XXXX" autofocus />
         </UiField>
@@ -125,21 +136,8 @@ async function submit() {
         </template>
         <p v-if="error" class="error" role="alert">{{ error }}<template v-if="retryIn">（{{ retryIn }} 秒后可重试）</template></p>
         <UiButton type="submit" variant="primary" block :loading="busy" :disabled="retryIn > 0">
-          {{ isSetup ? '创建并进入' : registerMode ? '兑换并开通账号' : '登录' }}
+          {{ isSetup ? '创建并进入' : registerMode ? '兑换并开通账号' : '立即登录' }}
         </UiButton>
-        <button
-          v-if="!isSetup"
-          type="button"
-          class="switch-mode"
-          @click="
-            () => {
-              registerMode = !registerMode
-              error = ''
-            }
-          "
-        >
-          {{ registerMode ? '已有账号？返回登录' : '有开号兑换码？自助开号' }}
-        </button>
         <p v-if="session.ephemeralSecret" class="note">当前未固定 JWT_SECRET，服务重启后需要重新登录。</p>
       </form>
     </div>
@@ -147,42 +145,26 @@ async function submit() {
 </template>
 
 <style scoped>
-.auth {
-  display: grid;
-  place-items: center;
-  min-height: 100vh;
-  padding: 24px 16px;
-  background: var(--bg);
-}
-.card { width: min(360px, 100%); }
-.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 36px; }
-.brand img { width: 30px; height: 30px; }
-.brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.04em; }
-.brand p { margin: 0; color: var(--text-3); font-size: 12.5px; }
-.form { display: flex; flex-direction: column; gap: 16px; }
-.lead { margin: -8px 0 6px; color: var(--text-2); font-size: 13.5px; }
-.form h2 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -0.025em; }
+.auth { display: grid; place-items: center; min-height: 100vh; padding: 28px 16px; background: radial-gradient(620px 360px at 50% 0%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 72%), var(--bg); }
+.card { width: min(410px, 100%); padding: 32px 30px; border-radius: 24px; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); }
+.brand { display: flex; align-items: center; gap: 13px; margin-bottom: 26px; }
+.brand-mark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 13px; background: var(--hero-gradient); box-shadow: 0 6px 18px rgba(249, 87, 37, 0.25); }
+.brand-mark img { width: 22px; height: 22px; filter: brightness(0) invert(1); }
+.brand h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+.brand p { margin: 1px 0 0; color: var(--text-3); font-size: 12.5px; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); }
+.seg button { height: 33px; border: 0; border-radius: 999px; background: transparent; color: var(--text-2); font-size: 13px; font-weight: 500; cursor: pointer; transition: all var(--dur) var(--ease); }
+.seg button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
+.form { display: flex; flex-direction: column; gap: 15px; }
+.lead { margin: -2px 0 2px; color: var(--text-2); font-size: 13px; }
+.form h2 { margin: 0 0 2px; font-size: 22px; font-weight: 700; letter-spacing: -0.025em; }
 .secret { position: relative; }
 .secret .input { padding-right: 42px; }
-.eye {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 0;
-  background: transparent;
-  color: var(--text-3);
-  cursor: pointer;
-}
-.eye svg { width: 18px; height: 18px; }
-.error { margin: 0; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--bad-soft); color: var(--bad); font-size: 13px; }
-.switch-mode { align-self: center; padding: 4px 8px; border: 0; background: transparent; color: var(--text-2); font-size: 13px; cursor: pointer; }
-.switch-mode:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
-.note { margin: 0; color: var(--warn); font-size: 12px; }
+.eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 34px; height: 34px; border: 0; background: transparent; color: var(--text-3); cursor: pointer; }
+.eye svg { width: 17px; height: 17px; }
+.error { margin: 0; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--bad-soft); color: var(--bad); font-size: 13px; }
+.note { margin: 0; color: var(--warn); font-size: 12px; text-align: center; }
 .state { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; color: var(--text-2); }
 .state p { margin: 0; }
+@media (max-width: 480px) { .card { padding: 24px 20px; } }
 </style>

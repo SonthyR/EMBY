@@ -103,14 +103,15 @@ const healthText = (h: any) => (h?.status === 'online' ? '可连接' : h?.status
 </template>
 
 <style scoped>
-.pick { display: flex; gap: 8px; max-width: 480px; margin-bottom: 20px; }
+.pick { display: flex; gap: 10px; max-width: 540px; margin-bottom: 20px; padding: 14px 16px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
 .pick .select { flex: 1; }
 .hint { font-size: 13.5px; max-width: 560px; }
-.section { margin-bottom: 32px; max-width: 720px; }
-h2 { display: flex; align-items: center; gap: 10px; margin: 0; padding-bottom: 10px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; }
+.section { margin-bottom: 16px; max-width: 780px; padding: 20px 22px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
+h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; padding-bottom: 12px; border-bottom: 1px solid var(--border); font-size: 15px; font-weight: 700; }
 .kv { margin: 0; }
 .kv div { display: flex; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
-.kv dt { flex: 0 0 96px; color: var(--text-3); }
+.kv div:last-child { border-bottom: 0; }
+.kv dt { flex: 0 0 96px; color: var(--text-3); font-size: 12.5px; }
 .kv dd { flex: 1; margin: 0; min-width: 0; overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .bad { color: var(--bad); }
 .warn { color: var(--warn); }

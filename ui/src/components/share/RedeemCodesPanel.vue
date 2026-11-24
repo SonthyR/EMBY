@@ -203,7 +203,7 @@ const FILTERS: { key: 'all' | RedeemCodeStatus; label: string }[] = [
 </script>
 
 <template>
-  <div>
+  <div class="codes-card">
     <div class="bar-top">
       <nav class="tabs" aria-label="按状态筛选兑换码">
         <button v-for="f in FILTERS" :key="f.key" type="button" :class="{ on: statusFilter === f.key }" @click="statusFilter = f.key">
@@ -339,18 +339,20 @@ const FILTERS: { key: 'all' | RedeemCodeStatus; label: string }[] = [
 </template>
 
 <style scoped>
-.bar-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); margin-bottom: 14px; flex-wrap: wrap; }
-.tabs { display: flex; gap: 20px; overflow-x: auto; scrollbar-width: none; }
+.codes-card { border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); overflow: hidden; }
+.bar-top { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.tabs { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { display: none; }
-.tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; white-space: nowrap; cursor: pointer; }
-.tabs button:hover { color: var(--text-2); }
-.tabs button.on { color: var(--text); }
-.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.tabs button { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 13px; border: 0; border-radius: 999px; background: transparent; color: var(--text-2); font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: all var(--dur) var(--ease); }
+.tabs button:hover { color: var(--text); }
+.tabs button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
 .n { font-size: 11.5px; color: var(--text-3); }
-.bar-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 6px; }
+.bar-actions { display: flex; align-items: center; gap: 8px; }
 
-.code-list { margin: 0; padding: 0; list-style: none; }
-.code-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.code-list { margin: 0; padding: 8px 12px; list-style: none; }
+.code-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 10px; border-radius: var(--radius-sm); transition: background var(--dur) var(--ease); }
+.code-row + .code-row { box-shadow: inset 0 1px 0 var(--border); }
+.code-row:hover { background: var(--surface-2); box-shadow: none; }
 .code-row.dim { opacity: 0.6; }
 .code-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .code-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

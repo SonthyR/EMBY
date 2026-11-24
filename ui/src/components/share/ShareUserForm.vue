@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ArrowDown, ArrowUp, Dices } from '@lucide/vue'
+import { Dices, GripVertical, Plus, X } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
@@ -32,6 +32,9 @@ const accounts = reactive<Record<number, SiteAccount[]>>({})
 const saving = ref(false)
 const errors = reactive<Record<string, string>>({})
 const editing = computed(() => !!props.user)
+const draggingIdx = ref<number | null>(null)
+const dragOverIdx = ref<number | null>(null)
+const dragListEl = ref<HTMLElement | null>(null)
 
 const cleanRouteSegment = computed(() => form.routePrefix.trim().replace(/^\/+|\/+$/g, '').toLowerCase())
 const previewOrigin = computed(() => {
@@ -59,23 +62,81 @@ const orderedSites = computed(() => {
   return result
 })
 
-const selectedSiteIds = computed(() => orderedSites.value.filter(s => selected[s.id]?.on).map(s => s.id))
+const assignedSites = computed(() => orderedSites.value.filter(s => selected[s.id]?.on))
+const unassignedSites = computed(() => orderedSites.value.filter(s => !selected[s.id]?.on))
 
-function moveSelectedSite(siteId: number, delta: -1 | 1) {
-  const active = [...selectedSiteIds.value]
-  const index = active.indexOf(siteId)
-  const target = index + delta
-  if (index < 0 || target < 0 || target >= active.length) return
-  ;[active[index], active[target]] = [active[target], active[index]]
-  const rest = orderedSites.value.filter(s => !selected[s.id]?.on).map(s => s.id)
+function reorderSelected(fromIdx: number, toIdx: number) {
+  const active = assignedSites.value.map(s => s.id)
+  if (fromIdx === toIdx || fromIdx < 0 || toIdx < 0 || fromIdx >= active.length || toIdx >= active.length) return
+  const [moved] = active.splice(fromIdx, 1)
+  active.splice(toIdx, 0, moved)
+  const rest = unassignedSites.value.map(s => s.id)
   siteOrder.value = [...active, ...rest]
 }
 
-function toggleSite(siteId: number) {
-  const active = orderedSites.value.filter(s => selected[s.id]?.on).map(s => s.id)
-  const rest = orderedSites.value.filter(s => !selected[s.id]?.on).map(s => s.id)
-  if (selected[siteId]?.on && !active.includes(siteId)) active.push(siteId)
+function addSite(siteId: number) {
+  if (!selected[siteId]) selected[siteId] = { on: true, account: 0 }
+  else selected[siteId].on = true
+  const active = assignedSites.value.map(s => s.id).filter(id => id !== siteId)
+  active.push(siteId)
+  const rest = props.sites.map(s => s.id).filter(id => !active.includes(id))
   siteOrder.value = [...active, ...rest]
+}
+
+function removeSite(siteId: number) {
+  if (selected[siteId]) selected[siteId].on = false
+  const active = assignedSites.value.map(s => s.id)
+  const rest = props.sites.map(s => s.id).filter(id => !active.includes(id))
+  siteOrder.value = [...active, ...rest]
+}
+
+function onDragStart(index: number, event: DragEvent) {
+  if (assignedSites.value.length < 2) return
+  draggingIdx.value = index
+  dragOverIdx.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+function onDragOver(index: number, event: DragEvent) {
+  event.preventDefault()
+  if (draggingIdx.value === null) return
+  dragOverIdx.value = index
+  if (draggingIdx.value !== index) {
+    reorderSelected(draggingIdx.value, index)
+    draggingIdx.value = index
+  }
+}
+function onDragEnd() {
+  draggingIdx.value = null
+  dragOverIdx.value = null
+}
+function onTouchStart(index: number) {
+  if (assignedSites.value.length < 2) return
+  draggingIdx.value = index
+  dragOverIdx.value = index
+}
+function onTouchMove(event: TouchEvent) {
+  if (draggingIdx.value === null || !dragListEl.value) return
+  const touch = event.touches[0]
+  if (!touch) return
+  const rows = Array.from(dragListEl.value.querySelectorAll<HTMLElement>('[data-form-drag-row]'))
+  for (let i = 0; i < rows.length; i++) {
+    const rect = rows[i].getBoundingClientRect()
+    if (touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
+      dragOverIdx.value = i
+      if (i !== draggingIdx.value) {
+        reorderSelected(draggingIdx.value, i)
+        draggingIdx.value = i
+      }
+      break
+    }
+  }
+}
+function onTouchEnd() {
+  draggingIdx.value = null
+  dragOverIdx.value = null
 }
 
 function usable(siteId: number) {
@@ -153,7 +214,7 @@ function validate(): ShareUserInput | null {
   if (!Number.isInteger(devices) || devices < 0 || devices > 100) errors.devices = '0–100 的整数'
   const speed = toInt(form.speed)
   if (!Number.isInteger(speed) || speed < 0 || speed > 100000) errors.speed = '0–100000 的整数'
-  const sites = orderedSites.value.filter(s => selected[s.id]?.on).map(s => ({ site_id: s.id, site_account_id: selected[s.id].account || 0 }))
+  const sites = assignedSites.value.map(s => ({ site_id: s.id, site_account_id: selected[s.id].account || 0 }))
   if (!sites.length) errors.sites = '至少选择一个站点'
   if (Object.keys(errors).length) return null
   return {
@@ -187,7 +248,7 @@ async function save() {
 </script>
 
 <template>
-  <UiDrawer :open="open" :title="editing ? '编辑分享账号' : '新建分享账号'" :subtitle="editing ? user?.username : '朋友会用这个账号登录 Emby 客户端'" :width="520" :dismissible="!saving" @close="emit('close')">
+  <UiDrawer :open="open" :title="editing ? '编辑分享账号' : '新建分享账号'" :subtitle="editing ? user?.username : '朋友会用这个账号登录 Emby 客户端'" :width="530" :dismissible="!saving" @close="emit('close')">
     <form class="form" novalidate @submit.prevent="save">
       <fieldset>
         <legend>登录与入口</legend>
@@ -248,29 +309,57 @@ async function save() {
       </fieldset>
 
       <fieldset>
-        <legend>可用站点{{ cleanRouteSegment ? '（首位为默认生效服务器）' : '' }}</legend>
+        <legend>可用 Emby 源站（按住拖拽排序，首位为默认首选）</legend>
         <p v-if="!sites.length" class="faint">还没有站点。</p>
-        <div class="sites">
-          <div v-for="site in orderedSites" :key="site.id" class="site">
+
+        <div
+          v-if="assignedSites.length"
+          ref="dragListEl"
+          class="drag-sites"
+          @touchmove.prevent="onTouchMove"
+          @touchend="onTouchEnd"
+          @touchcancel="onTouchEnd"
+        >
+          <div
+            v-for="(site, index) in assignedSites"
+            :key="site.id"
+            data-form-drag-row
+            class="site-card"
+            :class="{
+              first: index === 0,
+              draggable: assignedSites.length > 1,
+              dragging: draggingIdx === index,
+              over: dragOverIdx === index && draggingIdx !== null && draggingIdx !== index,
+            }"
+            :draggable="assignedSites.length > 1"
+            @dragstart="onDragStart(index, $event)"
+            @dragover="onDragOver(index, $event)"
+            @dragend="onDragEnd"
+          >
             <div class="site-head">
-              <label class="check">
-                <input v-model="selected[site.id].on" type="checkbox" @change="toggleSite(site.id)" />
-                <span class="site-name">{{ site.name }}</span>
-                <span v-if="cleanRouteSegment && selectedSiteIds[0] === site.id" class="rank-tag">首位</span>
-                <span v-if="!site.enabled" class="faint">已停用</span>
-              </label>
-              <div v-if="selected[site.id]?.on && selectedSiteIds.length > 1" class="order-btns">
-                <button type="button" class="order-btn" aria-label="上移" title="上移" :disabled="selectedSiteIds.indexOf(site.id) === 0" @click="moveSelectedSite(site.id, -1)"><ArrowUp /></button>
-                <button type="button" class="order-btn" aria-label="下移" title="下移" :disabled="selectedSiteIds.indexOf(site.id) === selectedSiteIds.length - 1" @click="moveSelectedSite(site.id, 1)"><ArrowDown /></button>
-              </div>
+              <span class="grip" title="按住拖拽排序" @touchstart.stop="onTouchStart(index)"><GripVertical /></span>
+              <span class="rank-pill num" :class="{ primary: index === 0 }">{{ index === 0 ? '首选' : `#${index + 1}` }}</span>
+              <span class="site-name">{{ site.name }}</span>
+              <span v-if="!site.enabled" class="off-tag">停用</span>
+              <button type="button" class="rm-btn" aria-label="移出站点" title="移出站点" @click="removeSite(site.id)"><X /></button>
             </div>
-            <select v-if="selected[site.id]?.on" v-model.number="selected[site.id].account" class="select compact" :disabled="!usable(site.id).length" aria-label="代登用的源站账号">
+            <select v-model.number="selected[site.id].account" class="select compact" :disabled="!usable(site.id).length" aria-label="代登用的源站账号">
               <option :value="0">自动均衡源站账号（推荐，支持 401/429 故障切换）</option>
               <option v-for="account in usable(site.id)" :key="account.id" :value="account.id">{{ account.account_name || account.username }}</option>
             </select>
-            <p v-if="selected[site.id]?.on && accounts[site.id] && !usable(site.id).length" class="warn">这个站点还没保存带密码的源站账号，朋友会登录失败。</p>
+            <p v-if="accounts[site.id] && !usable(site.id).length" class="warn">这个站点还没保存带密码的源站账号，朋友会登录失败。</p>
           </div>
         </div>
+
+        <div v-if="unassignedSites.length" class="add-wrap">
+          <span class="add-label">点击添加其他 Emby 源站</span>
+          <div class="add-chips">
+            <button v-for="site in unassignedSites" :key="site.id" type="button" class="add-chip" @click="addSite(site.id)">
+              <Plus /><span>{{ site.name }}</span><small v-if="!site.enabled">停用</small>
+            </button>
+          </div>
+        </div>
+
         <p v-if="errors.sites" class="err">{{ errors.sites }}</p>
       </fieldset>
 
@@ -279,7 +368,7 @@ async function save() {
         <UiField label="备注" for="su-note">
           <input id="su-note" v-model="form.note" class="input" maxlength="1000" placeholder="比如朋友的名字" />
         </UiField>
-        <UiSwitch v-model="form.enabled" label="启用" description="关闭后无法登录，在线设备会立即断开" />
+        <UiSwitch v-model="form.enabled" label="启用账号" description="关闭后无法登录，在线设备会立即断开" />
       </fieldset>
       <button type="submit" hidden />
     </form>
@@ -295,30 +384,86 @@ async function save() {
 fieldset { display: flex; flex-direction: column; gap: 14px; margin: 0; padding: 18px 0; border: 0; border-bottom: 1px solid var(--border); min-width: 0; }
 fieldset:first-of-type { padding-top: 0; }
 fieldset:last-of-type { border-bottom: 0; }
-legend { float: left; width: 100%; margin-bottom: 14px; padding: 0; font-size: 12px; font-weight: 500; color: var(--text-3); }
+legend { float: left; width: 100%; margin-bottom: 14px; padding: 0; font-size: 12.5px; font-weight: 600; color: var(--text-2); }
 legend + * { clear: both; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 14px; }
 .with-btn { display: flex; gap: 6px; }
 .prefix-input { display: flex; align-items: center; }
-.prefix-input .slash { display: grid; place-items: center; width: 32px; height: 36px; border: 1px solid var(--border-strong); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-2); color: var(--text-3); font-family: var(--mono); }
+.prefix-input .slash { display: grid; place-items: center; width: 34px; height: 38px; border: 1px solid var(--border-strong); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-2); color: var(--text-3); font-family: var(--mono); }
 .prefix-input .input { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-.chips button { height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-2); font-size: 12px; cursor: pointer; transition: all var(--dur) var(--ease); }
-.chips button:hover { border-color: var(--border-strong); color: var(--text); }
-.sites { display: flex; flex-direction: column; }
-.site { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
-.site:last-child { border-bottom: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.chips button { height: 27px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text-2); font-size: 12px; font-weight: 500; cursor: pointer; transition: all var(--dur) var(--ease); }
+.chips button:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+.drag-sites { display: flex; flex-direction: column; gap: 10px; }
+.site-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 13px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  transition: transform 150ms var(--ease), border-color 150ms var(--ease), box-shadow 150ms var(--ease), opacity 150ms var(--ease);
+}
+.site-card.draggable { cursor: grab; }
+.site-card.draggable:active { cursor: grabbing; }
+.site-card.first {
+  background: linear-gradient(90deg, var(--accent-soft) 0%, var(--surface) 75%);
+  border-color: var(--accent-border);
+}
+.site-card.dragging { opacity: 0.55; border-style: dashed; border-color: var(--accent); }
+.site-card.over { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
 .site-head { display: flex; align-items: center; gap: 8px; }
-.check { flex: 1; display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; min-width: 0; }
-.site-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rank-tag { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); flex: 0 0 auto; }
-.order-btns { display: flex; gap: 2px; }
-.order-btn { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; }
-.order-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
-.order-btn:disabled { opacity: 0.3; cursor: default; }
-.order-btn svg { width: 14px; height: 14px; }
-.select.compact { height: 32px; font-size: 13px; margin-left: 25px; width: calc(100% - 25px); }
-.warn { margin: 0 0 0 25px; font-size: 12px; color: var(--warn); }
+.grip { display: grid; place-items: center; color: var(--text-3); touch-action: none; }
+.grip svg { width: 15px; height: 15px; }
+.rank-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+.rank-pill.primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+.site-name { flex: 1; font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.off-tag { font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: var(--bad-soft); color: var(--bad); font-weight: 600; }
+.rm-btn { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
+.rm-btn:hover { background: var(--bad-soft); color: var(--bad); }
+.rm-btn svg { width: 14px; height: 14px; }
+
+.select.compact { height: 34px; font-size: 12.5px; background-color: var(--surface); }
+.warn { margin: 0; font-size: 12px; color: var(--warn); }
+
+.add-wrap { display: flex; flex-direction: column; gap: 7px; }
+.add-label { font-size: 11.5px; color: var(--text-3); }
+.add-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.add-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.add-chip:hover { border-style: solid; border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.add-chip svg { width: 13px; height: 13px; }
+.add-chip small { font-size: 10.5px; color: var(--bad); }
+
 .err { margin: 0; font-size: 12px; color: var(--bad); }
 @media (max-width: 520px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

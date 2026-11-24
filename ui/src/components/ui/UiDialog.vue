@@ -86,7 +86,8 @@ onBeforeUnmount(() => {
   place-items: center;
   padding: 24px 16px;
   background: var(--overlay);
-  backdrop-filter: blur(3px);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 .panel {
   display: flex;
@@ -99,23 +100,13 @@ onBeforeUnmount(() => {
   box-shadow: var(--shadow);
   outline: none;
 }
-.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px 6px; }
-.head h2 { margin: 0; font-size: 17px; font-weight: 600; }
-.close {
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-2);
-  cursor: pointer;
-}
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 20px 22px 10px; }
+.head h2 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.015em; }
+.close { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: var(--surface-2); color: var(--text-2); cursor: pointer; }
 .close:hover { background: var(--surface-hover); color: var(--text); }
-.close svg { width: 18px; height: 18px; }
-.body { padding: 12px 20px 16px; overflow: auto; overscroll-behavior: contain; }
-.foot { display: flex; justify-content: flex-end; gap: 10px; padding: 12px 20px 18px; border-top: 1px solid var(--border); }
+.close svg { width: 16px; height: 16px; }
+.body { padding: 12px 22px 18px; overflow: auto; overscroll-behavior: contain; }
+.foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px 18px; border-top: 1px solid var(--border); }
 
 .dialog-enter-active, .dialog-leave-active { transition: opacity 180ms var(--ease); }
 .dialog-enter-active .panel, .dialog-leave-active .panel { transition: transform 220ms var(--ease); }

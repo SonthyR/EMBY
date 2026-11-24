@@ -10,6 +10,7 @@ const props = withDefaults(
   defineProps<{ labels: number[]; series: Series[]; height?: number; format?: (v: number) => string; timeFormat?: (ms: number) => string }>(),
   { height: 220 },
 )
+const gradPrefix = `area-${Math.random().toString(36).slice(2, 8)}-`
 
 const root = ref<HTMLElement | null>(null)
 const width = ref(600)
@@ -95,8 +96,8 @@ const tip = computed(() => {
   <div ref="root" class="chart" @pointermove="onMove" @pointerleave="hover = null">
     <svg :width="width" :height="height" role="img" aria-label="流量趋势图">
       <defs>
-        <linearGradient v-for="(s, k) in series" :id="`g${k}`" :key="k" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" :style="{ stopColor: s.color, stopOpacity: 0.18 }" />
+        <linearGradient v-for="(s, k) in series" :id="`${gradPrefix}${k}`" :key="k" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" :style="{ stopColor: s.color, stopOpacity: 0.24 }" />
           <stop offset="100%" :style="{ stopColor: s.color, stopOpacity: 0 }" />
         </linearGradient>
       </defs>
@@ -108,12 +109,12 @@ const tip = computed(() => {
         <text v-for="i in xTicks" :key="'x' + i" :x="x(i)" :y="height - 6" text-anchor="middle">{{ tfmt(labels[i]) }}</text>
       </g>
       <g v-for="(s, k) in series" :key="s.name">
-        <path :d="areaPath(s.values)" :fill="`url(#g${k})`" />
-        <path :d="linePath(s.values)" fill="none" :style="{ stroke: s.color }" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" />
+        <path :d="areaPath(s.values)" :fill="`url(#${gradPrefix}${k})`" />
+        <path :d="linePath(s.values)" fill="none" :style="{ stroke: s.color }" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
       </g>
       <g v-if="hover !== null">
         <line class="cursor" :x1="x(hover)" :x2="x(hover)" :y1="pad.top" :y2="pad.top + innerH" />
-        <circle v-for="s in series" :key="s.name" :cx="x(hover)" :cy="y(s.values[hover] || 0)" r="3.5" :style="{ fill: s.color, stroke: 'var(--bg)' }" stroke-width="2" />
+        <circle v-for="s in series" :key="s.name" :cx="x(hover)" :cy="y(s.values[hover] || 0)" r="4" :style="{ fill: s.color, stroke: 'var(--surface)' }" stroke-width="2" />
       </g>
     </svg>
     <div v-if="tip" class="tip" :style="{ left: tip.left + 'px' }">

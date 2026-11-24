@@ -58,29 +58,30 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 </template>
 
 <style scoped>
-.layer { position: fixed; inset: 0; z-index: 100; background: var(--overlay); }
+.layer { position: fixed; inset: 0; z-index: 100; background: var(--overlay); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px); }
 .drawer {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  bottom: 8px;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
   display: flex;
   flex-direction: column;
-  width: min(var(--w), calc(100% - 16px));
+  width: min(var(--w), calc(100% - 24px));
   background: var(--bg-elev);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
   outline: none;
 }
-.head { display: flex; align-items: flex-start; gap: 8px; padding: 18px 18px 14px 22px; border-bottom: 1px solid var(--border); }
+.head { display: flex; align-items: flex-start; gap: 10px; padding: 20px 20px 16px 24px; border-bottom: 1px solid var(--border); }
 .titles { flex: 1; min-width: 0; }
-.titles :deep(h2), h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sub { margin: 2px 0 0; font-size: 13px; color: var(--text-3); }
-.close { display: grid; place-items: center; width: 30px; height: 30px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-3); cursor: pointer; }
+.titles :deep(h2), h2 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub { margin: 3px 0 0; font-size: 12.5px; color: var(--text-3); }
+.close { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: var(--surface-2); color: var(--text-2); cursor: pointer; transition: background var(--dur) var(--ease), color var(--dur) var(--ease); }
 .close:hover { background: var(--surface-hover); color: var(--text); }
-.close svg { width: 17px; height: 17px; }
-.body { flex: 1; overflow: auto; padding: 18px 22px 24px; overscroll-behavior: contain; }
-.foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--border); }
+.close svg { width: 16px; height: 16px; }
+.body { flex: 1; overflow: auto; padding: 20px 24px 26px; overscroll-behavior: contain; }
+.foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 24px; border-top: 1px solid var(--border); background: var(--surface); border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 
 .drawer-enter-active, .drawer-leave-active { transition: background 220ms var(--ease); }
 .drawer-enter-active .drawer, .drawer-leave-active .drawer { transition: transform 280ms var(--ease), opacity 200ms var(--ease); }

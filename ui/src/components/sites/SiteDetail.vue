@@ -76,20 +76,21 @@ const state = computed(() => {
 .state { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
 .primary { display: flex; gap: 8px; margin-bottom: 24px; }
 .primary > :first-child { flex: 1; }
-.usage { display: flex; flex-direction: column; gap: 6px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
-.big { font-size: 30px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.15; }
-.usage .faint { font-size: 13px; margin-bottom: 6px; }
-.props { margin: 0; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.usage { display: flex; flex-direction: column; gap: 6px; padding: 16px 18px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--border); margin-bottom: 14px; }
+.big { font-size: 28px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.15; }
+.usage .faint { font-size: 12.5px; margin-bottom: 4px; }
+.props { margin: 0; padding: 6px 0 12px; border-bottom: 1px solid var(--border); }
 .props div { display: flex; gap: 16px; padding: 9px 0; font-size: 13.5px; }
-.props dt { flex: 0 0 84px; color: var(--text-3); }
+.props dt { flex: 0 0 84px; color: var(--text-3); font-size: 12.5px; }
 .props dd { flex: 1; margin: 0; min-width: 0; overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .bad-text { color: var(--bad); }
 .block { padding-top: 20px; }
-h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
-.menu { display: flex; flex-direction: column; margin: 0 -10px; }
-.menu button { display: flex; align-items: center; justify-content: space-between; height: 38px; padding: 0 10px; border: 0; border-radius: var(--radius-sm); background: transparent; font-size: 13.5px; text-align: left; cursor: pointer; }
+h3 { margin: 0 0 10px; font-size: 12.5px; font-weight: 600; color: var(--text-2); }
+.menu { display: flex; flex-direction: column; gap: 4px; }
+.menu button { display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 12px; border: 0; border-radius: var(--radius-sm); background: var(--surface-2); font-size: 13.5px; font-weight: 500; text-align: left; cursor: pointer; transition: background var(--dur) var(--ease); }
 .menu button:hover:not(:disabled) { background: var(--surface-hover); }
 .menu button:disabled { opacity: 0.4; cursor: default; }
 .menu svg { width: 15px; height: 15px; color: var(--text-3); }
 .menu .danger { color: var(--bad); }
+.menu .danger:hover:not(:disabled) { background: var(--bad-soft); }
 </style>

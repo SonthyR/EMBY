@@ -32,20 +32,23 @@ import { dismiss, toasts } from '@/stores/toast'
 }
 .toast {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
   max-width: 100%;
-  padding: 10px 14px;
+  padding: 10px 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-elev);
+  border-radius: 999px;
+  background: var(--surface-glass);
+  backdrop-filter: saturate(1.6) blur(16px);
+  -webkit-backdrop-filter: saturate(1.6) blur(16px);
   box-shadow: var(--shadow);
   text-align: left;
-  font-size: 14px;
+  font-size: 13.5px;
+  font-weight: 500;
   cursor: pointer;
   pointer-events: auto;
 }
-.toast svg { width: 18px; height: 18px; flex: 0 0 18px; margin-top: 1px; }
+.toast svg { width: 17px; height: 17px; flex: 0 0 17px; }
 .success svg { color: var(--good); }
 .error svg { color: var(--bad); }
 .info svg { color: var(--accent); }

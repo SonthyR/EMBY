@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Copy, Zap, MoreHorizontal, ArrowUp, ArrowDown } from '@lucide/vue'
+import { Plus, Search, Copy, Zap, MoreHorizontal, ArrowUp, ArrowDown, GripVertical } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiMenu from '@/components/ui/UiMenu.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
@@ -30,6 +30,8 @@ const selectedId = ref<number | null>(null)
 const sorting = ref(false)
 const sortDraft = ref<Site[]>([])
 const savingOrder = ref(false)
+const draggingIdx = ref<number | null>(null)
+const dragOverIdx = ref<number | null>(null)
 const importOpen = ref(false)
 const importFormat = ref('json')
 const importData = ref('')
@@ -130,10 +132,10 @@ function onEditorSaved() {
 }
 function latencyText(site: Site) {
   const l = latency.value[site.id]
-  if (!l) return { text: '—', tone: 'faint' }
-  if (l.busy) return { text: '…', tone: 'faint' }
-  if (!l.ok) return { text: '失败', tone: 'bad' }
-  return { text: `${l.ms} ms`, tone: (l.ms || 0) < 200 ? '' : (l.ms || 0) < 800 ? 'warn' : 'bad' }
+  if (!l) return { text: '未测速', tone: 'faint' }
+  if (l.busy) return { text: '测速中…', tone: 'faint' }
+  if (!l.ok) return { text: '连接失败', tone: 'bad' }
+  return { text: `${l.ms} ms`, tone: (l.ms || 0) < 200 ? 'good' : (l.ms || 0) < 800 ? 'warn' : 'bad' }
 }
 
 function startSorting() {
@@ -146,6 +148,27 @@ function move(index: number, delta: number) {
   const [item] = next.splice(index, 1)
   next.splice(index + delta, 0, item)
   sortDraft.value = next
+}
+function onSortDragStart(index: number, event: DragEvent) {
+  draggingIdx.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+function onSortDragOver(index: number, event: DragEvent) {
+  event.preventDefault()
+  dragOverIdx.value = index
+  if (draggingIdx.value === null || draggingIdx.value === index) return
+  const next = [...sortDraft.value]
+  const [item] = next.splice(draggingIdx.value, 1)
+  next.splice(index, 0, item)
+  sortDraft.value = next
+  draggingIdx.value = index
+}
+function onSortDragEnd() {
+  draggingIdx.value = null
+  dragOverIdx.value = null
 }
 async function saveOrder() {
   savingOrder.value = true
@@ -183,7 +206,7 @@ function onMenu(key: string) {
 }
 const menuItems = [
   { key: 'test', label: '全部测速' },
-  { key: 'sort', label: '调整顺序' },
+  { key: 'sort', label: '拖拽调整顺序' },
   { key: 'd1', label: '', divider: true },
   { key: 'import-json', label: '导入 JSON' },
   { key: 'import-csv', label: '导入 CSV' },
@@ -202,11 +225,11 @@ const menuItems = [
       <UiButton variant="primary" @click="edit()"><Plus />添加站点</UiButton>
     </PageHeader>
 
-    <dl class="stats">
-      <div><dt>站点</dt><dd class="num">{{ counts.all }}</dd></div>
-      <div><dt>运行中</dt><dd class="num">{{ counts.running }}</dd></div>
-      <div><dt>累计流量</dt><dd class="num">{{ formatBytes(totalTraffic) }}</dd></div>
-      <div><dt>账号即将到期</dt><dd class="num" :class="{ warn: reminders.length }">{{ reminders.length }}</dd></div>
+    <dl class="kpi-grid">
+      <div class="kpi-card"><dt>站点总数</dt><dd class="num">{{ counts.all }}</dd></div>
+      <div class="kpi-card"><dt><span class="dot good" />运行中</dt><dd class="num">{{ counts.running }}</dd></div>
+      <div class="kpi-card"><dt>累计流量</dt><dd class="num">{{ formatBytes(totalTraffic) }}</dd></div>
+      <div class="kpi-card" :class="{ warn: reminders.length }"><dt>账号即将到期</dt><dd class="num">{{ reminders.length }}</dd></div>
     </dl>
 
     <button v-if="reminders.length && !sorting" type="button" class="notice" @click="historyOpen = true">
@@ -218,22 +241,26 @@ const menuItems = [
     </button>
 
     <div v-if="sorting" class="sortbar">
-      <span class="muted">用箭头调整顺序，分享信息和列表都会按这个顺序显示。</span>
-      <UiButton size="sm" @click="sorting = false">取消</UiButton>
-      <UiButton size="sm" variant="primary" :loading="savingOrder" @click="saveOrder">保存顺序</UiButton>
+      <span class="muted">直接拖拽卡片或点击箭头调整顺序，分享信息和列表都会按这个顺序显示。</span>
+      <div class="sort-acts">
+        <UiButton size="sm" @click="sorting = false">取消</UiButton>
+        <UiButton size="sm" variant="accent" :loading="savingOrder" @click="saveOrder">保存顺序</UiButton>
+      </div>
     </div>
-    <div v-else class="toolbar">
-      <nav class="tabs">
+    <div v-else class="toolbar-card">
+      <nav class="seg" aria-label="按状态筛选">
         <button type="button" :class="{ on: filter === 'all' }" @click="filter = 'all'">全部<span class="n">{{ counts.all }}</span></button>
         <button type="button" :class="{ on: filter === 'running' }" @click="filter = 'running'">运行中<span class="n">{{ counts.running }}</span></button>
         <button type="button" :class="{ on: filter === 'stopped' }" @click="filter = 'stopped'">已停止<span v-if="counts.stopped" class="n">{{ counts.stopped }}</span></button>
       </nav>
-      <label class="search"><Search /><input v-model="query" data-page-search type="search" placeholder="搜索" aria-label="搜索站点" /><kbd>/</kbd></label>
+      <label class="search"><Search /><input v-model="query" data-page-search type="search" placeholder="搜索站点或地址…" aria-label="搜索站点" /><kbd>/</kbd></label>
     </div>
 
-    <div v-if="loading" class="rows"><div v-for="n in 3" :key="n" class="row skeleton"><span /></div></div>
-    <div v-else-if="loadError" class="empty"><p>{{ loadError }}</p><UiButton @click="load()">重试</UiButton></div>
-    <div v-else-if="!sites.length" class="empty">
+    <div v-if="loading" class="site-grid">
+      <div v-for="n in 4" :key="n" class="site-card skeleton"><span /></div>
+    </div>
+    <div v-else-if="loadError" class="empty-card"><p>{{ loadError }}</p><UiButton @click="load()">重试</UiButton></div>
+    <div v-else-if="!sites.length" class="empty-card">
       <h2>还没有站点</h2>
       <p>添加一个 Emby 源站，云渡会为它生成访问地址；也可以导入之前导出的配置。</p>
       <div class="row-actions">
@@ -241,47 +268,83 @@ const menuItems = [
         <UiButton @click="pickImport('json')">导入配置</UiButton>
       </div>
     </div>
-    <div v-else class="rows">
-      <div class="row head">
-        <span>站点</span><span>状态</span><span>流量</span><span>延迟</span><span class="sr-only">操作</span>
-      </div>
-      <TransitionGroup name="list">
-        <div
-          v-for="(site, index) in visible"
-          :key="site.id"
-          class="row item"
-          :class="{ active: selectedId === site.id }"
-          tabindex="0"
-          @click="!sorting && (selectedId = site.id)"
-          @keydown.enter="!sorting && (selectedId = site.id)"
-        >
-          <span class="who">
-            <span class="name">{{ site.name }}</span>
-            <span class="sub mono">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
-          </span>
-          <span class="status"><span class="dot" :class="site.running ? 'good' : site.enabled ? 'bad' : ''" />{{ site.running ? '运行中' : site.enabled ? '启动失败' : '已停用' }}</span>
-          <span class="traffic">
-            <span class="num">{{ formatBytes(Number(site.traffic_used) || 0) }}<span v-if="site.traffic_quota" class="faint"> / {{ formatBytes(Number(site.traffic_quota)) }}</span></span>
-            <UiProgress v-if="site.traffic_quota" :value="Number(site.traffic_used) || 0" :max="Number(site.traffic_quota)" />
-          </span>
-          <span class="num lat" :class="latencyText(site).tone">{{ latencyText(site).text }}</span>
-          <span class="act">
-            <template v-if="sorting">
-              <UiButton variant="ghost" size="sm" icon :disabled="index === 0" aria-label="上移" @click.stop="move(index, -1)"><ArrowUp /></UiButton>
-              <UiButton variant="ghost" size="sm" icon :disabled="index === visible.length - 1" aria-label="下移" @click.stop="move(index, 1)"><ArrowDown /></UiButton>
-            </template>
-            <template v-else>
-              <UiButton variant="ghost" size="sm" icon aria-label="测速" title="测速" @click.stop="test(site)"><Zap /></UiButton>
-              <UiButton variant="ghost" size="sm" icon aria-label="复制访问地址" title="复制访问地址" @click.stop="copyAddress(site)"><Copy /></UiButton>
-            </template>
-          </span>
-          <span class="mobile-meta">{{ formatBytes(Number(site.traffic_used) || 0) }} · {{ INGRESS_LABEL[normalizedIngressMode(site)] }}<template v-if="latency[site.id]?.ok"> · {{ latency[site.id].ms }} ms</template></span>
+
+    <div v-else-if="sorting" class="sort-list">
+      <div
+        v-for="(site, index) in visible"
+        :key="site.id"
+        class="sort-row"
+        :class="{ dragging: draggingIdx === index, over: dragOverIdx === index && draggingIdx !== index }"
+        draggable="true"
+        @dragstart="onSortDragStart(index, $event)"
+        @dragover="onSortDragOver(index, $event)"
+        @dragend="onSortDragEnd"
+      >
+        <span class="grip"><GripVertical /></span>
+        <span class="rank-badge num">#{{ index + 1 }}</span>
+        <div class="who">
+          <span class="name">{{ site.name }}</span>
+          <span class="sub mono">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
         </div>
-      </TransitionGroup>
+        <div class="sort-btns">
+          <UiButton variant="ghost" size="sm" icon :disabled="index === 0" aria-label="上移" @click="move(index, -1)"><ArrowUp /></UiButton>
+          <UiButton variant="ghost" size="sm" icon :disabled="index === visible.length - 1" aria-label="下移" @click="move(index, 1)"><ArrowDown /></UiButton>
+        </div>
+      </div>
+    </div>
+
+    <div v-else class="site-grid">
+      <article
+        v-for="site in visible"
+        :key="site.id"
+        class="site-card"
+        :class="{ active: selectedId === site.id, stopped: !site.running }"
+        tabindex="0"
+        @click="selectedId = site.id"
+        @keydown.enter="selectedId = site.id"
+      >
+        <div class="card-top">
+          <div class="who">
+            <h3 class="name">{{ site.name }}</h3>
+            <span class="sub mono" :title="address(site)">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
+          </div>
+          <span class="status-pill" :class="site.running ? 'good' : site.enabled ? 'bad' : 'off'">
+            <span class="dot" :class="site.running ? 'good' : site.enabled ? 'bad' : ''" />
+            {{ site.running ? '运行中' : site.enabled ? '启动失败' : '已停用' }}
+          </span>
+        </div>
+
+        <div class="card-metrics">
+          <div class="metric-box">
+            <span class="m-label">已用流量</span>
+            <span class="m-val num">
+              {{ formatBytes(Number(site.traffic_used) || 0) }}
+              <small v-if="site.traffic_quota" class="faint">/ {{ formatBytes(Number(site.traffic_quota)) }}</small>
+            </span>
+          </div>
+          <div class="metric-box">
+            <span class="m-label">源站延迟</span>
+            <span class="m-val num" :class="latencyText(site).tone">{{ latencyText(site).text }}</span>
+          </div>
+          <div class="metric-box">
+            <span class="m-label">接入模式</span>
+            <span class="m-val">{{ INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
+          </div>
+        </div>
+
+        <UiProgress v-if="site.traffic_quota" :value="Number(site.traffic_used) || 0" :max="Number(site.traffic_quota)" />
+
+        <div class="card-foot">
+          <span class="faint hint-text">点击查看详情与源站账号</span>
+          <div class="act" @click.stop>
+            <UiButton variant="secondary" size="sm" @click="test(site)"><Zap />测速</UiButton>
+            <UiButton variant="secondary" size="sm" @click="copyAddress(site)"><Copy />复制</UiButton>
+          </div>
+        </div>
+      </article>
       <p v-if="!visible.length" class="none">没有符合条件的站点</p>
     </div>
 
-    <button type="button" class="fab" aria-label="添加站点" @click="edit()"><Plus /></button>
     <input ref="fileInput" type="file" hidden @change="onFile" />
 
     <SiteDetail
@@ -304,70 +367,232 @@ const menuItems = [
 </template>
 
 <style scoped>
-.stats { display: flex; gap: 48px; margin: 0 0 28px; flex-wrap: wrap; }
-.stats div { display: flex; flex-direction: column; gap: 2px; }
-.stats dt { font-size: 12.5px; color: var(--text-3); }
-.stats dd { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
-.stats dd.warn { color: var(--warn); }
-.notice { display: flex; align-items: center; gap: 10px; width: 100%; margin: 0 0 24px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border)); border-radius: var(--radius); background: color-mix(in srgb, var(--warn) 6%, transparent); color: var(--text-2); font-size: 13px; text-align: left; cursor: pointer; }
-.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); }
-.sortbar { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
-.sortbar .muted { flex: 1; font-size: 13px; }
-.tabs { display: flex; gap: 22px; }
-.tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; cursor: pointer; white-space: nowrap; }
-.tabs button:hover { color: var(--text-2); }
-.tabs button.on { color: var(--text); }
-.tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 0 0 18px; }
+.kpi-card { padding: 16px 20px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); display: flex; flex-direction: column; gap: 6px; }
+.kpi-card.warn dd { color: var(--warn); }
+.kpi-card dt { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.kpi-card dd { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.025em; }
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin: 0 0 18px;
+  padding: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--warn) 34%, var(--border));
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toolbar-card,
+.sortbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+}
+.sortbar .muted { font-size: 13px; }
+.sort-acts { display: flex; gap: 8px; }
+
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--dur) var(--ease);
+}
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }
 .n { font-size: 11.5px; color: var(--text-3); }
-.search { display: flex; align-items: center; gap: 8px; width: 220px; height: 30px; padding: 0 8px; border-radius: var(--radius-sm); color: var(--text-3); }
-.search:focus-within { background: var(--surface-hover); }
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 240px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.search:focus-within { background: var(--surface); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .search svg { width: 14px; height: 14px; }
-.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13.5px; color: var(--text); }
-.rows { position: relative; }
-.row { display: grid; grid-template-columns: minmax(0, 2.4fr) 110px minmax(0, 1.4fr) 80px 72px; align-items: center; gap: 16px; padding: 0 12px; }
-.row.head { height: 38px; font-size: 12px; color: var(--text-3); }
-.row.item { height: 60px; margin: 0 -12px; padding: 0 24px; border-radius: var(--radius); cursor: pointer; outline: none; transition: background var(--dur) var(--ease); }
-.row.item + .row.item { box-shadow: inset 0 1px 0 var(--border); }
-.row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-hover); box-shadow: none; }
-.row.item:hover + .row.item, .row.item.active + .row.item { box-shadow: none; }
-.who { display: flex; flex-direction: column; min-width: 0; }
-.name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; outline: none; font-size: 13px; color: var(--text); }
+
+.site-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.site-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 22px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  outline: none;
+  transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.site-card:hover,
+.site-card:focus-visible,
+.site-card.active {
+  border-color: var(--accent-border);
+  transform: translateY(-2px);
+}
+.site-card.stopped { opacity: 0.78; }
+
+.card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.name { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
-.traffic { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
-.lat { font-size: 13px; }
-.lat.warn { color: var(--warn); }
-.lat.bad { color: var(--bad); }
-.act { display: flex; justify-content: flex-end; gap: 2px; opacity: 0; transition: opacity var(--dur) var(--ease); }
-.row.item:hover .act, .row.item.active .act, .row.item:focus-within .act { opacity: 1; }
-.sortbar ~ .rows .act { opacity: 1; }
-.mobile-meta { display: none; }
-.skeleton { height: 60px; }
-.skeleton span { grid-column: 1 / -1; height: 14px; width: 40%; border-radius: 4px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.status-pill.good { background: var(--good-soft); color: var(--good); }
+.status-pill.bad { background: var(--bad-soft); color: var(--bad); }
+
+.card-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.metric-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.m-label { font-size: 11px; color: var(--text-3); }
+.m-val { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-val.good { color: var(--good); }
+.m-val.warn { color: var(--warn); }
+.m-val.bad { color: var(--bad); }
+.m-val.faint { color: var(--text-3); font-weight: 500; }
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.hint-text { font-size: 12px; }
+.act { display: flex; gap: 6px; }
+
+.sort-list { display: flex; flex-direction: column; gap: 10px; }
+.sort-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+  cursor: grab;
+  transition: transform 140ms var(--ease), border-color 140ms var(--ease), opacity 140ms var(--ease);
+}
+.sort-row:active { cursor: grabbing; }
+.sort-row.dragging { opacity: 0.55; border-color: var(--accent); }
+.sort-row.over { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.grip { display: grid; place-items: center; color: var(--text-3); }
+.grip svg { width: 16px; height: 16px; }
+.rank-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+.sort-row .who { flex: 1; }
+.sort-btns { display: flex; gap: 4px; }
+
+.skeleton { min-height: 168px; cursor: default; }
+.skeleton span { height: 16px; width: 45%; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.4; } }
-.none { padding: 32px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
-.empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; text-align: center; }
-.empty h2 { margin: 0; font-size: 17px; font-weight: 600; }
-.empty p { max-width: 380px; margin: 0 0 8px; color: var(--text-2); }
+.none { grid-column: 1 / -1; padding: 40px 0; text-align: center; color: var(--text-3); font-size: 13.5px; }
+.empty-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 64px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+  text-align: center;
+}
+.empty-card h2 { margin: 0; font-size: 17px; font-weight: 700; }
+.empty-card p { max-width: 380px; margin: 0 0 8px; color: var(--text-2); }
 .row-actions { display: flex; gap: 8px; }
-.fab { display: none; }
-@media (max-width: 860px) {
-  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; }
-  .toolbar { flex-direction: column-reverse; align-items: stretch; gap: 8px; }
-  .search { width: 100%; height: 36px; background: var(--surface-hover); }
+
+@media (max-width: 960px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .site-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .search { width: 100%; }
   .search kbd { display: none; }
-  .row.head { display: none; }
-  .row.item { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'who status' 'meta meta'; height: auto; gap: 4px 12px; padding: 13px 16px; margin: 0 -16px; border-radius: 0; }
-  .sortbar ~ .rows .row.item { grid-template-areas: 'who act' 'meta meta'; }
-  .who { grid-area: who; }
-  .who .sub { display: none; }
-  .status { grid-area: status; }
-  .traffic, .lat { display: none; }
-  .act { display: none; }
-  .sortbar ~ .rows .act { display: flex; grid-area: act; }
-  .sortbar ~ .rows .status { display: none; }
-  .mobile-meta { grid-area: meta; display: block; font-size: 12.5px; color: var(--text-3); }
-  .fab { position: fixed; right: 18px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 25; display: grid; place-items: center; width: 52px; height: 52px; border: 0; border-radius: 50%; background: var(--inverse-bg); color: var(--inverse-text); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3); cursor: pointer; }
-  .fab svg { width: 22px; height: 22px; }
+  .card-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .hint-text { display: none; }
 }
 </style>
