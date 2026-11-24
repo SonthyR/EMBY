@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,19 +35,19 @@ const (
 	appleSpeedtestUserAgent   = "networkQuality/194.80.3 CFNetwork/3860.400.51 Darwin/25.3.0"
 	speedtestBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-	volcengineTOSBeijingHost      = "probe-bucket-beijing.tos-cn-beijing.volces.com"
-	volcengineTOSShanghaiHost     = "probe-bucket-shanghai.tos-cn-shanghai.volces.com"
-	volcengineTOSGuangzhouHost    = "probe-bucket-guangzhou.tos-cn-guangzhou.volces.com"
-	defaultDoHAliDNSURL           = "https://dns.alidns.com/resolve"
-	defaultDoHGoogleURL           = "https://dns.google/resolve"
-	defaultTOSCatalogURL          = "https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=tos"
-	maxTOSCatalogBytes            = 128 << 10
-	tosDNSCacheTTL                = 10 * time.Minute
-	maxSpeedtestCandidatesPerNode = 3
-	volcengineTOSDownloadRange    = "bytes=0-536870911"
-	minValidUploadBytes           = int64(256 << 10)
-	minFastTestUploadBytes        = int64(64 << 10)
-	maxDirectReportSessions       = 128
+	volcengineTOSBeijingHost   = "probe-bucket-beijing.tos-cn-beijing.volces.com"
+	volcengineTOSShanghaiHost  = "probe-bucket-shanghai.tos-cn-shanghai.volces.com"
+	volcengineTOSGuangzhouHost = "probe-bucket-guangzhou.tos-cn-guangzhou.volces.com"
+	defaultDoHAliDNSURL        = "https://dns.alidns.com/resolve"
+	defaultDoHGoogleURL        = "https://dns.google/resolve"
+	defaultTOSCatalogURL       = "https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=tos"
+	maxTOSCatalogBytes         = 128 << 10
+	tosDNSCacheTTL             = 10 * time.Minute
+	maxSpeedtestDNSCandidates  = 3
+	volcengineTOSDownloadRange = "bytes=0-536870911"
+	minValidUploadBytes        = int64(256 << 10)
+	minFastTestUploadBytes     = int64(64 << 10)
+	maxDirectReportSessions    = 128
 
 	edgeSpeedtestPathPrefix       = "/_yundu/st/"
 	edgeSpeedtestUIPathPrefix     = "/_yundu/st-ui/"
@@ -775,6 +774,13 @@ func newSpeedtestSingleConnHTTPClient(resolvedIP, targetHost string, totalTimeou
 	if transport.DialContext != nil && transportOverride != nil {
 		origDial := transport.DialContext
 		transport.DialContext = func(dctx context.Context, network, addr string) (net.Conn, error) {
+			if host, port, err := net.SplitHostPort(addr); err == nil && resolvedAddr.IsValid() &&
+				(targetHost == "" || strings.EqualFold(host, targetHost)) {
+				if !isPublicSpeedtestIP(resolvedAddr) {
+					return nil, errors.New("拒绝连接非公网目标 IP")
+				}
+				addr = net.JoinHostPort(resolvedAddr.Unmap().String(), port)
+			}
 			start := time.Now()
 			conn, err := origDial(dctx, network, addr)
 			if err != nil {
@@ -840,6 +846,11 @@ func executeSpeedtestTarget(ctx context.Context, target agentSpeedtestTarget, de
 		dur = 15 * time.Second
 	}
 
+	if target.TargetKind == "builtin" &&
+		(isTOSSpeedtestHost(targetHostnameForURL(target.DownloadURL)) || (target.DownloadURL == "" && target.UploadURL == "")) {
+		return executeTOSTarget(ctx, target, dur, transportOverride)
+	}
+
 	if len(target.Candidates) > 0 {
 		rowBudget := max(min(dur*3+12*time.Second, 30*time.Second), 12*time.Second)
 		rowCtx, rowCancel := context.WithTimeout(ctx, rowBudget)
@@ -853,18 +864,7 @@ func executeSpeedtestTarget(ctx context.Context, target agentSpeedtestTarget, de
 				break
 			}
 			tried++
-			candTarget := target
-			candTarget.Candidates = nil
-			candTarget.ResolvedIP = cand.ResolvedIP
-			if cand.UploadURL != "" {
-				candTarget.UploadURL = cand.UploadURL
-			}
-			if cand.DownloadURL != "" {
-				candTarget.DownloadURL = cand.DownloadURL
-			}
-			if cand.Method != "" {
-				candTarget.Method = cand.Method
-			}
+			candTarget := speedtestTargetWithCandidate(target, cand)
 			res := executeSingleSpeedtestCandidate(rowCtx, candTarget, dur, transportOverride)
 			if cand.Label != "" {
 				res.ResolvedNode = cand.Label
@@ -896,8 +896,24 @@ func executeSpeedtestTarget(ctx context.Context, target agentSpeedtestTarget, de
 	return res
 }
 
-func executeSingleSpeedtestCandidate(ctx context.Context, target agentSpeedtestTarget, dur time.Duration, transportOverride *http.Transport) speedtestTargetResult {
-	res := speedtestTargetResult{
+func speedtestTargetWithCandidate(target agentSpeedtestTarget, cand speedtestCandidate) agentSpeedtestTarget {
+	candTarget := target
+	candTarget.Candidates = nil
+	candTarget.ResolvedIP = cand.ResolvedIP
+	if cand.UploadURL != "" {
+		candTarget.UploadURL = cand.UploadURL
+	}
+	if cand.DownloadURL != "" {
+		candTarget.DownloadURL = cand.DownloadURL
+	}
+	if cand.Method != "" {
+		candTarget.Method = cand.Method
+	}
+	return candTarget
+}
+
+func newSpeedtestTargetResult(target agentSpeedtestTarget) speedtestTargetResult {
+	return speedtestTargetResult{
 		TargetKey:     target.TargetKey,
 		Label:         target.Label,
 		Province:      target.Province,
@@ -911,6 +927,10 @@ func executeSingleSpeedtestCandidate(ctx context.Context, target agentSpeedtestT
 		OutboundRTTMs: -1,
 		TestedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+func executeSingleSpeedtestCandidate(ctx context.Context, target agentSpeedtestTarget, dur time.Duration, transportOverride *http.Transport) speedtestTargetResult {
+	res := newSpeedtestTargetResult(target)
 	if strings.TrimSpace(target.UploadURL) == "" && strings.TrimSpace(target.DownloadURL) == "" {
 		res.Status = "error"
 		res.Error = "无可用测速地址"
@@ -980,16 +1000,25 @@ func targetHostnameForURL(rawURL string) string {
 func measureSingleUpload(ctx context.Context, target agentSpeedtestTarget, dur time.Duration, transportOverride *http.Transport) (bps int64, retrans int, rttMs int, remoteIP string, err error) {
 	retrans = -1
 	rttMs = -1
-	reqCtx, cancel := context.WithTimeout(ctx, dur+10*time.Second)
-	defer cancel()
-
 	method := strings.ToUpper(strings.TrimSpace(target.Method))
 	if method != http.MethodPut {
 		method = http.MethodPost
 	}
+	targetHost := targetHostnameForURL(target.UploadURL)
+	tosUpload := target.TargetKind == "builtin" && isTOSSpeedtestHost(targetHost) && method == http.MethodPut
+	phaseTimeout := dur + 10*time.Second
+	if tosUpload {
+		phaseTimeout = dur
+	}
+	startedAt := time.Now()
+	reqCtx, cancel := context.WithDeadline(ctx, startedAt.Add(phaseTimeout))
+	defer cancel()
+
 	plannedBytes := int64(256 << 20)
 	if target.IsAppleCDN {
 		plannedBytes = int64(64 << 20)
+	} else if tosUpload {
+		plannedBytes = tosSpeedtestBytes
 	}
 	if dur < time.Second {
 		plannedBytes = int64(4 << 20)
@@ -1009,13 +1038,14 @@ func measureSingleUpload(ctx context.Context, target agentSpeedtestTarget, dur t
 		req.Header.Set("User-Agent", speedtestBrowserUserAgent)
 	}
 
-	targetHost := targetHostnameForURL(target.UploadURL)
-	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, targetHost, dur+10*time.Second, transportOverride)
+	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, targetHost, 0, transportOverride)
 	resp, doErr := client.Do(req)
 	endAt := time.Now()
 
 	if resp != nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		if !tosUpload {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		}
 		if tc := getConn(); tc != nil {
 			tc.capture()
 		}
@@ -1034,11 +1064,30 @@ func measureSingleUpload(ctx context.Context, target agentSpeedtestTarget, dur t
 	}
 
 	sent := bodyStream.sentBytes()
-	elapsed := bodyStream.elapsed()
 	minBytes := minValidUploadBytes
 	if dur < time.Second {
 		minBytes = minFastTestUploadBytes
 	}
+	if tosUpload {
+		completed := doErr == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300
+		if completed || (resp == nil && sent >= plannedBytes) {
+			defer deleteTOSSpeedtestUpload(ctx, client, req)
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, retrans, rttMs, remoteIP, err
+		}
+		timedSample := errors.Is(doErr, context.DeadlineExceeded) && reqCtx.Err() == context.DeadlineExceeded && sent >= minBytes
+		switch {
+		case doErr != nil && !timedSample:
+			return 0, retrans, rttMs, remoteIP, doErr
+		case resp != nil && !completed:
+			return 0, retrans, rttMs, remoteIP, fmt.Errorf("HTTP %d", resp.StatusCode)
+		case doErr == nil && sent < plannedBytes:
+			return 0, retrans, rttMs, remoteIP, errors.New("测速上传未发完请求体")
+		}
+		return tosTransferBps(sent, endAt.Sub(startedAt)), retrans, rttMs, remoteIP, nil
+	}
+	elapsed := bodyStream.elapsed()
 	validWindow := doErr != nil && ctx.Err() == nil &&
 		(errors.Is(doErr, errUploadWindowReached) || bodyStream.hitWindow()) &&
 		sent >= minBytes &&
@@ -1074,7 +1123,14 @@ func measureSingleUpload(ctx context.Context, target agentSpeedtestTarget, dur t
 
 func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur time.Duration, transportOverride *http.Transport) (bps int64, rttMs int, remoteIP string, err error) {
 	rttMs = -1
-	reqCtx, cancel := context.WithTimeout(ctx, dur+10*time.Second)
+	targetHost := targetHostnameForURL(target.DownloadURL)
+	tosDownload := target.TargetKind == "builtin" && isTOSSpeedtestHost(targetHost)
+	phaseTimeout := dur + 10*time.Second
+	if tosDownload {
+		phaseTimeout = dur
+	}
+	startedAt := time.Now()
+	reqCtx, cancel := context.WithDeadline(ctx, startedAt.Add(phaseTimeout))
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.DownloadURL, nil)
@@ -1089,11 +1145,12 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Cache-Control", "no-store")
 
-	targetHost := targetHostnameForURL(target.DownloadURL)
-	if strings.HasSuffix(strings.ToLower(targetHost), ".volces.com") {
+	if tosDownload {
+		req.Header.Set("Range", tosSpeedtestDownloadRange)
+	} else if strings.HasSuffix(strings.ToLower(targetHost), ".volces.com") {
 		req.Header.Set("Range", volcengineTOSDownloadRange)
 	}
-	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, targetHost, dur+10*time.Second, transportOverride)
+	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, targetHost, 0, transportOverride)
 	resp, doErr := client.Do(req)
 	if doErr != nil {
 		if tc := getConn(); tc != nil {
@@ -1101,7 +1158,14 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 		}
 		return 0, -1, remoteIP, doErr
 	}
-	if resp.StatusCode >= 400 {
+	var expectedBytes int64
+	var responseErr error
+	if tosDownload {
+		expectedBytes, responseErr = validateTOSRange(resp, tosSpeedtestBytes)
+	} else if resp.StatusCode >= 400 {
+		responseErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if responseErr != nil {
 		if tc := getConn(); tc != nil {
 			tc.capture()
 			remoteIP = tc.remoteIP
@@ -1113,7 +1177,7 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 			}
 		}
 		_ = resp.Body.Close()
-		return 0, rttMs, remoteIP, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 0, rttMs, remoteIP, responseErr
 	}
 
 	buf := make([]byte, 64<<10)
@@ -1170,6 +1234,23 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 	}
 	_ = resp.Body.Close()
 
+	if tosDownload {
+		if err := ctx.Err(); err != nil {
+			return 0, rttMs, remoteIP, err
+		}
+		timedSample := reqCtx.Err() == context.DeadlineExceeded &&
+			(transferErr == nil || errors.Is(transferErr, context.DeadlineExceeded))
+		if transferErr != nil && !timedSample {
+			return 0, rttMs, remoteIP, transferErr
+		}
+		if !timedSample && totalRead != expectedBytes {
+			return 0, rttMs, remoteIP, io.ErrUnexpectedEOF
+		}
+		if totalRead < tosMinimumDownloadBytes {
+			return 0, rttMs, remoteIP, fmt.Errorf("测速文件样本不足（%d 字节）", totalRead)
+		}
+		return tosTransferBps(totalRead, endAt.Sub(startedAt)), rttMs, remoteIP, nil
+	}
 	if transferErr != nil {
 		return 0, rttMs, remoteIP, transferErr
 	}
@@ -1196,12 +1277,12 @@ type speedtestDNSCacheEntry struct {
 	expiresAt time.Time
 }
 
-func filterPublicIPv4Candidates(raw []string) []string {
+func filterPublicIPv4Candidates(raw []string, limit int) []string {
 	if len(raw) == 0 {
 		return nil
 	}
 	seen := make(map[string]bool, len(raw))
-	out := make([]string, 0, maxSpeedtestCandidatesPerNode)
+	out := make([]string, 0, limit)
 	for _, s := range raw {
 		addr, err := netip.ParseAddr(strings.TrimSpace(s))
 		if err != nil {
@@ -1217,7 +1298,7 @@ func filterPublicIPv4Candidates(raw []string) []string {
 		}
 		seen[ipStr] = true
 		out = append(out, ipStr)
-		if len(out) >= maxSpeedtestCandidatesPerNode {
+		if len(out) >= limit {
 			break
 		}
 	}
@@ -1243,7 +1324,7 @@ func parseDoHAnswerIPv4(data []byte) []string {
 			raw = append(raw, ans.Data)
 		}
 	}
-	return filterPublicIPv4Candidates(raw)
+	return filterPublicIPv4Candidates(raw, maxSpeedtestDNSCandidates)
 }
 
 func (m *speedtestManager) fetchDoHIPv4(ctx context.Context, client *http.Client, endpoint, host, ecs string) []string {
@@ -1317,24 +1398,32 @@ func (m *speedtestManager) loadTOSCatalog(ctx context.Context) map[string][]stri
 	out := make(map[string][]string)
 	for _, line := range strings.Split(string(body), "\n") {
 		fields := strings.Split(strings.TrimSuffix(line, "\r"), "\t")
-		if len(fields) < 8 || fields[0] != "tos" || fields[1] != "4" || fields[6] != "443" {
+		if len(fields) < 8 || fields[1] != "4" || fields[6] != "443" {
 			continue
 		}
-		def, ok := lookupSpeedtestProvince(fields[2])
-		if !ok {
+		switch fields[0] {
+		case "tos", "tosutil", "speedtest":
+		default:
 			continue
 		}
-		_, regionHost, _ := strings.Cut(def.TOSHost, ".")
-		if !strings.EqualFold(strings.TrimSuffix(fields[7], "."), regionHost) {
-			continue
+		group := strings.ToLower(strings.TrimSpace(fields[3]))
+		switch group {
+		case ispGroupCT, ispGroupCU, ispGroupCM:
+		default:
+			group = classifyISPGroup(fields[3])
 		}
-		group := classifyISPGroup(fields[3])
-		if def.ecsForISP(group) == "" {
-			continue
-		}
-		key := def.Code + "-" + group
-		if len(out[key]) < maxSpeedtestCandidatesPerNode {
-			out[key] = filterPublicIPv4Candidates(append(out[key], fields[5]))
+		// The catalog's city label is display metadata. Its TOS endpoint
+		// identifies the service region.
+		region := strings.TrimSuffix(fields[7], ".")
+		for _, def := range speedtestProvinceCatalog {
+			_, regionHost, _ := strings.Cut(def.TOSHost, ".")
+			if strings.EqualFold(region, regionHost) && def.ecsForISP(group) != "" {
+				key := def.Code + "-" + group
+				if len(out[key]) < maxTOSDirectoryCandidates {
+					out[key] = filterPublicIPv4Candidates(append(out[key], fields[5]), maxTOSDirectoryCandidates)
+				}
+				break
+			}
 		}
 	}
 	return out
@@ -1366,7 +1455,7 @@ func (m *speedtestManager) resolveVolcengineTOSIPs(ctx context.Context, host, ec
 		if err != nil {
 			return nil
 		}
-		return filterPublicIPv4Candidates(ips)
+		return filterPublicIPv4Candidates(ips, maxSpeedtestDNSCandidates)
 	}
 
 	var resolved []string
@@ -1377,19 +1466,6 @@ func (m *speedtestManager) resolveVolcengineTOSIPs(ctx context.Context, host, ec
 		if ips := m.fetchDoHIPv4(ctx, client, ep, host, ecs); len(ips) > 0 {
 			resolved = ips
 			break
-		}
-	}
-
-	if len(resolved) == 0 && ctx.Err() == nil {
-		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", host)
-		cancel()
-		if err == nil {
-			raw := make([]string, 0, len(addrs))
-			for _, a := range addrs {
-				raw = append(raw, a.String())
-			}
-			resolved = filterPublicIPv4Candidates(raw)
 		}
 	}
 
@@ -1469,7 +1545,6 @@ func newSpeedtestManager(db *DB, pm *ProxyManager) *speedtestManager {
 		dohEndpoints:      []string{defaultDoHAliDNSURL, defaultDoHGoogleURL},
 		tosCatalogURL:     defaultTOSCatalogURL,
 		dnsCache:          make(map[string]speedtestDNSCacheEntry),
-		phaseDuration:     defaultSpeedtestPhaseDuration,
 		directReports:     make(map[string]*directSpeedtestReportState),
 		activeNode:        make(map[int64]string),
 		masterCanc:        make(map[string]context.CancelFunc),
@@ -1697,7 +1772,8 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 		return nil, errSpeedtestAlreadyRunning
 	}
 	m.activeNode[nodeID] = "preparing:" + jobID
-	dur := m.phaseDuration
+	configuredDuration := m.phaseDuration
+	dur := configuredDuration
 	m.mu.Unlock()
 
 	m.markJobsExpired(expiredIDs)
@@ -1757,72 +1833,14 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 			cleanISPs = append([]string(nil), defaultSpeedtestISPs...)
 		}
 
-		resolvedGrid := make([][][]string, len(validProvs))
-		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 6*time.Second)
-		var resolveWG sync.WaitGroup
-		var catalog map[string][]string
-		resolveWG.Go(func() { catalog = m.loadTOSCatalog(resolveCtx) })
-		for pi, def := range validProvs {
-			resolvedGrid[pi] = make([][]string, len(cleanISPs))
-			for ii, g := range cleanISPs {
-				resolveWG.Add(1)
-				go func(pIdx, iIdx int, host, ecs string) {
-					defer resolveWG.Done()
-					resolvedGrid[pIdx][iIdx] = m.resolveVolcengineTOSIPs(resolveCtx, host, ecs)
-				}(pi, ii, def.TOSHost, def.ecsForISP(g))
-			}
-		}
-		resolveWG.Wait()
-		resolveCancel()
-
-		for pi, def := range validProvs {
+		for _, def := range validProvs {
 			cleanProvs = append(cleanProvs, def.Code)
-			for ii, g := range cleanISPs {
-				if len(targets) >= maxSpeedtestTargetsPerJob {
-					break
-				}
-				ips := filterPublicIPv4Candidates(slices.Concat(catalog[def.Code+"-"+g], resolvedGrid[pi][ii]))
-				dlURL := "https://" + def.TOSHost + "/download/test"
-				cands := make([]speedtestCandidate, 0, max(len(ips), 1))
-				if len(ips) > 0 {
-					for _, ip := range ips {
-						cands = append(cands, speedtestCandidate{
-							Label:       ip,
-							ResolvedIP:  ip,
-							UploadURL:   "https://" + def.TOSHost + "/upload/yundu-" + newSpeedtestRandomHex(8),
-							DownloadURL: dlURL,
-							Method:      http.MethodPut,
-						})
-					}
-				} else {
-					cands = append(cands, speedtestCandidate{
-						Label:       def.TOSHost,
-						UploadURL:   "https://" + def.TOSHost + "/upload/yundu-" + newSpeedtestRandomHex(8),
-						DownloadURL: dlURL,
-						Method:      http.MethodPut,
-					})
-				}
-				ispLbl := ispGroupLabel(g)
-				first := cands[0]
-				targets = append(targets, agentSpeedtestTarget{
-					TargetKey:   def.Code + "-" + g,
-					Label:       def.Label + ispLbl,
-					Province:    def.Label,
-					ISPGroup:    g,
-					ISPLabel:    ispLbl,
-					TargetKind:  "builtin",
-					ResolvedIP:  first.ResolvedIP,
-					UploadURL:   first.UploadURL,
-					DownloadURL: first.DownloadURL,
-					Method:      first.Method,
-					DurationMs:  durationMs,
-					Candidates:  cands,
-				})
-			}
-			if len(targets) >= maxSpeedtestTargetsPerJob {
-				break
-			}
 		}
+		tosDuration := configuredDuration
+		if tosDuration <= 0 {
+			tosDuration = tosSpeedtestDuration
+		}
+		targets = append(targets, m.buildTOSTargets(validProvs, cleanISPs, tosDuration)...)
 	}
 
 	if mode == "apple" {

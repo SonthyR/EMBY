@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -226,7 +227,10 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, strings.Join([]string{
 				"tos\t4\t北京\t电信\tnode.example\t127.0.0.1\t443\ttos-cn-beijing.volces.com",
-				"tos\t4\t北京\t电信\tnode.example\t180.213.185.50\t443\ttos-cn-shanghai.volces.com",
+				"tos\t4\t浦东新区\tCT\tnode.example\t180.213.185.50\t443\ttos-cn-shanghai.volces.com",
+				"tos\t4\t北京市\tCT\tnode.example\t180.213.185.61\t443\ttos-cn-beijing.volces.com",
+				"tos\t4\t北京\t电信\tnode.example\t180.213.185.62\t443\ttos-cn-beijing.volces.com",
+				"tos\t4\t北京\t电信\tnode.example\t180.213.185.63\t443\ttos-cn-beijing.volces.com",
 				"tos\t4\t北京\t电信\tnode.example\t180.213.185.21\t443\ttos-cn-beijing.volces.com",
 			}, "\r\n"))
 			return
@@ -239,8 +243,10 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	app.speedtest.dohClient = dohSrv.Client()
 	app.speedtest.dohEndpoints = []string{dohSrv.URL}
 	app.speedtest.tosCatalogURL = dohSrv.URL + "/getNodes?format=tsv&scope=tos"
-	if catalog := app.speedtest.loadTOSCatalog(context.Background()); len(catalog["bj-ct"]) != 1 || catalog["bj-ct"][0] != "180.213.185.21" {
+	if catalog := app.speedtest.loadTOSCatalog(context.Background()); len(catalog["bj-ct"]) != 4 || catalog["bj-ct"][0] != "180.213.185.61" || catalog["bj-ct"][3] != "180.213.185.21" {
 		t.Fatalf("unexpected vetted TOS catalog: %+v", catalog)
+	} else if sh := catalog["sh-ct"]; len(sh) != 1 || sh[0] != "180.213.185.50" {
+		t.Fatalf("expected the Shanghai endpoint under Shanghai even with a display city label: %+v", catalog)
 	}
 	if firstIPs := app.speedtest.resolveVolcengineTOSIPs(context.Background(), volcengineTOSBeijingHost, "219.141.136.0/24"); len(firstIPs) != 1 || firstIPs[0] != "180.213.185.21" {
 		t.Fatalf("resolveVolcengineTOSIPs returned %+v", firstIPs)
@@ -250,15 +256,21 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		t.Fatalf("expected cached DoH resolution (hits=%d), got %+v", dohHits.Load(), secondIPs)
 	}
 
-	var bjTOSAttempts atomic.Int32
+	var bjTOSAttempts, failedTOSDials, cleanedTOSUploads atomic.Int32
+	var interruptTOSDownload atomic.Bool
 	chunk := bytes.Repeat([]byte("SPEEDTEST-PAYLOAD-"), 4096)
 	targetHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/upload/yundu-") {
+			if r.Method == http.MethodDelete {
+				cleanedTOSUploads.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			if r.Method != http.MethodPut || r.ContentLength <= 0 {
 				http.Error(w, "invalid TOS PUT upload", http.StatusBadRequest)
 				return
 			}
-			// Fail first Beijing TOS candidate to exercise multi-IP failover.
+			// Reject the first reachable Beijing upload so the next candidate is used.
 			if strings.EqualFold(r.Host, volcengineTOSBeijingHost) && bjTOSAttempts.Add(1) == 1 {
 				http.Error(w, "upstream overloaded", http.StatusBadGateway)
 				return
@@ -269,12 +281,29 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/download/test":
-			if r.Header.Get("Range") != volcengineTOSDownloadRange {
+			if r.Header.Get("Range") == "bytes=0-0" {
+				w.Header().Set("Content-Range", "bytes 0-0/1048576000")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte{0})
+				return
+			}
+			if r.Header.Get("Range") != tosSpeedtestDownloadRange {
 				http.Error(w, "missing expected TOS Range header", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/1048576000", 8*len(chunk)-1))
+			w.Header().Set("Content-Length", strconv.Itoa(8*len(chunk)))
 			w.WriteHeader(http.StatusPartialContent)
+			if interruptTOSDownload.Load() {
+				_, _ = w.Write(chunk)
+				w.(http.Flusher).Flush()
+				select {
+				case <-r.Context().Done():
+				case <-time.After(3 * time.Second):
+				}
+				return
+			}
 			for i := 0; i < 8; i++ {
 				_, _ = w.Write(chunk)
 			}
@@ -357,11 +386,36 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, _ := net.SplitHostPort(addr)
+			switch host {
+			case "180.213.185.61", "180.213.185.62", "180.213.185.63":
+				failedTOSDials.Add(1)
+				return nil, &net.OpError{Op: "dial", Net: network, Err: context.DeadlineExceeded}
+			}
 			var d net.Dialer
 			return d.DialContext(ctx, "tcp", targetSrv.Listener.Addr().String())
 		},
 	}
 	mockTransport.TLSClientConfig.RootCAs = pool
+
+	t.Run("TOS deadline keeps transferred bytes but parent cancellation rejects them", func(t *testing.T) {
+		interruptTOSDownload.Store(true)
+		defer interruptTOSDownload.Store(false)
+		province, _ := lookupSpeedtestProvince("bj")
+		downloadTarget := newTOSTarget(province, ispGroupCT, []string{"180.213.185.21"}, nil, time.Second)
+		const duration = 300 * time.Millisecond
+		started := time.Now()
+		bps, _, _, err := measureSingleDownload(context.Background(), downloadTarget, duration, mockTransport)
+		if err != nil || bps <= 0 || time.Since(started) > 2*time.Second {
+			t.Fatalf("expected a partial sample at the TOS deadline, got %d B/s after %s, err=%v", bps, time.Since(started), err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), duration)
+		defer cancel()
+		bps, _, _, err = measureSingleDownload(ctx, downloadTarget, 5*time.Second, mockTransport)
+		if err == nil || bps != 0 {
+			t.Fatalf("parent cancellation produced a sample, got %d B/s, err=%v", bps, err)
+		}
+	})
 
 	app.speedtest.dohResolver = func(_ context.Context, _ string, _ string) ([]string, error) {
 		return []string{"180.213.185.40", "180.213.185.21"}, nil
@@ -388,7 +442,7 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected custom target response: %s", createRec.Body.String())
 	}
 
-	// 3. Start Master builtin+custom job (with candidate failover from bad-bj -> good-bj).
+	// 3. Start a job with three unreachable candidates, a rejected upload, and a healthy fallback.
 	startRec := httptest.NewRecorder()
 	app.handleSpeedtestStart(startRec, httptest.NewRequest(http.MethodPost, "/api/speedtest/start", strings.NewReader(`{"node_id":0,"mode":"all","provinces":["bj","bj"],"isps":["ct","ct","ct"]}`)))
 	if startRec.Code != http.StatusCreated {
@@ -403,7 +457,7 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	if startResp.Job.TotalTargets != 2 || len(startResp.Job.Results) != 2 {
 		t.Fatalf("master job total_targets=%d, results=%d, want 2 (1 builtin + 1 custom)", startResp.Job.TotalTargets, len(startResp.Job.Results))
 	}
-	if catalogHits.Load() != 2 || startResp.Job.Results[0].ResolvedIP != "180.213.185.21" {
+	if catalogHits.Load() != 2 || startResp.Job.Results[0].ResolvedIP != "180.213.185.61" {
 		t.Fatalf("expected the live catalog address before DoH candidates: %+v", startResp.Job.Results)
 	}
 
@@ -437,9 +491,13 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		}
 		if r.TargetKind == "builtin" {
 			if r.ResolvedNode != "180.213.185.40" || r.ResolvedIP != "180.213.185.40" {
-				t.Fatalf("expected failover to second TOS IP candidate (180.213.185.40), got %+v", r)
+				t.Fatalf("expected failover to usable TOS IP (180.213.185.40), got %+v", r)
 			}
 		}
+	}
+	if failedTOSDials.Load() != 3 || bjTOSAttempts.Load() != 2 || cleanedTOSUploads.Load() != 1 {
+		t.Fatalf("expected 3 probe failures, 2 measured uploads and 1 cleanup; got %d, %d, %d",
+			failedTOSDials.Load(), bjTOSAttempts.Load(), cleanedTOSUploads.Load())
 	}
 	if metrics := rt.nodeSpeedMetricsCopy(0); len(metrics) != 2 {
 		t.Fatalf("master persisted metrics = %+v, want ct and cu", metrics)
