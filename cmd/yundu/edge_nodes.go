@@ -359,6 +359,7 @@ type edgeNodeLiveState struct {
 	alertQuota80Period  string
 	alertQuota100Period string
 	supportsSpeedtest   bool
+	supportsDirectPopup bool
 
 	pending           atomic.Int64
 	persistedTotalIn  int64
@@ -1846,20 +1847,21 @@ type agentTrafficReport struct {
 }
 
 type agentHeartbeatRequest struct {
-	Version           string                  `json:"version"`
-	ListenPort        int                     `json:"listen_port"`
-	TLSActive         bool                    `json:"tls_active"`
-	ActiveStreams     int                     `json:"active_streams"`
-	CurrentBps        int64                   `json:"current_bps"`
-	MemoryBytes       uint64                  `json:"memory_bytes"`
-	UptimeSec         int64                   `json:"uptime_sec"`
-	SupportsSpeedtest bool                    `json:"supports_speedtest,omitempty"`
-	UpstreamLatencies map[int64]int           `json:"upstream_latencies,omitempty"`
-	SpeedtestProgress *agentSpeedtestProgress `json:"speedtest_progress,omitempty"`
-	UpgradeRequestID  string                  `json:"upgrade_request_id,omitempty"`
-	UpgradeStatus     string                  `json:"upgrade_status,omitempty"`
-	CertFingerprint   string                  `json:"cert_fingerprint"`
-	TrafficReports    []agentTrafficReport    `json:"traffic_reports"`
+	Version             string                  `json:"version"`
+	ListenPort          int                     `json:"listen_port"`
+	TLSActive           bool                    `json:"tls_active"`
+	ActiveStreams       int                     `json:"active_streams"`
+	CurrentBps          int64                   `json:"current_bps"`
+	MemoryBytes         uint64                  `json:"memory_bytes"`
+	UptimeSec           int64                   `json:"uptime_sec"`
+	SupportsSpeedtest   bool                    `json:"supports_speedtest,omitempty"`
+	SupportsDirectPopup bool                    `json:"supports_direct_popup,omitempty"`
+	UpstreamLatencies   map[int64]int           `json:"upstream_latencies,omitempty"`
+	SpeedtestProgress   *agentSpeedtestProgress `json:"speedtest_progress,omitempty"`
+	UpgradeRequestID    string                  `json:"upgrade_request_id,omitempty"`
+	UpgradeStatus       string                  `json:"upgrade_status,omitempty"`
+	CertFingerprint     string                  `json:"cert_fingerprint"`
+	TrafficReports      []agentTrafficReport    `json:"traffic_reports"`
 }
 
 type agentHeartbeatResponse struct {
@@ -2020,6 +2022,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if req.SupportsSpeedtest {
 		node.supportsSpeedtest = true
 	}
+	node.supportsDirectPopup = req.SupportsDirectPopup || strings.TrimSpace(r.Header.Get("X-Yundu-Direct-Popup")) == "1"
 	if detectedIP != "" {
 		node.detectedIP = detectedIP
 	}

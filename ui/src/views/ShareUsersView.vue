@@ -32,18 +32,22 @@ const shareText = ref('')
 const justCreated = ref(false)
 
 const selected = computed(() => users.value.find(u => u.id === selectedId.value) || null)
+let listLoadGen = 0
 
 async function load(silent = false) {
+  const gen = ++listLoadGen
   if (!silent) loading.value = true
   try {
     const [list, siteList] = await Promise.all([shareApi.list(), sitesApi.list()])
+    if (gen !== listLoadGen) return
     users.value = list
     sites.value = siteList
     loadError.value = ''
   } catch (error) {
+    if (gen !== listLoadGen) return
     loadError.value = errorMessage(error, '读取失败')
   } finally {
-    loading.value = false
+    if (gen === listLoadGen) loading.value = false
   }
 }
 
@@ -238,6 +242,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
     <ShareUserDetail
       :open="!!selected && !formOpen"
       :user="selected"
+      :sites="sites"
       @close="selectedId = null"
       @edit="selected && openEdit(selected)"
       @changed="load(true)"

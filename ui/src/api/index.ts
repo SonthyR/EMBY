@@ -21,6 +21,7 @@ import type {
   SiteAccount,
   SpeedtestCustomTarget,
   SpeedtestCustomTargetInput,
+  SpeedtestDirectReport,
   SpeedtestDirectTarget,
   SpeedtestJob,
   SpeedtestTargetsResponse,
@@ -316,7 +317,7 @@ export const speedtestApi = {
     api.del<{ deleted: boolean }>(`/api/speedtest/custom-targets/${id(targetId)}`),
   start: (req: {
     node_id: number
-    mode: 'builtin' | 'custom' | 'all'
+    mode: 'builtin' | 'apple' | 'custom' | 'all'
     provinces?: string[]
     isps?: string[]
     custom_target_ids?: number[]
@@ -327,7 +328,12 @@ export const speedtestApi = {
     ),
   job: (jobId: string) => api.get<{ job: SpeedtestJob }>(`/api/speedtest/jobs/${encodeURIComponent(jobId)}`),
   cancel: (jobId: string) => api.post<{ canceled: boolean }>(`/api/speedtest/jobs/${encodeURIComponent(jobId)}/cancel`),
-  directTargets: () => api.get<{ targets: SpeedtestDirectTarget[] }>('/api/speedtest/direct-targets'),
+  directTargets: (nodeId?: number) =>
+    api.get<{ targets: SpeedtestDirectTarget[] }>(
+      nodeId !== undefined ? `/api/speedtest/direct-targets?node_id=${encodeURIComponent(String(nodeId))}` : '/api/speedtest/direct-targets',
+    ),
+  directReportPoll: (reportId: string) =>
+    api.get<{ report: SpeedtestDirectReport }>(`/api/speedtest/direct-report/poll?id=${encodeURIComponent(reportId)}`),
 }
 
 export const ip2regionApi = {

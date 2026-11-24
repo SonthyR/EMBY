@@ -358,6 +358,8 @@ export interface SpeedtestTargetsResponse {
   default_isps: string[]
   custom_targets: SpeedtestCustomTarget[]
   nodes: SpeedtestNodeSummary[]
+  catalog_count?: number
+  catalog_updated_at?: string
 }
 
 export interface SpeedtestTargetResult {
@@ -366,7 +368,8 @@ export interface SpeedtestTargetResult {
   province: string
   isp_group: string
   isp_label: string
-  target_kind: 'builtin' | 'custom' | string
+  target_kind: 'builtin' | 'apple' | 'custom' | string
+  resolved_node?: string
   resolved_ip?: string
   status: 'pending' | 'running' | 'done' | 'error' | string
   error?: string
@@ -384,7 +387,7 @@ export interface SpeedtestJob {
   id: string
   node_id: number
   node_name: string
-  mode: string
+  mode: 'builtin' | 'apple' | 'custom' | 'all' | string
   provinces: string[]
   isps: string[]
   status: 'pending' | 'running' | 'done' | 'failed' | 'canceled' | string
@@ -404,8 +407,22 @@ export interface SpeedtestDirectTarget {
   public_url?: string
   scheme: string
   stream_url: string
+  popup_url?: string
+  report_id?: string
+  supports_popup?: boolean
   size_bytes: number
   unavailable_reason?: string
+}
+
+export interface SpeedtestDirectReport {
+  id: string
+  node_id: number
+  status: 'idle' | 'running' | 'done' | 'error' | string
+  ttfb_ms: number
+  mbps: number
+  received_bytes: number
+  error?: string
+  terminal?: boolean
 }
 
 export interface DashboardAnalyticsSummary {

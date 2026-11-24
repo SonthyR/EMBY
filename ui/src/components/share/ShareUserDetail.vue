@@ -1,29 +1,68 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X } from '@lucide/vue'
+import { Check, Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import { shareApi, shareUserToInput, type ShareSession, type ShareUser } from '@/api'
+import { shareApi, shareUserToInput, type ShareSession, type ShareUser, type Site } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { copyText, daysUntil, dateOnly, formatBytes, relativeTime } from '@/utils/format'
 import { STATUS_LABEL, STATUS_TONE } from './shareStatus'
 
-const props = defineProps<{ open: boolean; user: ShareUser | null }>()
+interface DraftSite {
+  site_id: number
+  site_account_id: number
+}
+
+const props = withDefaults(
+  defineProps<{ open: boolean; user: ShareUser | null; sites?: Site[] }>(),
+  { sites: () => [] },
+)
 const emit = defineEmits<{ close: []; edit: []; changed: []; deleted: []; copyShare: [] }>()
 const detail = ref<ShareUser | null>(null)
+const draftSites = ref<DraftSite[]>([])
+const baselineAccounts = ref<Record<number, number>>({})
 const busy = ref('')
 const reveal = ref(false)
+let detailReqGen = 0
+
+const siteMap = computed(() => new Map(props.sites.map(s => [s.id, s])))
+
+function syncDraftSites(u: ShareUser | null) {
+  const next: DraftSite[] = []
+  const accountsMap: Record<number, number> = {}
+  for (const s of u?.sites || []) {
+    const acct = s.site_account_id || 0
+    accountsMap[s.site_id] = acct
+    next.push({ site_id: s.site_id, site_account_id: acct })
+  }
+  baselineAccounts.value = accountsMap
+  draftSites.value = next
+}
+
+const sitesDirty = computed(() => {
+  const orig = detail.value?.sites || []
+  if (draftSites.value.length !== orig.length) return true
+  return draftSites.value.some(
+    (d, i) => d.site_id !== orig[i].site_id || (d.site_account_id || 0) !== (orig[i].site_account_id || 0),
+  )
+})
 
 watch(
   () => [props.open, props.user] as const,
-  async ([open, user]) => {
+  async ([open, user], prev) => {
+    const gen = ++detailReqGen
     if (!open || !user) return
+    const userChanged = !prev?.[0] || detail.value?.id !== user.id
     if (detail.value?.id !== user.id) reveal.value = false
     detail.value = { ...user, sessions: detail.value?.id === user.id ? detail.value.sessions : undefined }
+    if (userChanged || !sitesDirty.value) syncDraftSites(detail.value)
     try {
-      detail.value = await shareApi.get(user.id)
+      const fresh = await shareApi.get(user.id)
+      if (gen !== detailReqGen || !props.open || detail.value?.id !== user.id) return
+      detail.value = fresh
+      if (userChanged || !sitesDirty.value) syncDraftSites(fresh)
     } catch {
       /* list data is enough */
     }
@@ -38,17 +77,26 @@ const expiry = computed(() => {
   return { text: dateOnly(u.expires_at), sub: days === null ? '' : days < 0 ? '已过期' : days === 0 ? '今天到期' : `还剩 ${days} 天` }
 })
 
-async function run(key: string, action: () => Promise<unknown>, success: string) {
+async function run(key: string, action: () => Promise<unknown>, success: string): Promise<boolean> {
+  const gen = ++detailReqGen
+  const targetUserId = detail.value?.id
   busy.value = key
   try {
     await action()
     toast.success(success)
     emit('changed')
-    if (detail.value) detail.value = await shareApi.get(detail.value.id)
+    if (targetUserId) {
+      const fresh = await shareApi.get(targetUserId)
+      if (gen === detailReqGen && props.open && detail.value?.id === targetUserId) {
+        detail.value = fresh
+      }
+    }
+    return true
   } catch (error) {
     toast.error(errorMessage(error))
+    return false
   } finally {
-    busy.value = ''
+    if (busy.value === key) busy.value = ''
   }
 }
 const toggle = () => {
@@ -85,6 +133,56 @@ async function copyRouteURL() {
   const url = detail.value?.route_url || detail.value?.route_prefix
   if (url && (await copyText(url))) toast.success('专属地址已复制')
 }
+
+function assignedIndex(siteId: number): number {
+  return draftSites.value.findIndex(s => s.site_id === siteId)
+}
+
+function toggleDraftSite(site: Site) {
+  const idx = assignedIndex(site.id)
+  if (idx >= 0) {
+    const remaining = draftSites.value.filter(s => s.site_id !== site.id)
+    if (!remaining.length) {
+      toast.error('至少保留一个源站')
+      return
+    }
+    if (
+      detail.value?.route_prefix &&
+      site.enabled &&
+      !remaining.some(item => siteMap.value.get(item.site_id)?.enabled)
+    ) {
+      toast.error('专属入口账号至少保留一个已启用源站')
+      return
+    }
+    draftSites.value = remaining
+  } else {
+    const acct = baselineAccounts.value[site.id] || 0
+    draftSites.value = [...draftSites.value, { site_id: site.id, site_account_id: acct }]
+  }
+}
+
+function promoteDraftSite(siteId: number) {
+  if (!siteMap.value.get(siteId)?.enabled) {
+    toast.error('已停用的源站无法设为首选生效站')
+    return
+  }
+  const existing = draftSites.value.find(s => s.site_id === siteId)
+  const target: DraftSite = existing || { site_id: siteId, site_account_id: baselineAccounts.value[siteId] || 0 }
+  draftSites.value = [target, ...draftSites.value.filter(s => s.site_id !== siteId)]
+}
+
+function resetDraftSites() {
+  syncDraftSites(detail.value)
+}
+
+async function saveSites() {
+  const u = detail.value
+  if (!u || !draftSites.value.length) return
+  const ok = await run('sites', () => shareApi.update(u.id, shareUserToInput(u, { sites: draftSites.value })), '源站分配已更新')
+  if (ok && detail.value?.id === u.id) {
+    syncDraftSites(detail.value)
+  }
+}
 </script>
 
 <template>
@@ -99,7 +197,7 @@ async function copyRouteURL() {
     <template v-if="detail">
       <div class="primary-actions">
         <UiButton variant="primary" @click="emit('copyShare')"><Copy />复制分享信息</UiButton>
-        <UiButton icon aria-label="编辑" title="编辑" @click="emit('edit')"><Pencil /></UiButton>
+        <UiButton icon aria-label="编辑" title="编辑" :disabled="!!busy" @click="emit('edit')"><Pencil /></UiButton>
       </div>
 
       <section class="usage">
@@ -123,7 +221,6 @@ async function copyRouteURL() {
         <div><dt>到期</dt><dd>{{ expiry.text }}<span v-if="expiry.sub" class="faint"> · {{ expiry.sub }}</span></dd></div>
         <div><dt>在线设备</dt><dd class="num">{{ detail.session_count }}{{ detail.max_devices ? ` / ${detail.max_devices} 台` : ' 台' }}</dd></div>
         <div><dt>限速</dt><dd>{{ detail.speed_limit ? `${detail.speed_limit} Mbps` : '不限' }}</dd></div>
-        <div><dt>站点</dt><dd>{{ detail.sites.map(s => s.site_name).join('、') || '—' }}</dd></div>
         <div>
           <dt>密码</dt>
           <dd class="secret">
@@ -134,6 +231,45 @@ async function copyRouteURL() {
         </div>
         <div v-if="detail.note"><dt>备注</dt><dd>{{ detail.note }}</dd></div>
       </dl>
+
+      <section class="block sites-block">
+        <div class="block-head">
+          <h3>分配源站</h3>
+          <span v-if="detail.route_prefix && draftSites.length > 1" class="faint hint">首位为首选生效源站（按启用状态顺位）</span>
+        </div>
+        <div v-if="sites.length" class="site-pills">
+          <div v-for="site in sites" :key="site.id" class="site-chip-wrap">
+            <button
+              type="button"
+              class="site-chip"
+              :class="{ on: assignedIndex(site.id) >= 0, off: !site.enabled }"
+              :disabled="!!busy"
+              @click="toggleDraftSite(site)"
+            >
+              <Check v-if="assignedIndex(site.id) >= 0" class="chip-ico" />
+              <span>{{ site.name }}</span>
+              <span v-if="!site.enabled" class="off-tag">停用</span>
+              <span v-else-if="detail.route_prefix && detail.active_site_id === site.id && assignedIndex(site.id) >= 0" class="active-tag">生效</span>
+              <span v-else-if="detail.route_prefix && draftSites.length > 1 && assignedIndex(site.id) === 0" class="prio-tag">首选</span>
+            </button>
+            <button
+              v-if="detail.route_prefix && draftSites.length > 1 && assignedIndex(site.id) > 0 && site.enabled"
+              type="button"
+              class="pin-btn"
+              :disabled="!!busy"
+              title="设为首选生效源站"
+              @click="promoteDraftSite(site.id)"
+            >
+              设为生效
+            </button>
+          </div>
+        </div>
+        <p v-else class="faint none">{{ detail.sites.map(s => s.site_name).join('、') || '暂无可用源站' }}</p>
+        <div v-if="sitesDirty" class="site-save-bar">
+          <UiButton size="sm" variant="primary" :loading="busy === 'sites'" :disabled="!!busy && busy !== 'sites'" @click="saveSites">保存源站分配</UiButton>
+          <UiButton size="sm" variant="ghost" :disabled="!!busy" @click="resetDraftSites">取消</UiButton>
+        </div>
+      </section>
 
       <section class="block">
         <h3>已登录设备</h3>
@@ -200,7 +336,26 @@ async function copyRouteURL() {
 .secret button:hover { background: var(--surface-hover); color: var(--text); }
 .secret svg { width: 14px; height: 14px; }
 .block { padding-top: 20px; }
+.block-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.block-head h3 { margin: 0; }
+.hint { font-size: 11.5px; }
 h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
+.sites-block { padding-bottom: 18px; border-bottom: 1px solid var(--border); }
+.site-pills { display: flex; flex-wrap: wrap; gap: 8px; }
+.site-chip-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.site-chip { display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-2); font-size: 12.5px; cursor: pointer; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease); }
+.site-chip:hover:not(:disabled) { border-color: var(--text-3); color: var(--text); }
+.site-chip.on { border-color: var(--text); background: var(--surface); color: var(--text); font-weight: 500; }
+.site-chip.off { opacity: 0.65; }
+.site-chip:disabled { opacity: 0.5; cursor: default; }
+.chip-ico { width: 13px; height: 13px; }
+.active-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: var(--good-soft); color: var(--good); font-weight: 500; }
+.prio-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-weight: 500; }
+.off-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-weight: 500; }
+.pin-btn { height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-3); font-size: 11px; cursor: pointer; }
+.pin-btn:hover:not(:disabled) { border-color: var(--text); color: var(--text); }
+.pin-btn:disabled { opacity: 0.5; cursor: default; }
+.site-save-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .devices { margin: 0; padding: 0; list-style: none; }
 .devices li { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
 .devices li:last-child { border-bottom: 0; }

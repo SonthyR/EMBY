@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.4.0"
+var appVersion = "v1.4.1"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -299,6 +299,8 @@ func main() {
 	mux.HandleFunc("/api/speedtest/jobs/", cors(app.authMiddleware(app.handleSpeedtestJobByID)))
 	mux.HandleFunc("/api/speedtest/direct-targets", cors(app.authMiddleware(app.handleSpeedtestDirectTargets)))
 	mux.HandleFunc("/api/speedtest/direct-stream", cors(app.authMiddleware(app.handleSpeedtestDirectStream)))
+	mux.HandleFunc("/api/speedtest/direct-report", app.handleSpeedtestDirectReport)
+	mux.HandleFunc("/api/speedtest/direct-report/poll", cors(app.authMiddleware(app.handleSpeedtestDirectReportPoll)))
 	mux.HandleFunc("/api/ip2region", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/ip2region/", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/agent/heartbeat", app.handleAgentHeartbeat)

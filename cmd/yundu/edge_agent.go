@@ -671,6 +671,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Yundu-Node-ID", strconv.FormatInt(a.cfg.NodeID, 10))
 	req.Header.Set("X-Yundu-Node-Token", a.cfg.Token)
+	req.Header.Set("X-Yundu-Direct-Popup", "1")
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
 
 	resp, err := a.masterClient.Do(req)
@@ -816,6 +817,237 @@ func (a *edgeAgent) handleSpeedtestDirectRequest(w http.ResponseWriter, r *http.
 	serveSpeedtestByteStream(w, r, ticket.MaxBytes)
 }
 
+const edgeSpeedtestDirectErrorHTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>直连测速</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e5e7eb;font:14px/1.6 system-ui,-apple-system,sans-serif}.card{max-width:360px;padding:20px 24px;border:1px solid #262b36;border-radius:12px;background:#171a21;text-align:center}p{margin:8px 0 0;color:#9ca3af}</style></head><body><div class="card"><strong>测速链接已失效</strong><p>请返回云渡面板重新发起本机直测。</p></div></body></html>`
+
+const edgeSpeedtestDirectUITemplate = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>云渡 · HTTP 从机直连测速</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:#0f1115;color:#e5e7eb;font:14px/1.5 system-ui,-apple-system,sans-serif}
+.card{width:100%;max-width:400px;padding:20px 22px;border:1px solid #262b36;border-radius:12px;background:#171a21}
+.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.title{font-size:15px;font-weight:600}
+.pill{padding:2px 9px;border-radius:999px;font-size:12px;background:#262b36;color:#cbd5e1}
+.pill.ok{background:rgba(16,185,129,.16);color:#34d399}
+.pill.err{background:rgba(239,68,68,.16);color:#f87171}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:12px 0;border-top:1px solid #262b36;border-bottom:1px solid #262b36}
+.k{font-size:12px;color:#9ca3af}.v{margin-top:2px;font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.note{margin:12px 0 0;font-size:12px;color:#9ca3af;min-height:18px}
+.btn{margin-top:12px;height:30px;padding:0 12px;border:1px solid #333a48;border-radius:7px;background:#1f2430;color:#e5e7eb;font-size:12.5px;cursor:pointer}
+</style></head><body>
+<div class="card">
+  <div class="head"><span class="title">本机 ↔ HTTP 从机直连测速</span><span id="st" class="pill">测速中</span></div>
+  <div class="grid">
+    <div><div class="k">首字节 TTFB</div><div id="ttfb" class="v">--</div></div>
+    <div><div class="k">单线程下行</div><div id="mbps" class="v">--</div></div>
+    <div><div class="k">已拉取流量</div><div id="bytes" class="v">--</div></div>
+  </div>
+  <p id="note" class="note">正在建立直连单线程 HTTP 数据流...</p>
+  <button id="closeBtn" class="btn" type="button" hidden>关闭窗口</button>
+</div>
+<script>
+(function(){
+  const cfg = __CONFIG__;
+  const stEl = document.getElementById('st');
+  const ttfbEl = document.getElementById('ttfb');
+  const mbpsEl = document.getElementById('mbps');
+  const bytesEl = document.getElementById('bytes');
+  const noteEl = document.getElementById('note');
+  const closeBtn = document.getElementById('closeBtn');
+  closeBtn.addEventListener('click', function(){ try { window.close(); } catch(e) {} });
+
+  function report(phase, data) {
+    if (!cfg.reportUrl || !cfg.reportId || !cfg.reportToken) return Promise.resolve();
+    return fetch(cfg.reportUrl, {
+      method: 'POST',
+      mode: 'cors',
+      keepalive: phase !== 'progress',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({
+        id: cfg.reportId,
+        token: cfg.reportToken,
+        phase: phase,
+        ttfb_ms: data.ttfbMs,
+        mbps: data.mbps,
+        received_bytes: data.receivedBytes,
+        error: data.error || ''
+      })
+    }).catch(function(){});
+  }
+
+  function fmtBytes(n) {
+    if (!n || n <= 0) return '0 B';
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MiB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+    return n + ' B';
+  }
+
+  async function finishSuccess(ttfbMs, mbps, received) {
+    stEl.textContent = '完成';
+    stEl.className = 'pill ok';
+    noteEl.textContent = '测速完成，正在回传结果...';
+    await report('done', { ttfbMs: ttfbMs, mbps: mbps, receivedBytes: received });
+    if (cfg.reportUrl) {
+      noteEl.textContent = '结果已回传面板，窗口即将关闭';
+      setTimeout(function(){ try { window.close(); } catch(e) {} }, 400);
+    }
+    closeBtn.hidden = false;
+  }
+
+  async function finishError(ttfbMs, mbps, received, msg) {
+    stEl.textContent = '失败';
+    stEl.className = 'pill err';
+    noteEl.textContent = msg;
+    closeBtn.hidden = false;
+    await report('error', { ttfbMs: ttfbMs, mbps: mbps, receivedBytes: received, error: msg });
+  }
+
+  async function run() {
+    const maxMs = cfg.durationMs || 5000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(function(){ ctrl.abort('duration_reached'); }, maxMs + 2500);
+    let ttfbMs = -1, mbps = 0, received = 0;
+    let warmAt = 0, warmBytes = 0, lastPost = 0;
+    try {
+      const startAt = performance.now();
+      const resp = await fetch(cfg.streamUrl, { method: 'GET', cache: 'no-store', signal: ctrl.signal });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      ttfbMs = Math.max(1, Math.round(performance.now() - startAt));
+      ttfbEl.textContent = ttfbMs + 'ms';
+      if (!resp.body) throw new Error('浏览器不支持流式读取');
+      const reader = resp.body.getReader();
+      const streamStart = performance.now();
+      noteEl.textContent = '测速中...';
+      while (true) {
+        if (performance.now() - streamStart >= maxMs) { ctrl.abort('duration_reached'); break; }
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        if (chunk.value) {
+          received += chunk.value.byteLength;
+          bytesEl.textContent = fmtBytes(received);
+          const now = performance.now();
+          if (warmAt === 0 && now - streamStart >= 700) { warmAt = now; warmBytes = received; }
+          const measureMs = warmAt > 0 && now - warmAt >= 300 ? now - warmAt : Math.max(10, now - streamStart);
+          const measureBytes = warmAt > 0 && now - warmAt >= 300 ? received - warmBytes : received;
+          mbps = Math.round(((measureBytes * 8) / (measureMs * 1000)) * 10) / 10;
+          mbpsEl.textContent = mbps.toFixed(1) + ' Mbps';
+          if (now - lastPost >= 250) {
+            lastPost = now;
+            report('progress', { ttfbMs: ttfbMs, mbps: mbps, receivedBytes: received });
+          }
+        }
+      }
+      if (received <= 0) {
+        await finishError(ttfbMs, 0, 0, '连接超时或未收到字节');
+        return;
+      }
+      const endNow = performance.now();
+      const totalElapsed = Math.max(10, endNow - (warmAt > 0 && endNow - warmAt >= 400 ? warmAt : streamStart));
+      const countedBytes = warmAt > 0 && endNow - warmAt >= 400 ? received - warmBytes : received;
+      mbps = Math.round(((countedBytes * 8) / (totalElapsed * 1000)) * 10) / 10;
+      mbpsEl.textContent = mbps.toFixed(1) + ' Mbps';
+      await finishSuccess(ttfbMs, mbps, received);
+    } catch (err) {
+      if ((ctrl.signal.reason === 'duration_reached' || String(err).indexOf('AbortError') >= 0) && received > 0 && ttfbMs > 0) {
+        await finishSuccess(ttfbMs, mbps, received);
+      } else {
+        const msg = ctrl.signal.reason === 'duration_reached' ? '连接或读取首字节超时' : ((err && err.message) ? err.message : String(err || '直连测速失败'));
+        await finishError(ttfbMs, mbps, received, msg);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  run();
+})();
+</script></body></html>`
+
+func (a *edgeAgent) handleSpeedtestDirectUIRequest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+
+	setCSP := func(reportOrigin string) {
+		csp := "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
+		if reportOrigin != "" {
+			csp += " " + reportOrigin
+		}
+		w.Header().Set("Content-Security-Policy", csp)
+	}
+	setCSP("")
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.nodeEnabled.Load() {
+		w.WriteHeader(http.StatusUnauthorized)
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, edgeSpeedtestDirectErrorHTML)
+		}
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, edgeSpeedtestUIPathPrefix)
+	sealed, _, _ := strings.Cut(rest, "/")
+	ticket, err := openEdgeSpeedtestTicket(a.cfg.Token, sealed)
+	if err != nil || ticket.NodeID != a.cfg.NodeID {
+		w.WriteHeader(http.StatusUnauthorized)
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, edgeSpeedtestDirectErrorHTML)
+		}
+		return
+	}
+
+	maxAllowed := ticket.MaxBytes
+	if maxAllowed <= 0 || maxAllowed > maxDirectStreamBytes {
+		maxAllowed = maxDirectStreamBytes
+	}
+	totalBytes := defaultDirectStreamBytes
+	if raw := strings.TrimSpace(r.URL.Query().Get("bytes")); raw != "" {
+		if parsed, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
+			totalBytes = parsed
+		}
+	}
+	if totalBytes < minDirectStreamBytes {
+		totalBytes = minDirectStreamBytes
+	}
+	if totalBytes > maxAllowed {
+		totalBytes = maxAllowed
+	}
+
+	reportOrigin := sanitizeSpeedtestOrigin(ticket.PanelOrigin)
+	reportURL := ""
+	if reportOrigin != "" && ticket.ReportID != "" && ticket.ReportToken != "" {
+		reportURL = reportOrigin + "/api/speedtest/direct-report"
+		setCSP(reportOrigin)
+	}
+
+	cfg := struct {
+		StreamURL   string `json:"streamUrl"`
+		ReportURL   string `json:"reportUrl"`
+		ReportID    string `json:"reportId"`
+		ReportToken string `json:"reportToken"`
+		DurationMs  int    `json:"durationMs"`
+	}{
+		StreamURL:   edgeSpeedtestPathPrefix + url.PathEscape(sealed) + "?bytes=" + strconv.FormatInt(totalBytes, 10),
+		ReportURL:   reportURL,
+		ReportID:    ticket.ReportID,
+		ReportToken: ticket.ReportToken,
+		DurationMs:  5000,
+	}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	pageHTML := strings.Replace(edgeSpeedtestDirectUITemplate, "__CONFIG__", string(cfgJSON), 1)
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = io.WriteString(w, pageHTML)
+	}
+}
+
 func (a *edgeAgent) isRequestBlocked(ticket edgePlaybackTicket) (bool, string) {
 	if !a.nodeEnabled.Load() {
 		return true, "节点已停用"
@@ -859,6 +1091,10 @@ func (a *edgeAgent) handler() http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprintf(w, `{"ok":true,"version":%q,"tls_active":%v}`, appVersion, a.hasTLS())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, edgeSpeedtestUIPathPrefix) {
+			a.handleSpeedtestDirectUIRequest(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, edgeSpeedtestPathPrefix) {

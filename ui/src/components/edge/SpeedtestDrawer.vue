@@ -44,10 +44,11 @@ const nodes = ref<SpeedtestNodeSummary[]>([])
 const customTargets = ref<SpeedtestCustomTarget[]>([])
 
 const selectedNodeId = ref<number>(props.initialNodeId)
-const mode = ref<'builtin' | 'custom' | 'all'>('builtin')
+const mode = ref<'builtin' | 'apple' | 'custom' | 'all'>('builtin')
 const selectedProvinces = ref<string[]>(['bj', 'sh', 'gd'])
 const selectedISPs = ref<string[]>(['ct', 'cu', 'cm'])
 const selectedCustomIds = ref<number[]>([])
+const catalogCount = ref<number>(0)
 
 const showCustomPanel = ref(false)
 const savingCustom = ref(false)
@@ -107,7 +108,7 @@ function stopDirectTest() {
   directRunning.value = false
 }
 
-function isHTTPSMixedBlocked(target: SpeedtestDirectTarget): boolean {
+function needsHTTPPopup(target: SpeedtestDirectTarget): boolean {
   return window.location.protocol === 'https:' && target.scheme === 'http' && !target.is_master
 }
 
@@ -119,6 +120,7 @@ async function loadTargets() {
     isps.value = res.isps || []
     nodes.value = res.nodes || []
     customTargets.value = res.custom_targets || []
+    catalogCount.value = res.catalog_count || 0
     if (!selectedProvinces.value.length && res.default_provinces?.length) {
       selectedProvinces.value = [...res.default_provinces]
     }
@@ -172,14 +174,24 @@ async function loadDirectTargets(expectedRunId?: number) {
           note: target.unavailable_reason || '节点离线或未配置访问地址',
         }
       }
-      if (isHTTPSMixedBlocked(target)) {
+      if (needsHTTPPopup(target)) {
+        if (!target.supports_popup || !target.popup_url || !target.report_id) {
+          return {
+            target,
+            status: 'blocked',
+            mbps: 0,
+            ttfbMs: -1,
+            receivedBytes: 0,
+            note: target.unavailable_reason || '需将从机升级至最新版，即可免配 HTTPS 直接测速',
+          }
+        }
         return {
           target,
-          status: 'blocked',
+          status: 'idle',
           mbps: 0,
           ttfbMs: -1,
           receivedBytes: 0,
-          note: '当前通过 HTTPS 访问面板，浏览器安全策略阻止直测 HTTP 从机（请为从机配置 HTTPS）',
+          note: 'HTTP 从机 · 通过同源小窗直测后安全回传（无需 HTTPS）',
         }
       }
       return {
@@ -364,25 +376,145 @@ async function cancelNodeSpeedtest() {
   }
 }
 
+async function refreshDirectTargetRow(nodeId: number) {
+  try {
+    const res = await speedtestApi.directTargets(nodeId)
+    const fresh = (res.targets || []).find(t => t.node_id === nodeId)
+    if (!fresh) return
+    const existing = directRows.value.find(r => r.target.node_id === nodeId)
+    if (existing) {
+      existing.target = fresh
+    }
+  } catch {
+    /* non-fatal ticket refresh */
+  }
+}
+
+async function pollDirectPopupReport(row: DirectRowState, expectedRunId: number): Promise<void> {
+  const reportId = row.target.report_id
+  if (!row.target.popup_url || !reportId) {
+    row.status = 'error'
+    row.note = '未签发有效的 HTTP 直测会话'
+    return
+  }
+
+  row.status = 'running'
+  row.mbps = 0
+  row.ttfbMs = -1
+  row.receivedBytes = 0
+  row.note = '已打开同源小窗，正在测量并回传...'
+
+  const deadline = performance.now() + 16000
+  try {
+    while (performance.now() < deadline) {
+      if (expectedRunId !== directRunId || !props.open || activeTab.value !== 'direct') {
+        row.status = 'idle'
+        row.note = '已手动停止'
+        return
+      }
+      await new Promise(r => window.setTimeout(r, 350))
+      if (expectedRunId !== directRunId || !props.open || activeTab.value !== 'direct') {
+        row.status = 'idle'
+        row.note = '已手动停止'
+        return
+      }
+      try {
+        const res = await speedtestApi.directReportPoll(reportId)
+        const rep = res.report
+        if (rep.ttfb_ms >= 0 && Number.isFinite(rep.ttfb_ms)) {
+          row.ttfbMs = rep.ttfb_ms
+        }
+        if (rep.mbps >= 0 && Number.isFinite(rep.mbps)) {
+          row.mbps = rep.mbps
+        }
+        if (rep.received_bytes >= 0 && Number.isFinite(rep.received_bytes)) {
+          row.receivedBytes = rep.received_bytes
+        }
+        if (rep.status === 'running') {
+          row.note = '小窗直测中...'
+          continue
+        }
+        if (rep.status === 'done') {
+          if (row.receivedBytes <= 0 || row.ttfbMs <= 0) {
+            row.status = 'error'
+            row.note = '未收到有效测速字节'
+          } else {
+            row.status = 'done'
+            row.note = `已通过同源小窗拉取 ${formatBytes(row.receivedBytes)}`
+          }
+          return
+        }
+        if (rep.status === 'error') {
+          row.status = 'error'
+          row.note = rep.error || 'HTTP 从机小窗直测失败'
+          return
+        }
+      } catch {
+        /* retry until deadline */
+      }
+    }
+    row.status = 'error'
+    row.note = '等待小窗回传超时，请确认弹窗未被拦截且本机可直连该从机端口'
+  } finally {
+    void refreshDirectTargetRow(row.target.node_id)
+  }
+}
+
+async function runSingleDirectPopup(row: DirectRowState) {
+  if (directRunning.value || !row.target.online || !row.target.supports_popup || !row.target.popup_url || !row.target.report_id) {
+    return
+  }
+  window.open(row.target.popup_url, '_blank', `width=460,height=320,noopener`)
+  const runId = ++directRunId
+  directRunning.value = true
+  try {
+    await pollDirectPopupReport(row, runId)
+  } finally {
+    if (runId === directRunId) {
+      directRunning.value = false
+    }
+  }
+}
+
 async function runDirectTests() {
   if (directRunning.value) {
     stopDirectTest()
     return
   }
+  if (!directRows.value.length) {
+    await loadDirectTargets()
+  }
+  const snapshot = [...directRows.value]
+  if (!snapshot.length || !props.open || activeTab.value !== 'direct') return
+
+  const eligibleHTTPRows = snapshot.filter(
+    r => r.target.online && needsHTTPPopup(r.target) && r.target.supports_popup && r.target.popup_url && r.target.report_id,
+  )
+  const firstHTTPRow = eligibleHTTPRows[0] || null
+  if (firstHTTPRow?.target.popup_url) {
+    window.open(firstHTTPRow.target.popup_url, '_blank', 'width=460,height=320,noopener')
+  }
+  for (const extraRow of eligibleHTTPRows.slice(1)) {
+    extraRow.status = 'idle'
+    extraRow.note = '请点击右侧「单独直测」开启独立窗口测试（浏览器安全策略每次点击开启一个窗口）'
+  }
+
   const runId = ++directRunId
   const masterCtrl = new AbortController()
   directAbort = masterCtrl
   directRunning.value = true
 
   try {
-    await loadDirectTargets(runId)
-    if (runId !== directRunId || !props.open || activeTab.value !== 'direct') {
-      return
-    }
-
-    for (const row of directRows.value) {
+    for (const row of snapshot) {
       if (runId !== directRunId || !props.open || activeTab.value !== 'direct') break
       if (row.status === 'blocked') continue
+
+      if (needsHTTPPopup(row.target)) {
+        if (firstHTTPRow && row.target.node_id === firstHTTPRow.target.node_id) {
+          await pollDirectPopupReport(row, runId)
+        }
+        continue
+      }
 
       row.status = 'running'
       row.mbps = 0
@@ -444,6 +576,9 @@ async function runDirectTests() {
             row.mbps = Math.round(((measureBytes * 8) / (measureMs * 1000)) * 10) / 10
           }
         }
+        if (received <= 0 || row.ttfbMs <= 0) {
+          throw new Error('未收到测速数据字节')
+        }
         const totalElapsed = Math.max(10, performance.now() - (warmAt > 0 && performance.now() - warmAt >= 400 ? warmAt : streamStart))
         const countedBytes = warmAt > 0 && performance.now() - warmAt >= 400 ? received - warmBytes : received
         row.mbps = Math.round(((countedBytes * 8) / (totalElapsed * 1000)) * 10) / 10
@@ -453,12 +588,16 @@ async function runDirectTests() {
         if (runId !== directRunId || masterCtrl.signal.aborted) {
           row.status = 'idle'
           row.note = '已手动停止'
-        } else if (ctrl.signal.reason === 'duration_reached' || (row.receivedBytes > 0 && String(err).includes('AbortError'))) {
+        } else if (
+          row.receivedBytes > 0 &&
+          row.ttfbMs > 0 &&
+          (ctrl.signal.reason === 'duration_reached' || String(err).includes('AbortError'))
+        ) {
           row.status = 'done'
           row.note = `已拉取 ${formatBytes(row.receivedBytes)}`
         } else {
           row.status = 'error'
-          row.note = errorMessage(err, '连接或 CORS 请求失败')
+          row.note = ctrl.signal.reason === 'duration_reached' ? '连接或读取首字节超时' : errorMessage(err, '连接或 CORS 请求失败')
         }
       } finally {
         masterCtrl.signal.removeEventListener('abort', onParentAbort)
@@ -573,9 +712,10 @@ onBeforeUnmount(() => {
 
             <UiField label="目标源模式" for="st-mode">
               <select id="st-mode" v-model="mode" class="select" :disabled="isJobRunning">
-                <option value="builtin">内置三网节点 (Apple CDN ECS)</option>
+                <option value="builtin">内置三网节点（公开三网测速库）</option>
+                <option value="apple">Apple CDN 就近节点（默认路由）</option>
                 <option value="custom">自定义测速目标 ({{ customTargets.length }})</option>
-                <option value="all">内置 + 自定义全量</option>
+                <option value="all">内置三网 + 自定义全量</option>
               </select>
             </UiField>
           </div>
@@ -702,7 +842,13 @@ onBeforeUnmount(() => {
             </span>
             <span class="faint num">{{ activeJob.completed_targets }} / {{ activeJob.total_targets }} ({{ progressPct }}%)</span>
           </div>
-          <div class="prog-track"><div class="prog-fill" :style="{ width: `${progressPct}%` }" /></div>
+          <div class="prog-track">
+            <div
+              class="prog-fill"
+              :class="{ bad: activeJob.status === 'failed' || activeJob.status === 'canceled' }"
+              :style="{ width: `${progressPct}%` }"
+            />
+          </div>
 
           <div class="table-wrap">
             <table class="st-table">
@@ -719,8 +865,11 @@ onBeforeUnmount(() => {
               <tbody>
                 <tr v-for="row in activeJob.results" :key="row.target_key" :class="{ running: row.status === 'running' }">
                   <td class="region-cell" :title="row.resolved_ip ? `目标IP: ${row.resolved_ip}` : ''">
-                    <span>{{ row.label }}</span>
-                    <small v-if="row.error" class="err-hint" :title="row.error"> · {{ row.error }}</small>
+                    <div class="region-main">
+                      <span>{{ row.label }}</span>
+                      <span v-if="row.resolved_node && row.resolved_node !== row.label" class="node-tag">{{ row.resolved_node }}</span>
+                    </div>
+                    <div v-if="row.error" class="err-hint" :title="row.error">{{ row.error }}</div>
                   </td>
                   <td class="num" :class="row.status === 'done' ? retransTone(row.return_retrans) : 'muted'">
                     {{ row.status === 'done' && row.return_retrans >= 0 ? row.return_retrans : '--' }}
@@ -750,9 +899,9 @@ onBeforeUnmount(() => {
       <template v-else>
         <div class="direct-head">
           <p class="faint">
-            从当前浏览器直接向主机和各在线从机发起单线程内存流测速（单节点约 5 秒），零 Emby 上游负载、不扣配额，用于验证你当前网络环境下最流畅的观看节点。
+            从当前浏览器直接向主机和各在线从机发起单线程内存流测速（单节点约 5 秒），零 Emby 上游负载、不扣配额；HTTP 从机将通过同源小窗直接测试，无需额外配置 HTTPS。
           </p>
-          <UiButton :variant="directRunning ? 'danger' : 'primary'" size="sm" :loading="directLoading" @click="runDirectTests">
+          <UiButton :variant="directRunning ? 'danger' : 'primary'" size="sm" :loading="directLoading" :disabled="directLoading && !directRunning" @click="runDirectTests">
             <Gauge />{{ directRunning ? '停止本机直测' : '开始本机直测' }}
           </UiButton>
         </div>
@@ -765,6 +914,7 @@ onBeforeUnmount(() => {
                 <th>状态</th>
                 <th class="num">首字节 TTFB</th>
                 <th class="num">单线程下行</th>
+                <th />
               </tr>
             </thead>
             <tbody>
@@ -785,9 +935,20 @@ onBeforeUnmount(() => {
                 <td class="num" :class="row.mbps > 0 ? speedTone(row.mbps) : 'muted'">
                   {{ row.mbps > 0 ? `${row.mbps.toFixed(1)}Mbps` : '--' }}
                 </td>
+                <td class="num">
+                  <UiButton
+                    v-if="row.target.online && needsHTTPPopup(row.target) && row.target.supports_popup && row.target.popup_url && row.target.report_id"
+                    size="sm"
+                    variant="ghost"
+                    :disabled="directRunning"
+                    @click="runSingleDirectPopup(row)"
+                  >
+                    单独直测
+                  </UiButton>
+                </td>
               </tr>
               <tr v-if="!directRows.length && !directLoading">
-                <td colspan="4" class="faint center">暂无可直测节点</td>
+                <td colspan="5" class="faint center">暂无可直测节点</td>
               </tr>
             </tbody>
           </table>
@@ -843,6 +1004,7 @@ onBeforeUnmount(() => {
 .job-meta > span { display: inline-flex; align-items: center; gap: 8px; }
 .prog-track { height: 4px; border-radius: 999px; background: var(--surface); overflow: hidden; }
 .prog-fill { height: 100%; background: var(--good); transition: width 240ms var(--ease); }
+.prog-fill.bad { background: var(--bad); }
 
 .table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; background: var(--bg-elev); }
 .st-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -851,8 +1013,10 @@ onBeforeUnmount(() => {
 .st-table th.num, .st-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .st-table tr:last-child td { border-bottom: 0; }
 .st-table tr.running { background: color-mix(in srgb, var(--warn) 6%, transparent); }
-.region-cell { font-weight: 500; }
-.err-hint { font-weight: 400; color: var(--bad); font-size: 11.5px; }
+.region-cell { font-weight: 500; min-width: 140px; }
+.region-main { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+.node-tag { font-size: 11px; font-weight: 400; padding: 1px 6px; border-radius: 4px; background: var(--surface); color: var(--text-3); }
+.err-hint { font-weight: 400; color: var(--bad); font-size: 11.5px; margin-top: 2px; white-space: normal; max-width: 240px; word-break: break-word; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 .good { color: var(--good); font-weight: 600; }
 .warn { color: var(--warn); font-weight: 500; }
