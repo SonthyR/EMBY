@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle } from '@lucide/vue'
+import { Activity, Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
+import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiDialog from '@/components/ui/UiDialog.vue'
@@ -384,11 +385,26 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
   { key: 'quota', label: '超额' },
   { key: 'disabled', label: '已停用' },
 ]
+
+const speedtestOpen = ref(false)
+const speedtestNodeId = ref(0)
+
+function openSpeedtest(nodeId: number) {
+  speedtestNodeId.value = nodeId
+  speedtestOpen.value = true
+}
+
+function speedPillTone(mbps: number): string {
+  if (mbps >= 150) return 'good'
+  if (mbps >= 50) return 'warn'
+  return 'bad'
+}
 </script>
 
 <template>
   <div>
     <PageHeader title="从机" description="添加普通 VPS 或 NAT 小鸡作为轻量媒体中转节点，视频播放自动就近卸载，登录与海报仍由主机接管。">
+      <UiButton @click="openSpeedtest(0)"><Activity />测速中心</UiButton>
       <UiButton variant="primary" @click="openCreate"><Plus />添加从机</UiButton>
     </PageHeader>
 
@@ -457,6 +473,19 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
             </span>
           </div>
 
+          <div v-if="node.speed_metrics?.length" class="latency-row">
+            <span class="faint lat-label">单线程回程</span>
+            <span
+              v-for="sm in node.speed_metrics"
+              :key="sm.isp_group"
+              class="lat-pill"
+              :class="speedPillTone(sm.avg_return_mbps)"
+              :title="`去程 ${sm.avg_outbound_mbps.toFixed(1)}Mbps · 延迟 ${sm.avg_return_rtt_ms >= 0 ? sm.avg_return_rtt_ms + 'ms' : '--'}${sm.total_retrans >= 0 ? ' · 重传 ' + sm.total_retrans : ''}`"
+            >
+              {{ sm.isp_label }} {{ sm.avg_return_mbps.toFixed(1) }}Mbps
+            </span>
+          </div>
+
           <p v-if="upgradeStatusInfo(node)" class="upgrade-note" :class="upgradeStatusInfo(node)!.tone">
             {{ upgradeStatusInfo(node)!.text }}
           </p>
@@ -487,6 +516,9 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
             @click="upgradeNode(node)"
           >
             <ArrowUpCircle />升级 {{ node.master_version }}
+          </UiButton>
+          <UiButton size="sm" :disabled="!node.online" :title="node.online ? '三网单线程测速' : '从机离线'" @click="openSpeedtest(node.id)">
+            <Activity />测速
           </UiButton>
           <UiButton size="sm" :variant="node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
             <Terminal />安装命令
@@ -615,6 +647,8 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
         <UiButton variant="primary" @click="copyInstallCommand"><Copy />复制安装命令</UiButton>
       </template>
     </UiDialog>
+
+    <SpeedtestDrawer :open="speedtestOpen" :initial-node-id="speedtestNodeId" @close="speedtestOpen = false" @completed="load()" />
   </div>
 </template>
 

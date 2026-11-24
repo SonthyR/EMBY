@@ -1770,6 +1770,32 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	return result, nil
 }
 
+func (rt *shareUserRuntime) analyticsSessionSummary() (onlineCount, masterPlaying, totalPlaying int, playingByUser map[int64]int) {
+	playingByUser = make(map[int64]int)
+	if rt == nil || rt.db == nil {
+		return 0, 0, 0, playingByUser
+	}
+	_ = rt.db.db.QueryRow(`SELECT COUNT(*) FROM share_user_sessions`).Scan(&onlineCount)
+	now := time.Now()
+	rt.mu.RLock()
+	for tokenHash, act := range rt.activity {
+		if act != nil && act.isWatching(now) {
+			totalPlaying++
+			if entry, ok := rt.sessions[tokenHash]; ok && entry.userID > 0 {
+				playingByUser[entry.userID]++
+			}
+			if act.lastNodeName == "" || act.lastNodeName == "主机" {
+				masterPlaying++
+			}
+		}
+	}
+	rt.mu.RUnlock()
+	if totalPlaying > onlineCount {
+		onlineCount = totalPlaying
+	}
+	return onlineCount, masterPlaying, totalPlaying, playingByUser
+}
+
 func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error) {
 	if rt == nil || rt.db == nil {
 		return []liveShareSessionView{}, nil

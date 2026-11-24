@@ -202,6 +202,37 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 	return result, nil
 }
 
+type dailyTrafficBucket struct {
+	BytesIn  int64
+	BytesOut int64
+	Requests int64
+}
+
+func (d *DB) SumDailyTrafficBetween(start, end time.Time) (map[string]dailyTrafficBucket, error) {
+	rows, err := d.db.Query(
+		`SELECT substr(recorded_at, 1, 10) AS day, COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0), COALESCE(SUM(requests), 0)
+		 FROM traffic_logs
+		 WHERE recorded_at >= ? AND recorded_at < ?
+		 GROUP BY day`,
+		start.In(time.Local).Format("2006-01-02 15:04:05"),
+		end.In(time.Local).Format("2006-01-02 15:04:05"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]dailyTrafficBucket)
+	for rows.Next() {
+		var day string
+		var b dailyTrafficBucket
+		if err := rows.Scan(&day, &b.BytesIn, &b.BytesOut, &b.Requests); err != nil {
+			return nil, err
+		}
+		out[day] = b
+	}
+	return out, rows.Err()
+}
+
 // SumTrafficSinceForSite returns the billable bytes for one site and cycle.
 // Directional columns remain raw so changing the billing mode never destroys
 // the information needed to recalculate the current cycle.

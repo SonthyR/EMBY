@@ -27,6 +27,7 @@ type App struct {
 	trustedProxies    []*net.IPNet
 	clientIPRegions   *clientIPRegionResolver
 	ip2region         *ip2regionManager
+	speedtest         *speedtestManager
 	panelHost         string
 	routeDomain       string
 	routeDirect       bool

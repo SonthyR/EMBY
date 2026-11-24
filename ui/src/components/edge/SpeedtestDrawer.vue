@@ -1,0 +1,880 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { Activity, Gauge, Plus, Square, Trash2, Wifi } from '@lucide/vue'
+import UiButton from '@/components/ui/UiButton.vue'
+import UiDrawer from '@/components/ui/UiDrawer.vue'
+import UiField from '@/components/ui/UiField.vue'
+import {
+  speedtestApi,
+  type SpeedtestCustomTarget,
+  type SpeedtestCustomTargetInput,
+  type SpeedtestDirectTarget,
+  type SpeedtestISP,
+  type SpeedtestJob,
+  type SpeedtestNodeSummary,
+  type SpeedtestProvince,
+  type SpeedtestTargetResult,
+} from '@/api'
+import { confirm } from '@/stores/confirm'
+import { errorMessage, toast } from '@/stores/toast'
+import { formatBytes } from '@/utils/format'
+
+const props = withDefaults(
+  defineProps<{
+    open: boolean
+    initialNodeId?: number
+    initialTab?: 'node' | 'direct'
+  }>(),
+  {
+    initialNodeId: 0,
+    initialTab: 'node',
+  },
+)
+
+const emit = defineEmits<{
+  close: []
+  completed: [job: SpeedtestJob]
+}>()
+
+const activeTab = ref<'node' | 'direct'>(props.initialTab)
+const loadingTargets = ref(false)
+const provinces = ref<SpeedtestProvince[]>([])
+const isps = ref<SpeedtestISP[]>([])
+const nodes = ref<SpeedtestNodeSummary[]>([])
+const customTargets = ref<SpeedtestCustomTarget[]>([])
+
+const selectedNodeId = ref<number>(props.initialNodeId)
+const mode = ref<'builtin' | 'custom' | 'all'>('builtin')
+const selectedProvinces = ref<string[]>(['bj', 'sh', 'gd'])
+const selectedISPs = ref<string[]>(['ct', 'cu', 'cm'])
+const selectedCustomIds = ref<number[]>([])
+
+const showCustomPanel = ref(false)
+const savingCustom = ref(false)
+const newCustom = ref<SpeedtestCustomTargetInput>({
+  name: '',
+  isp_group: 'ct',
+  province: '',
+  upload_url: '',
+  download_url: '',
+  method: 'POST',
+  enabled: true,
+})
+
+const starting = ref(false)
+const canceling = ref(false)
+const activeJob = ref<SpeedtestJob | null>(null)
+let pollTimer: number | null = null
+let pollGen = 0
+
+interface DirectRowState {
+  target: SpeedtestDirectTarget
+  status: 'idle' | 'running' | 'done' | 'blocked' | 'error'
+  mbps: number
+  ttfbMs: number
+  receivedBytes: number
+  note: string
+}
+
+const directLoading = ref(false)
+const directRunning = ref(false)
+const directRows = ref<DirectRowState[]>([])
+let directAbort: AbortController | null = null
+let directRunId = 0
+
+const selectedNode = computed(() => nodes.value.find(n => n.id === selectedNodeId.value) || null)
+const isJobRunning = computed(() => activeJob.value?.status === 'running' || activeJob.value?.status === 'pending')
+const progressPct = computed(() => {
+  const job = activeJob.value
+  if (!job || !job.total_targets) return 0
+  return Math.min(100, Math.round((job.completed_targets / job.total_targets) * 100))
+})
+
+function stopPolling() {
+  pollGen++
+  if (pollTimer !== null) {
+    window.clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+function stopDirectTest() {
+  directRunId++
+  if (directAbort) {
+    directAbort.abort('stopped')
+    directAbort = null
+  }
+  directRunning.value = false
+}
+
+function isHTTPSMixedBlocked(target: SpeedtestDirectTarget): boolean {
+  return window.location.protocol === 'https:' && target.scheme === 'http' && !target.is_master
+}
+
+async function loadTargets() {
+  loadingTargets.value = true
+  try {
+    const res = await speedtestApi.targets()
+    provinces.value = res.provinces || []
+    isps.value = res.isps || []
+    nodes.value = res.nodes || []
+    customTargets.value = res.custom_targets || []
+    if (!selectedProvinces.value.length && res.default_provinces?.length) {
+      selectedProvinces.value = [...res.default_provinces]
+    }
+    if (!selectedISPs.value.length && res.default_isps?.length) {
+      selectedISPs.value = [...res.default_isps]
+    }
+    if (nodes.value.length && !nodes.value.some(n => n.id === selectedNodeId.value)) {
+      selectedNodeId.value = nodes.value[0].id
+    }
+  } catch (err) {
+    toast.error(errorMessage(err, '加载测速配置失败'))
+  } finally {
+    loadingTargets.value = false
+  }
+}
+
+async function loadLatestJobForNode(nodeId: number) {
+  stopPolling()
+  const gen = pollGen
+  try {
+    const res = await speedtestApi.jobs(nodeId)
+    if (gen !== pollGen || !props.open || selectedNodeId.value !== nodeId) return
+    const latest = res.jobs?.[0] || null
+    activeJob.value = latest
+    if (latest && (latest.status === 'running' || latest.status === 'pending')) {
+      startPolling(latest.id)
+    }
+  } catch {
+    if (gen === pollGen) {
+      activeJob.value = null
+    }
+  }
+}
+
+let directLoadGen = 0
+
+async function loadDirectTargets(expectedRunId?: number) {
+  const gen = ++directLoadGen
+  directLoading.value = true
+  try {
+    const res = await speedtestApi.directTargets()
+    if (gen !== directLoadGen || (expectedRunId !== undefined && expectedRunId !== directRunId)) return
+    directRows.value = (res.targets || []).map(target => {
+      if (!target.online) {
+        return {
+          target,
+          status: 'blocked',
+          mbps: 0,
+          ttfbMs: -1,
+          receivedBytes: 0,
+          note: target.unavailable_reason || '节点离线或未配置访问地址',
+        }
+      }
+      if (isHTTPSMixedBlocked(target)) {
+        return {
+          target,
+          status: 'blocked',
+          mbps: 0,
+          ttfbMs: -1,
+          receivedBytes: 0,
+          note: '当前通过 HTTPS 访问面板，浏览器安全策略阻止直测 HTTP 从机（请为从机配置 HTTPS）',
+        }
+      }
+      return {
+        target,
+        status: 'idle',
+        mbps: 0,
+        ttfbMs: -1,
+        receivedBytes: 0,
+        note: '',
+      }
+    })
+  } catch (err) {
+    toast.error(errorMessage(err, '加载直测节点失败'))
+  } finally {
+    directLoading.value = false
+  }
+}
+
+function startPolling(jobId: string) {
+  stopPolling()
+  const gen = pollGen
+  let consecutiveErrs = 0
+
+  const tick = async () => {
+    if (gen !== pollGen || !props.open || activeTab.value !== 'node') return
+    try {
+      const res = await speedtestApi.job(jobId)
+      if (gen !== pollGen || !props.open || activeTab.value !== 'node') return
+      consecutiveErrs = 0
+      const job = res.job
+      activeJob.value = job
+      if (job.status !== 'running' && job.status !== 'pending') {
+        stopPolling()
+        await loadTargets()
+        if (props.open) emit('completed', job)
+        return
+      }
+    } catch {
+      if (gen !== pollGen || !props.open) return
+      consecutiveErrs++
+      if (consecutiveErrs >= 3) {
+        stopPolling()
+        return
+      }
+    }
+    if (gen === pollGen && props.open && activeTab.value === 'node') {
+      pollTimer = window.setTimeout(tick, 1000)
+    }
+  }
+
+  pollTimer = window.setTimeout(tick, 1000)
+}
+
+function toggleProvince(code: string) {
+  const idx = selectedProvinces.value.indexOf(code)
+  if (idx >= 0) {
+    if (selectedProvinces.value.length > 1) selectedProvinces.value.splice(idx, 1)
+  } else {
+    selectedProvinces.value.push(code)
+  }
+}
+
+function toggleISP(group: string) {
+  const idx = selectedISPs.value.indexOf(group)
+  if (idx >= 0) {
+    if (selectedISPs.value.length > 1) selectedISPs.value.splice(idx, 1)
+  } else {
+    selectedISPs.value.push(group)
+  }
+}
+
+function selectPreset(preset: 'top3' | 'all') {
+  if (preset === 'top3') {
+    selectedProvinces.value = ['bj', 'sh', 'gd']
+    selectedISPs.value = ['ct', 'cu', 'cm']
+  } else {
+    selectedProvinces.value = provinces.value.map(p => p.code)
+    selectedISPs.value = ['ct', 'cu', 'cm']
+  }
+}
+
+function toggleCustomSelection(targetId: number) {
+  const idx = selectedCustomIds.value.indexOf(targetId)
+  if (idx >= 0) {
+    selectedCustomIds.value.splice(idx, 1)
+  } else {
+    selectedCustomIds.value.push(targetId)
+  }
+}
+
+async function addCustomTarget() {
+  if (!newCustom.value.name.trim()) {
+    toast.error('请填写自定义目标名称')
+    return
+  }
+  if (!newCustom.value.upload_url?.trim() && !newCustom.value.download_url?.trim()) {
+    toast.error('回程地址或去程地址至少填写一项')
+    return
+  }
+  savingCustom.value = true
+  try {
+    await speedtestApi.createCustom({
+      ...newCustom.value,
+      name: newCustom.value.name.trim(),
+      province: newCustom.value.province?.trim() || '',
+      upload_url: newCustom.value.upload_url?.trim() || '',
+      download_url: newCustom.value.download_url?.trim() || '',
+    })
+    toast.success('已添加自定义测速目标')
+    newCustom.value = {
+      name: '',
+      isp_group: 'ct',
+      province: '',
+      upload_url: '',
+      download_url: '',
+      method: 'POST',
+      enabled: true,
+    }
+    await loadTargets()
+  } catch (err) {
+    toast.error(errorMessage(err, '创建自定义测速目标失败'))
+  } finally {
+    savingCustom.value = false
+  }
+}
+
+async function deleteCustomTarget(target: SpeedtestCustomTarget) {
+  if (!(await confirm({ title: '删除测速目标', message: `确定删除「${target.name}」吗？`, confirmText: '删除', danger: true }))) {
+    return
+  }
+  try {
+    await speedtestApi.removeCustom(target.id)
+    selectedCustomIds.value = selectedCustomIds.value.filter(id => id !== target.id)
+    toast.success('已删除测速目标')
+    await loadTargets()
+  } catch (err) {
+    toast.error(errorMessage(err, '删除失败'))
+  }
+}
+
+async function startNodeSpeedtest() {
+  if (selectedNode.value && !selectedNode.value.online) {
+    toast.error('所选从机当前离线，无法执行测速')
+    return
+  }
+  if ((mode.value === 'custom' || mode.value === 'all') && !customTargets.value.some(t => t.enabled) && mode.value === 'custom') {
+    toast.error('请先添加并启用至少一个自定义测速目标')
+    showCustomPanel.value = true
+    return
+  }
+  starting.value = true
+  try {
+    const res = await speedtestApi.start({
+      node_id: selectedNodeId.value,
+      mode: mode.value,
+      provinces: selectedProvinces.value,
+      isps: selectedISPs.value,
+      custom_target_ids: selectedCustomIds.value,
+    })
+    activeJob.value = res.job
+    startPolling(res.job.id)
+  } catch (err) {
+    toast.error(errorMessage(err, '启动测速失败'))
+  } finally {
+    starting.value = false
+  }
+}
+
+async function cancelNodeSpeedtest() {
+  if (!activeJob.value) return
+  canceling.value = true
+  try {
+    await speedtestApi.cancel(activeJob.value.id)
+    stopPolling()
+    const res = await speedtestApi.job(activeJob.value.id)
+    activeJob.value = res.job
+    toast.success('测速任务已取消')
+  } catch (err) {
+    toast.error(errorMessage(err, '取消失败'))
+  } finally {
+    canceling.value = false
+  }
+}
+
+async function runDirectTests() {
+  if (directRunning.value) {
+    stopDirectTest()
+    return
+  }
+  const runId = ++directRunId
+  const masterCtrl = new AbortController()
+  directAbort = masterCtrl
+  directRunning.value = true
+
+  try {
+    await loadDirectTargets(runId)
+    if (runId !== directRunId || !props.open || activeTab.value !== 'direct') {
+      return
+    }
+
+    for (const row of directRows.value) {
+      if (runId !== directRunId || !props.open || activeTab.value !== 'direct') break
+      if (row.status === 'blocked') continue
+
+      row.status = 'running'
+      row.mbps = 0
+      row.ttfbMs = -1
+      row.receivedBytes = 0
+      row.note = '正在连接...'
+
+      const ctrl = new AbortController()
+      const onParentAbort = () => ctrl.abort(masterCtrl.signal.reason || 'stopped')
+      masterCtrl.signal.addEventListener('abort', onParentAbort, { once: true })
+      const maxDurationMs = 5000
+      const timeoutId = window.setTimeout(() => ctrl.abort('duration_reached'), maxDurationMs + 2500)
+
+      try {
+        const startAt = performance.now()
+        const resp = await fetch(row.target.stream_url, {
+          method: 'GET',
+          cache: 'no-store',
+          credentials: row.target.is_master ? 'same-origin' : 'omit',
+          signal: ctrl.signal,
+        })
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`)
+        }
+        row.ttfbMs = Math.max(1, Math.round(performance.now() - startAt))
+        if (!resp.body) {
+          throw new Error('浏览器不支持流式读取')
+        }
+
+        const reader = resp.body.getReader()
+        const streamStart = performance.now()
+        let warmAt = 0
+        let warmBytes = 0
+        let received = 0
+        row.note = '测速中...'
+
+        while (true) {
+          if (runId !== directRunId || !props.open || activeTab.value !== 'direct') {
+            ctrl.abort('stopped')
+            break
+          }
+          const elapsed = performance.now() - streamStart
+          if (elapsed >= maxDurationMs) {
+            ctrl.abort('duration_reached')
+            break
+          }
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            received += value.byteLength
+            row.receivedBytes = received
+            const now = performance.now()
+            if (warmAt === 0 && now - streamStart >= 700) {
+              warmAt = now
+              warmBytes = received
+            }
+            const measureMs = warmAt > 0 && now - warmAt >= 300 ? now - warmAt : Math.max(10, now - streamStart)
+            const measureBytes = warmAt > 0 && now - warmAt >= 300 ? received - warmBytes : received
+            row.mbps = Math.round(((measureBytes * 8) / (measureMs * 1000)) * 10) / 10
+          }
+        }
+        const totalElapsed = Math.max(10, performance.now() - (warmAt > 0 && performance.now() - warmAt >= 400 ? warmAt : streamStart))
+        const countedBytes = warmAt > 0 && performance.now() - warmAt >= 400 ? received - warmBytes : received
+        row.mbps = Math.round(((countedBytes * 8) / (totalElapsed * 1000)) * 10) / 10
+        row.status = 'done'
+        row.note = `已拉取 ${formatBytes(received)}`
+      } catch (err) {
+        if (runId !== directRunId || masterCtrl.signal.aborted) {
+          row.status = 'idle'
+          row.note = '已手动停止'
+        } else if (ctrl.signal.reason === 'duration_reached' || (row.receivedBytes > 0 && String(err).includes('AbortError'))) {
+          row.status = 'done'
+          row.note = `已拉取 ${formatBytes(row.receivedBytes)}`
+        } else {
+          row.status = 'error'
+          row.note = errorMessage(err, '连接或 CORS 请求失败')
+        }
+      } finally {
+        masterCtrl.signal.removeEventListener('abort', onParentAbort)
+        window.clearTimeout(timeoutId)
+      }
+    }
+  } finally {
+    if (runId === directRunId) {
+      directAbort = null
+      directRunning.value = false
+    }
+  }
+}
+
+function speedTone(mbps: number): string {
+  if (mbps <= 0) return 'muted'
+  if (mbps >= 150) return 'good'
+  if (mbps >= 50) return 'warn'
+  return 'bad'
+}
+
+function retransTone(retrans: number): string {
+  if (retrans < 0) return 'muted'
+  if (retrans <= 5) return 'good'
+  if (retrans <= 50) return 'warn'
+  return 'bad'
+}
+
+function rttTone(rtt: number): string {
+  if (rtt < 0) return 'muted'
+  if (rtt <= 150) return 'good'
+  if (rtt <= 220) return 'warn'
+  return 'bad'
+}
+
+function formatMbpsCell(row: SpeedtestTargetResult, dir: 'return' | 'outbound'): string {
+  if (row.status === 'pending') return '--'
+  if (row.status === 'running') return '测速中'
+  const val = dir === 'return' ? row.return_mbps : row.outbound_mbps
+  return val > 0 ? `${val.toFixed(1)}Mbps` : '--'
+}
+
+function handleNodeChange() {
+  loadLatestJobForNode(selectedNodeId.value)
+}
+
+watch(
+  () => props.open,
+  async open => {
+    if (open) {
+      activeTab.value = props.initialTab || 'node'
+      selectedNodeId.value = props.initialNodeId ?? 0
+      await loadTargets()
+      if (activeTab.value === 'node') {
+        await loadLatestJobForNode(selectedNodeId.value)
+      } else {
+        await loadDirectTargets()
+      }
+    } else {
+      stopPolling()
+      stopDirectTest()
+    }
+  },
+)
+
+watch(activeTab, tab => {
+  if (!props.open) return
+  if (tab === 'direct') {
+    stopPolling()
+    loadDirectTargets()
+  } else {
+    stopDirectTest()
+    loadLatestJobForNode(selectedNodeId.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  stopPolling()
+  stopDirectTest()
+})
+</script>
+
+<template>
+  <UiDrawer
+    :open="open"
+    title="三网单线程测速中心"
+    subtitle="仅管理员可见 · 真实模拟单连接流媒体吞吐与内核 TCP 重传"
+    :width="760"
+    :dismissible="!starting"
+    @close="emit('close')"
+  >
+    <div class="st-wrap">
+      <nav class="st-tabs" role="tablist">
+        <button type="button" role="tab" :aria-selected="activeTab === 'node'" :class="{ on: activeTab === 'node' }" @click="activeTab = 'node'">
+          <Activity class="ico" />节点三网测速
+        </button>
+        <button type="button" role="tab" :aria-selected="activeTab === 'direct'" :class="{ on: activeTab === 'direct' }" @click="activeTab = 'direct'">
+          <Wifi class="ico" />本机直测（当前浏览器）
+        </button>
+      </nav>
+
+      <template v-if="activeTab === 'node'">
+        <div class="controls-box">
+          <div class="row-grid">
+            <UiField label="测试节点" for="st-node">
+              <select id="st-node" v-model.number="selectedNodeId" class="select" :disabled="isJobRunning || loadingTargets" @change="handleNodeChange">
+                <option v-for="n in nodes" :key="n.id" :value="n.id">
+                  {{ n.name }}{{ n.is_master ? ' (Master)' : n.online ? ' · 在线' : ' · 离线' }}
+                </option>
+              </select>
+            </UiField>
+
+            <UiField label="目标源模式" for="st-mode">
+              <select id="st-mode" v-model="mode" class="select" :disabled="isJobRunning">
+                <option value="builtin">内置三网节点 (Apple CDN ECS)</option>
+                <option value="custom">自定义测速目标 ({{ customTargets.length }})</option>
+                <option value="all">内置 + 自定义全量</option>
+              </select>
+            </UiField>
+          </div>
+
+          <div v-if="mode === 'builtin' || mode === 'all'" class="picker">
+            <div class="picker-head">
+              <span class="label">省份与运营商</span>
+              <div class="presets">
+                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset('top3')">北上广默认 (9项)</button>
+                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset('all')">全量 12 省 (36项)</button>
+              </div>
+            </div>
+            <div class="chip-group">
+              <button
+                v-for="p in provinces"
+                :key="p.code"
+                type="button"
+                class="chip"
+                :class="{ on: selectedProvinces.includes(p.code) }"
+                :disabled="isJobRunning"
+                @click="toggleProvince(p.code)"
+              >
+                {{ p.label }}
+              </button>
+            </div>
+            <div class="chip-group isps">
+              <button
+                v-for="isp in isps"
+                :key="isp.group"
+                type="button"
+                class="chip isp"
+                :class="{ on: selectedISPs.includes(isp.group) }"
+                :disabled="isJobRunning"
+                @click="toggleISP(isp.group)"
+              >
+                {{ isp.label }}
+              </button>
+            </div>
+          </div>
+
+          <div class="custom-bar">
+            <button type="button" class="link-btn" @click="showCustomPanel = !showCustomPanel">
+              {{ showCustomPanel ? '收起自定义测速目标' : `管理自定义测速目标 (${customTargets.length})` }}
+            </button>
+            <div class="action-right">
+              <UiButton
+                v-if="isJobRunning"
+                variant="danger"
+                size="sm"
+                :loading="canceling"
+                @click="cancelNodeSpeedtest"
+              >
+                <Square />取消测速
+              </UiButton>
+              <UiButton
+                v-else
+                variant="primary"
+                size="sm"
+                :loading="starting"
+                :disabled="selectedNode !== null && !selectedNode.online"
+                @click="startNodeSpeedtest"
+              >
+                <Gauge />{{ selectedNode && !selectedNode.online ? '节点离线' : '开始单线程测速' }}
+              </UiButton>
+            </div>
+          </div>
+
+          <div v-if="showCustomPanel" class="custom-panel">
+            <ul v-if="customTargets.length" class="custom-list">
+              <li v-for="ct in customTargets" :key="ct.id">
+                <label class="ct-check">
+                  <input type="checkbox" :checked="selectedCustomIds.includes(ct.id)" @change="toggleCustomSelection(ct.id)" />
+                  <span class="ct-name">{{ ct.name }}</span>
+                  <span class="tag">{{ ct.isp_label }}</span>
+                  <span v-if="ct.province" class="faint">{{ ct.province }}</span>
+                </label>
+                <span class="faint mono ct-urls" :title="ct.upload_url || ct.download_url">{{ ct.upload_url || ct.download_url }}</span>
+                <button type="button" class="del-btn" title="删除" @click="deleteCustomTarget(ct)"><Trash2 /></button>
+              </li>
+            </ul>
+            <div class="custom-form">
+              <div class="cf-row">
+                <UiField label="目标名称" for="ct-name">
+                  <input id="ct-name" v-model="newCustom.name" class="input" placeholder="例如：深圳电信 LookingGlass" />
+                </UiField>
+                <UiField label="运营商归属" for="ct-isp">
+                  <select id="ct-isp" v-model="newCustom.isp_group" class="select">
+                    <option value="ct">电信</option>
+                    <option value="cu">联通</option>
+                    <option value="cm">移动</option>
+                    <option value="other">其他</option>
+                  </select>
+                </UiField>
+                <UiField label="地区标签" for="ct-prov">
+                  <input id="ct-prov" v-model="newCustom.province" class="input" placeholder="可选，如：深圳" />
+                </UiField>
+              </div>
+              <div class="cf-row">
+                <UiField label="回程上传测速地址 (POST/PUT)" for="ct-up" help="从节点向该地址上传，测算回程速率与内核重传">
+                  <input id="ct-up" v-model="newCustom.upload_url" class="input mono" placeholder="https://example.com/upload" />
+                </UiField>
+                <UiField label="去程下载测速地址 (GET)" for="ct-dl" help="节点从该地址单线程下载">
+                  <input id="ct-dl" v-model="newCustom.download_url" class="input mono" placeholder="https://example.com/100mb.bin" />
+                </UiField>
+              </div>
+              <div class="cf-actions">
+                <select v-model="newCustom.method" class="select method-sel">
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                </select>
+                <UiButton size="sm" :loading="savingCustom" @click="addCustomTarget"><Plus />添加目标</UiButton>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="activeJob" class="job-box">
+          <div class="job-meta">
+            <span>
+              <strong>{{ activeJob.node_name }}</strong>
+              <span class="pill" :class="activeJob.status === 'done' ? 'good' : activeJob.status === 'failed' || activeJob.status === 'canceled' ? 'bad' : 'warn'">
+                {{ activeJob.status === 'running' ? '测速进行中' : activeJob.status === 'done' ? '已完成' : activeJob.status === 'canceled' ? '已取消' : activeJob.status === 'failed' ? '失败' : '等待从机认领' }}
+              </span>
+            </span>
+            <span class="faint num">{{ activeJob.completed_targets }} / {{ activeJob.total_targets }} ({{ progressPct }}%)</span>
+          </div>
+          <div class="prog-track"><div class="prog-fill" :style="{ width: `${progressPct}%` }" /></div>
+
+          <div class="table-wrap">
+            <table class="st-table">
+              <thead>
+                <tr>
+                  <th>地区</th>
+                  <th class="num">回程重传</th>
+                  <th class="num">回程速度</th>
+                  <th class="num">去程速度</th>
+                  <th class="num">回程延迟</th>
+                  <th class="num">去程延迟</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in activeJob.results" :key="row.target_key" :class="{ running: row.status === 'running' }">
+                  <td class="region-cell" :title="row.resolved_ip ? `目标IP: ${row.resolved_ip}` : ''">
+                    <span>{{ row.label }}</span>
+                    <small v-if="row.error" class="err-hint" :title="row.error"> · {{ row.error }}</small>
+                  </td>
+                  <td class="num" :class="row.status === 'done' ? retransTone(row.return_retrans) : 'muted'">
+                    {{ row.status === 'done' && row.return_retrans >= 0 ? row.return_retrans : '--' }}
+                  </td>
+                  <td class="num" :class="row.status === 'done' ? speedTone(row.return_mbps) : 'muted'">
+                    {{ formatMbpsCell(row, 'return') }}
+                  </td>
+                  <td class="num" :class="row.status === 'done' ? speedTone(row.outbound_mbps) : 'muted'">
+                    {{ formatMbpsCell(row, 'outbound') }}
+                  </td>
+                  <td class="num" :class="row.status === 'done' ? rttTone(row.return_rtt_ms) : 'muted'">
+                    {{ row.status === 'done' && row.return_rtt_ms >= 0 ? `${row.return_rtt_ms}ms` : '--' }}
+                  </td>
+                  <td class="num" :class="row.status === 'done' ? rttTone(row.outbound_rtt_ms) : 'muted'">
+                    {{ row.status === 'done' && row.outbound_rtt_ms >= 0 ? `${row.outbound_rtt_ms}ms` : '--' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div v-else class="empty-hint">
+          尚未对该节点运行三网测速，选择省份与运营商后点击「开始单线程测速」。
+        </div>
+      </template>
+
+      <template v-else>
+        <div class="direct-head">
+          <p class="faint">
+            从当前浏览器直接向主机和各在线从机发起单线程内存流测速（单节点约 5 秒），零 Emby 上游负载、不扣配额，用于验证你当前网络环境下最流畅的观看节点。
+          </p>
+          <UiButton :variant="directRunning ? 'danger' : 'primary'" size="sm" :loading="directLoading" @click="runDirectTests">
+            <Gauge />{{ directRunning ? '停止本机直测' : '开始本机直测' }}
+          </UiButton>
+        </div>
+
+        <div class="table-wrap">
+          <table class="st-table direct-table">
+            <thead>
+              <tr>
+                <th>节点</th>
+                <th>状态</th>
+                <th class="num">首字节 TTFB</th>
+                <th class="num">单线程下行</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in directRows" :key="row.target.node_id">
+                <td>
+                  <strong>{{ row.target.name }}</strong>
+                  <div v-if="row.target.public_url" class="faint mono sub-url">{{ row.target.public_url }}</div>
+                </td>
+                <td>
+                  <span class="pill" :class="row.status === 'done' ? 'good' : row.status === 'running' ? 'warn' : row.status === 'error' || row.status === 'blocked' ? 'bad' : ''">
+                    {{ row.status === 'running' ? '测速中' : row.status === 'done' ? '完成' : row.status === 'blocked' ? '不可测' : row.status === 'error' ? '失败' : '待测' }}
+                  </span>
+                  <div v-if="row.note" class="faint sub-note">{{ row.note }}</div>
+                </td>
+                <td class="num" :class="row.ttfbMs >= 0 ? rttTone(row.ttfbMs) : 'muted'">
+                  {{ row.ttfbMs >= 0 ? `${row.ttfbMs}ms` : '--' }}
+                </td>
+                <td class="num" :class="row.mbps > 0 ? speedTone(row.mbps) : 'muted'">
+                  {{ row.mbps > 0 ? `${row.mbps.toFixed(1)}Mbps` : '--' }}
+                </td>
+              </tr>
+              <tr v-if="!directRows.length && !directLoading">
+                <td colspan="4" class="faint center">暂无可直测节点</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </div>
+  </UiDrawer>
+</template>
+
+<style scoped>
+.st-wrap { display: flex; flex-direction: column; gap: 16px; }
+.st-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--border); }
+.st-tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 38px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; cursor: pointer; }
+.st-tabs button.on { color: var(--text); font-weight: 500; }
+.st-tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
+.st-tabs .ico { width: 15px; height: 15px; }
+
+.controls-box { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.row-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.picker { display: flex; flex-direction: column; gap: 8px; }
+.picker-head { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; }
+.picker-head .label { color: var(--text-2); font-weight: 500; }
+.presets { display: flex; gap: 12px; }
+.link-btn { border: 0; padding: 0; background: transparent; color: var(--text-2); font-size: 12.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.link-btn:hover:not(:disabled) { color: var(--text); }
+.link-btn:disabled { opacity: 0.45; cursor: default; }
+
+.chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elev); color: var(--text-2); font-size: 12px; cursor: pointer; }
+.chip.on { border-color: var(--text); background: var(--surface); color: var(--text); font-weight: 500; }
+.chip.isp.on { border-color: var(--good); color: var(--good); background: var(--good-soft); }
+
+.custom-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--border); }
+.action-right { display: flex; align-items: center; gap: 8px; }
+
+.custom-panel { display: flex; flex-direction: column; gap: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.custom-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.custom-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); font-size: 12.5px; }
+.ct-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ct-name { font-weight: 500; }
+.ct-urls { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.del-btn { display: grid; place-items: center; width: 24px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; }
+.del-btn:hover { color: var(--bad); background: var(--surface-hover); }
+.del-btn svg { width: 13px; height: 13px; }
+
+.custom-form { display: flex; flex-direction: column; gap: 10px; }
+.cf-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.cf-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+.method-sel { width: 96px; }
+
+.job-box { display: flex; flex-direction: column; gap: 10px; }
+.job-meta { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+.job-meta > span { display: inline-flex; align-items: center; gap: 8px; }
+.prog-track { height: 4px; border-radius: 999px; background: var(--surface); overflow: hidden; }
+.prog-fill { height: 100%; background: var(--good); transition: width 240ms var(--ease); }
+
+.table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; background: var(--bg-elev); }
+.st-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.st-table th, .st-table td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.st-table th { font-size: 12px; font-weight: 500; color: var(--text-3); background: var(--bg); }
+.st-table th.num, .st-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.st-table tr:last-child td { border-bottom: 0; }
+.st-table tr.running { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.region-cell { font-weight: 500; }
+.err-hint { font-weight: 400; color: var(--bad); font-size: 11.5px; }
+
+.good { color: var(--good); font-weight: 600; }
+.warn { color: var(--warn); font-weight: 500; }
+.bad { color: var(--bad); font-weight: 500; }
+.muted { color: var(--text-3); }
+.faint { color: var(--text-3); }
+.mono { font-family: var(--font-mono); }
+.tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--surface); color: var(--text-2); }
+.pill { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 999px; font-size: 11.5px; background: var(--surface); color: var(--text-2); }
+.pill.good { background: var(--good-soft); color: var(--good); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+
+.empty-hint { padding: 36px 16px; text-align: center; font-size: 13px; color: var(--text-3); border: 1px dashed var(--border); border-radius: var(--radius); }
+.direct-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.direct-head p { margin: 0; font-size: 12.5px; line-height: 1.5; }
+.sub-url { font-size: 11px; margin-top: 2px; }
+.sub-note { font-size: 11.5px; margin-top: 3px; white-space: normal; max-width: 280px; }
+.center { text-align: center !important; padding: 24px !important; }
+
+@media (max-width: 640px) {
+  .row-grid { grid-template-columns: 1fr; }
+  .direct-head { flex-direction: column; align-items: flex-start; }
+}
+</style>

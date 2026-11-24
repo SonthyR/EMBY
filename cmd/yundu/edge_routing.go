@@ -174,7 +174,7 @@ func tryRedirectToEdgeNode(
 	if !isEdgeOffloadableMediaRequest(r) {
 		return false
 	}
-	decision := pm.edges.selectNodeForIP(clientIP)
+	decision := pm.edges.selectNodeForDispatch(clientIP)
 	if decision.NodeID <= 0 {
 		return false
 	}
@@ -220,7 +220,7 @@ func tryRedirectDynamicResourceToEdgeNode(
 		return false
 	}
 	edgeCtx := edgeRequestContextFrom(r.Context())
-	decision := pm.edges.selectNodeForIP(edgeCtx.clientIP)
+	decision := pm.edges.selectNodeForDispatch(edgeCtx.clientIP)
 	if decision.NodeID <= 0 {
 		return false
 	}

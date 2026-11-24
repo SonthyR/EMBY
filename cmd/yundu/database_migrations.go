@@ -537,6 +537,9 @@ func (d *DB) migrateOnce() error {
 	if err := ensureRedeemCodeSchema(ctx, conn); err != nil {
 		return err
 	}
+	if err := ensureSpeedtestSchema(ctx, conn); err != nil {
+		return err
+	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldBan, Trash2 } from '@lucide/vue'
+import { Activity, ArrowDownWideNarrow, ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldBan, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
+import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import {
@@ -11,6 +12,7 @@ import {
   type IP2RegionStatus,
   type ISPRouteGroup,
   type ISPRouteNode,
+  type ISPRouteStrategy,
 } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -249,7 +251,52 @@ function nodeStatusClass(node: ISPRouteNode): string {
 }
 
 function activeNodeLabel(group: ISPRouteGroup): string {
-  return group.nodes.find(n => n.active)?.name || '主机'
+  const activeNodes = group.nodes.filter(n => n.active)
+  if (group.strategy === 'balance' && activeNodes.length > 1) {
+    return `负载均衡 (${activeNodes.length} 台)`
+  }
+  return activeNodes[0]?.name || '主机'
+}
+
+const speedtestOpen = ref(false)
+
+const STRATEGIES: { key: ISPRouteStrategy; label: string }[] = [
+  { key: 'priority', label: '手动优先级' },
+  { key: 'auto', label: '自动择优' },
+  { key: 'balance', label: '负载均衡' },
+]
+
+function hasSpeedMetrics(group: ISPRouteGroup): boolean {
+  return group.nodes.some(n => (n.speed_metric?.avg_return_bps || 0) > 0)
+}
+
+async function setGroupStrategy(group: ISPRouteGroup, strategy: ISPRouteStrategy) {
+  if (group.strategy === strategy || savingGroup.value) return
+  savingGroup.value = group.group
+  try {
+    const res = await ispRoutesApi.setStrategy(group.group, strategy)
+    blockNonMainland.value = !!res.block_non_mainland
+    groups.value = res.groups || []
+    const lbl = STRATEGIES.find(s => s.key === strategy)?.label || strategy
+    toast.success(`「${group.label}」已切换为${lbl}`)
+  } catch (error) {
+    toast.error(errorMessage(error, '保存调度模式失败'))
+  } finally {
+    savingGroup.value = null
+  }
+}
+
+async function sortGroupBySpeed(group: ISPRouteGroup) {
+  if (!hasSpeedMetrics(group) || savingGroup.value) return
+  const indexed = group.nodes.map((node, index) => ({ node, index }))
+  indexed.sort((a, b) => {
+    const aBps = a.node.speed_metric?.avg_return_bps || 0
+    const bBps = b.node.speed_metric?.avg_return_bps || 0
+    if (aBps !== bBps) return bBps - aBps
+    return a.index - b.index
+  })
+  group.nodes = indexed.map(item => item.node)
+  await persistGroup(group.group)
 }
 
 async function runLookup(sample?: string) {
@@ -301,7 +348,8 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 
 <template>
   <div class="routes-page">
-    <PageHeader title="线路" description="按访问者运营商智能分流媒体播放流：拖动调整每条线路的节点优先级，首位在线节点生效，离线自动降级。">
+    <PageHeader title="线路" description="按访问者运营商智能分流媒体播放流：支持手动优先级、基于单线程测速的自动择优与负载均衡。">
+      <UiButton @click="speedtestOpen = true"><Activity />单线程测速</UiButton>
       <UiButton @click="load()"><RefreshCw />刷新</UiButton>
     </PageHeader>
 
@@ -361,6 +409,36 @@ async function deleteIPDB(version: 'v4' | 'v6') {
               已拒绝「{{ group.label }}」分组的 Emby 客户端连接（HTTP 403），不会消耗主机或从机流量；面板网页与内网不受影响。
             </p>
 
+            <div class="strategy-bar" :class="{ dimmed: group.block_connect }">
+              <div class="seg" role="group" :aria-label="`${group.label}调度模式`">
+                <button
+                  v-for="s in STRATEGIES"
+                  :key="s.key"
+                  type="button"
+                  :class="{ on: (group.strategy || 'priority') === s.key }"
+                  :disabled="savingGroup === group.group"
+                  @click="setGroupStrategy(group, s.key)"
+                >
+                  {{ s.label }}
+                </button>
+              </div>
+              <UiButton
+                size="sm"
+                variant="ghost"
+                :disabled="!hasSpeedMetrics(group) || !!savingGroup"
+                :title="hasSpeedMetrics(group) ? '按单线程实测回程速度降序推荐排序' : '请先在右上角对节点运行单线程测速'"
+                @click="sortGroupBySpeed(group)"
+              >
+                <ArrowDownWideNarrow />按速度排序
+              </UiButton>
+            </div>
+            <p v-if="!group.block_connect && group.strategy === 'auto'" class="strategy-hint faint">
+              自动择优：仅在已启用且在线的从机间按实测回程速率、重传率与负载选优，主机仅作全从机不可用时的兜底。
+            </p>
+            <p v-else-if="!group.block_connect && group.strategy === 'balance'" class="strategy-hint faint">
+              负载均衡：仅在已启用且在线的从机间按最低活跃连接数与轮询均衡分发，主机仅作全从机不可用时的兜底。
+            </p>
+
             <TransitionGroup name="list" tag="ul" class="node-list" :class="{ dimmed: group.block_connect }">
               <li
                 v-for="(node, idx) in group.nodes"
@@ -398,6 +476,12 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                     <span>{{ node.name }}</span>
                     <span v-if="node.active" class="badge-active">当前生效</span>
                     <span class="status-dot" :class="nodeStatusClass(node)">{{ nodeStatusText(node) }}</span>
+                  </div>
+                  <div v-if="node.speed_metric && node.speed_metric.avg_return_bps > 0" class="node-speed num">
+                    回程 {{ node.speed_metric.avg_return_mbps.toFixed(1) }}Mbps
+                    <span v-if="node.speed_metric.avg_outbound_mbps > 0"> · 去程 {{ node.speed_metric.avg_outbound_mbps.toFixed(1) }}Mbps</span>
+                    <span v-if="node.speed_metric.avg_return_rtt_ms >= 0"> · {{ node.speed_metric.avg_return_rtt_ms }}ms</span>
+                    <span v-if="node.speed_metric.total_retrans >= 0"> · 重传 {{ node.speed_metric.total_retrans }}</span>
                   </div>
                   <div v-if="node.public_url" class="node-url mono">{{ node.public_url }}</div>
                 </div>
@@ -567,6 +651,8 @@ async function deleteIPDB(version: 'v4' | 'v6') {
         </div>
       </section>
     </template>
+
+    <SpeedtestDrawer :open="speedtestOpen" @close="speedtestOpen = false" @completed="load(true)" />
   </div>
 </template>
 
@@ -617,7 +703,15 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 
 .node-info { flex: 1; min-width: 0; }
 .node-name { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 13.5px; font-weight: 500; }
+.node-speed { margin-top: 3px; font-size: 11.5px; color: var(--good); font-weight: 500; }
 .node-url { margin-top: 2px; font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.strategy-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.strategy-bar.dimmed { opacity: 0.48; pointer-events: none; }
+.seg { display: inline-flex; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); }
+.seg button { height: 24px; padding: 0 9px; border: 0; border-radius: calc(var(--radius-sm) - 2px); background: transparent; color: var(--text-3); font-size: 12px; cursor: pointer; }
+.seg button.on { background: var(--surface); color: var(--text); font-weight: 500; }
+.strategy-hint { margin: 0; font-size: 11.5px; line-height: 1.5; }
 
 .badge-active { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); font-weight: 500; }
 .status-dot { font-size: 11.5px; color: var(--text-3); }

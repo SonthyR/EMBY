@@ -282,8 +282,26 @@ type edgeAgent struct {
 	lastHandledUpgradeID string
 	upgrading            atomic.Bool
 
+	speedtestMu         sync.Mutex
+	speedtestActiveID   string
+	speedtestLastDoneID string
+	speedtestCancel     context.CancelFunc
+	speedtestProgress   *agentSpeedtestProgress
+	speedtestTransport  *http.Transport
+	speedtestNotifyCh   chan struct{}
+	lastWindowAt        atomic.Int64
+
+	directActive  atomic.Int32
+	directMu      sync.Mutex
+	directBudgets map[string]directStreamBudget
+
 	restartCh   chan struct{}
 	restartOnce sync.Once
+}
+
+type directStreamBudget struct {
+	used int64
+	exp  int64
 }
 
 func (a *edgeAgent) requestRestart() {
@@ -317,16 +335,19 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 				return http.ErrUseLastResponse
 			},
 		},
-		blockedUsers: make(map[int64]bool),
-		revoked:      make(map[string]bool),
-		limiters:     make(map[int64]*shareRateLimiter),
-		speedLimits:  make(map[int64]int),
-		traffic:      make(map[agentTrafficKey]*agentTrafficAccum),
-		flushCh:      make(chan struct{}, 1),
-		latencies:    make(map[int64]int),
-		probeNowCh:   make(chan struct{}, 1),
-		restartCh:    make(chan struct{}),
+		blockedUsers:      make(map[int64]bool),
+		revoked:           make(map[string]bool),
+		limiters:          make(map[int64]*shareRateLimiter),
+		speedLimits:       make(map[int64]int),
+		traffic:           make(map[agentTrafficKey]*agentTrafficAccum),
+		flushCh:           make(chan struct{}, 1),
+		latencies:         make(map[int64]int),
+		probeNowCh:        make(chan struct{}, 1),
+		speedtestNotifyCh: make(chan struct{}, 1),
+		directBudgets:     make(map[string]directStreamBudget),
+		restartCh:         make(chan struct{}),
 	}
+	agent.lastWindowAt.Store(time.Now().UnixNano())
 	agent.nodeEnabled.Store(true)
 	return agent
 }
@@ -430,20 +451,195 @@ func (a *edgeAgent) heartbeatLoop(ctx context.Context) {
 			if err := a.sendHeartbeat(ctx); err == nil {
 				lastFlush = time.Now()
 			}
+		case <-a.speedtestNotifyCh:
+			if err := a.sendHeartbeat(ctx); err == nil {
+				lastFlush = time.Now()
+			}
 		}
 	}
+}
+
+func (a *edgeAgent) triggerSpeedtestNotify() {
+	if a == nil || a.speedtestNotifyCh == nil {
+		return
+	}
+	select {
+	case a.speedtestNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (a *edgeAgent) snapshotSpeedtestProgress() *agentSpeedtestProgress {
+	a.speedtestMu.Lock()
+	defer a.speedtestMu.Unlock()
+	if a.speedtestProgress == nil {
+		return nil
+	}
+	cp := *a.speedtestProgress
+	cp.Results = append([]speedtestTargetResult(nil), a.speedtestProgress.Results...)
+	return &cp
+}
+
+func (a *edgeAgent) ackSpeedtestProgress(sent *agentSpeedtestProgress, ackID string) {
+	if sent == nil || ackID == "" || ackID != sent.TaskID {
+		return
+	}
+	if sent.Status != "done" && sent.Status != "failed" && sent.Status != "canceled" {
+		return
+	}
+	a.speedtestMu.Lock()
+	if a.speedtestProgress != nil && a.speedtestProgress.TaskID == sent.TaskID && a.speedtestProgress.Status == sent.Status {
+		a.speedtestProgress = nil
+	}
+	a.speedtestMu.Unlock()
+}
+
+func (a *edgeAgent) handleSpeedtestDirective(parentCtx context.Context, task *agentSpeedtestTask, cancelID string) {
+	var cancelFn context.CancelFunc
+	var startTask *agentSpeedtestTask
+	var taskCtx context.Context
+
+	a.speedtestMu.Lock()
+	if cancelID != "" && a.speedtestActiveID == cancelID && a.speedtestCancel != nil {
+		cancelFn = a.speedtestCancel
+	}
+	if task != nil && task.TaskID != "" &&
+		task.TaskID != cancelID &&
+		task.TaskID != a.speedtestActiveID &&
+		task.TaskID != a.speedtestLastDoneID &&
+		a.speedtestActiveID == "" {
+		taskCtx, a.speedtestCancel = context.WithCancel(parentCtx)
+		a.speedtestActiveID = task.TaskID
+		cp := agentSpeedtestTask{
+			TaskID:     task.TaskID,
+			DurationMs: task.DurationMs,
+			Targets:    append([]agentSpeedtestTarget(nil), task.Targets...),
+		}
+		startTask = &cp
+	}
+	a.speedtestMu.Unlock()
+
+	if cancelFn != nil {
+		cancelFn()
+	}
+	if startTask != nil {
+		go a.runSpeedtestTask(taskCtx, *startTask)
+	}
+}
+
+func (a *edgeAgent) runSpeedtestTask(ctx context.Context, task agentSpeedtestTask) {
+	dur := defaultSpeedtestPhaseDuration
+	if task.DurationMs > 0 {
+		dur = time.Duration(task.DurationMs) * time.Millisecond
+	}
+	results := make([]speedtestTargetResult, len(task.Targets))
+	for i, tgt := range task.Targets {
+		results[i] = speedtestTargetResult{
+			TargetKey:     tgt.TargetKey,
+			Label:         tgt.Label,
+			Province:      tgt.Province,
+			ISPGroup:      tgt.ISPGroup,
+			ISPLabel:      tgt.ISPLabel,
+			TargetKind:    tgt.TargetKind,
+			ResolvedIP:    tgt.ResolvedIP,
+			Status:        "pending",
+			ReturnRetrans: -1,
+			ReturnRTTMs:   -1,
+			OutboundRTTMs: -1,
+		}
+	}
+
+	update := func(status string, completed int, errMsg string) {
+		a.speedtestMu.Lock()
+		a.speedtestProgress = &agentSpeedtestProgress{
+			TaskID:           task.TaskID,
+			Status:           status,
+			CompletedTargets: completed,
+			TotalTargets:     len(results),
+			Error:            errMsg,
+			Results:          append([]speedtestTargetResult(nil), results...),
+		}
+		a.speedtestMu.Unlock()
+		a.triggerSpeedtestNotify()
+	}
+
+	a.speedtestMu.Lock()
+	trOverride := a.speedtestTransport
+	a.speedtestMu.Unlock()
+
+	update("running", 0, "")
+
+	completed := 0
+	for i, tgt := range task.Targets {
+		if ctx.Err() != nil {
+			break
+		}
+		results[i].Status = "running"
+		update("running", completed, "")
+
+		res := executeSpeedtestTarget(ctx, tgt, dur, trOverride)
+		if ctx.Err() != nil {
+			results[i].Status = "error"
+			results[i].Error = "已取消"
+			break
+		}
+		results[i] = res
+		completed++
+		update("running", completed, "")
+	}
+
+	finalStatus := "done"
+	finalErr := ""
+	if ctx.Err() != nil {
+		finalStatus = "canceled"
+		finalErr = "任务已手动取消"
+	} else {
+		succeeded := 0
+		for _, r := range results {
+			if r.Status == "done" {
+				succeeded++
+			}
+		}
+		if succeeded == 0 && len(results) > 0 {
+			finalStatus = "failed"
+			finalErr = "全部测速目标执行失败"
+		}
+	}
+
+	a.speedtestMu.Lock()
+	a.speedtestProgress = &agentSpeedtestProgress{
+		TaskID:           task.TaskID,
+		Status:           finalStatus,
+		CompletedTargets: completed,
+		TotalTargets:     len(results),
+		Error:            finalErr,
+		Results:          append([]speedtestTargetResult(nil), results...),
+	}
+	a.speedtestActiveID = ""
+	a.speedtestLastDoneID = task.TaskID
+	a.speedtestCancel = nil
+	a.speedtestMu.Unlock()
+
+	a.triggerSpeedtestNotify()
 }
 
 func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	reports := a.drainTrafficReports()
 	bytesInWindow := a.windowBytes.Swap(0)
-	bps := bytesInWindow * 8 / int64(edgeAgentHeartbeatInterval/time.Second)
+	nowNano := time.Now().UnixNano()
+	prevNano := a.lastWindowAt.Swap(nowNano)
+	elapsedSec := float64(nowNano-prevNano) / float64(time.Second)
+	if elapsedSec < 1.0 {
+		elapsedSec = 1.0
+	}
+	bps := int64(float64(bytesInWindow*8) / elapsedSec)
 
 	a.certMu.RLock()
 	fp := a.certFingerprint
 	tlsActive := a.cert != nil
 	a.certMu.RUnlock()
 
+	stProgress := a.snapshotSpeedtestProgress()
 	upgradeReqID, upgradeStatus := a.getUpgradeState()
 	payload := agentHeartbeatRequest{
 		Version:           appVersion,
@@ -453,7 +649,9 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 		CurrentBps:        bps,
 		MemoryBytes:       currentProcessMemoryBytes(),
 		UptimeSec:         int64(time.Since(a.startedAt).Seconds()),
+		SupportsSpeedtest: true,
 		UpstreamLatencies: a.snapshotLatencies(),
+		SpeedtestProgress: stProgress,
 		UpgradeRequestID:  upgradeReqID,
 		UpgradeStatus:     upgradeStatus,
 		CertFingerprint:   fp,
@@ -531,11 +729,91 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 			log.Printf("edge agent: invalid synced TLS certificate: %v", err)
 		}
 	}
+	a.ackSpeedtestProgress(stProgress, reply.AckSpeedtestID)
 	a.setProbeTargets(reply.ProbeTargets)
+	a.handleSpeedtestDirective(ctx, reply.SpeedtestTask, reply.CancelSpeedtestID)
 	if reply.UpgradeToVersion != "" && reply.UpgradeRequestID != "" {
 		a.maybeTriggerUpgrade(ctx, reply.UpgradeToVersion, reply.UpgradeRequestID)
 	}
 	return nil
+}
+
+func (a *edgeAgent) reserveDirectBudget(ticket edgeSpeedtestTicket, requestedBytes int64) bool {
+	if requestedBytes < minDirectStreamBytes {
+		requestedBytes = minDirectStreamBytes
+	}
+	if ticket.MaxBytes <= 0 || ticket.MaxBytes > maxDirectStreamBytes {
+		ticket.MaxBytes = maxDirectStreamBytes
+	}
+	if requestedBytes > ticket.MaxBytes {
+		requestedBytes = ticket.MaxBytes
+	}
+	budgetLimit := ticket.MaxBytes * 2
+	nowUnix := time.Now().Unix()
+
+	a.directMu.Lock()
+	defer a.directMu.Unlock()
+	if a.directBudgets == nil {
+		a.directBudgets = make(map[string]directStreamBudget)
+	}
+	for k, v := range a.directBudgets {
+		if nowUnix > v.exp {
+			delete(a.directBudgets, k)
+		}
+	}
+	entry := a.directBudgets[ticket.JTI]
+	if entry.used+requestedBytes > budgetLimit {
+		return false
+	}
+	entry.used += requestedBytes
+	entry.exp = ticket.ExpiresAt
+	a.directBudgets[ticket.JTI] = entry
+	return true
+}
+
+func (a *edgeAgent) handleSpeedtestDirectRequest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Range, Accept, Cache-Control")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.nodeEnabled.Load() {
+		writeShareJSONError(w, http.StatusUnauthorized, "节点已停用")
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, edgeSpeedtestPathPrefix)
+	sealed, _, _ := strings.Cut(rest, "/")
+	ticket, err := openEdgeSpeedtestTicket(a.cfg.Token, sealed)
+	if err != nil || ticket.NodeID != a.cfg.NodeID {
+		writeShareJSONError(w, http.StatusUnauthorized, "测速链接已失效")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if cur := a.directActive.Add(1); cur > 2 {
+			a.directActive.Add(-1)
+			writeShareJSONError(w, http.StatusTooManyRequests, "当前直测并发已满，请稍后再试")
+			return
+		}
+		defer a.directActive.Add(-1)
+		requested := defaultDirectStreamBytes
+		if raw := strings.TrimSpace(r.URL.Query().Get("bytes")); raw != "" {
+			if parsed, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
+				requested = parsed
+			}
+		}
+		if !a.reserveDirectBudget(ticket, requested) {
+			writeShareJSONError(w, http.StatusTooManyRequests, "本机直测令牌流量额度已耗尽")
+			return
+		}
+	}
+	serveSpeedtestByteStream(w, r, ticket.MaxBytes)
 }
 
 func (a *edgeAgent) isRequestBlocked(ticket edgePlaybackTicket) (bool, string) {
@@ -581,6 +859,10 @@ func (a *edgeAgent) handler() http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprintf(w, `{"ok":true,"version":%q,"tls_active":%v}`, appVersion, a.hasTLS())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, edgeSpeedtestPathPrefix) {
+			a.handleSpeedtestDirectRequest(w, r)
 			return
 		}
 		if !strings.HasPrefix(r.URL.Path, edgeTicketPathPrefix) {

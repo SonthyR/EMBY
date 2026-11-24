@@ -450,6 +450,22 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 	return snap, nil
 }
 
+func (pm *ProxyManager) SumPendingTraffic() (bytesIn, bytesOut, requests int64) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, inst := range pm.proxies {
+		if inst == nil {
+			continue
+		}
+		inst.trafficMu.Lock()
+		bytesIn += inst.bytesIn.Load()
+		bytesOut += inst.bytesOut.Load()
+		requests += inst.pendingRequests.Load()
+		inst.trafficMu.Unlock()
+	}
+	return bytesIn, bytesOut, requests
+}
+
 func (pm *ProxyManager) GetRunningCount() int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()

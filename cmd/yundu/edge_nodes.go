@@ -16,9 +16,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -40,7 +42,21 @@ const (
 	edgeNodeDefaultPort      = 19090
 	edgeInstallScriptRawBase = "https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh"
 	ispSettingNonMainlandKey = "_non_mainland"
+	ispStrategyPriority      = "priority"
+	ispStrategyAuto          = "auto"
+	ispStrategyBalance       = "balance"
+	speedtestMetricMaxAge    = 30 * 24 * time.Hour
 )
+
+func normalizeISPStrategy(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch s {
+	case ispStrategyPriority, ispStrategyAuto, ispStrategyBalance:
+		return s, true
+	default:
+		return ispStrategyPriority, false
+	}
+}
 
 const edgeNodeSchemaSQL = `
 CREATE TABLE IF NOT EXISTS edge_nodes (
@@ -83,15 +99,35 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, edgeNodeSchemaSQL); err != nil {
 		return err
 	}
+	for _, col := range []struct{ table, name, alter string }{
+		{"isp_group_settings", "strategy", `ALTER TABLE isp_group_settings ADD COLUMN strategy TEXT NOT NULL DEFAULT 'priority'`},
+		{"edge_nodes", "total_bytes_in", `ALTER TABLE edge_nodes ADD COLUMN total_bytes_in INTEGER NOT NULL DEFAULT 0`},
+		{"edge_nodes", "total_bytes_out", `ALTER TABLE edge_nodes ADD COLUMN total_bytes_out INTEGER NOT NULL DEFAULT 0`},
+	} {
+		var exists int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+col.table+"') WHERE name=?", col.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := conn.ExecContext(ctx, col.alter); err != nil {
+				return err
+			}
+			if col.table == "edge_nodes" && col.name == "total_bytes_out" {
+				if _, err := conn.ExecContext(ctx, `UPDATE edge_nodes SET total_bytes_out=traffic_used WHERE traffic_used > 0 AND total_bytes_in = 0 AND total_bytes_out = 0`); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for _, group := range allISPGroups {
 		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_route_rules(isp_group, node_id, sort_order, enabled) VALUES(?, 0, 1, 1)`, group); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect) VALUES(?, 0)`, group); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect, strategy) VALUES(?, 0, 'priority')`, group); err != nil {
 			return err
 		}
 	}
-	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect) VALUES(?, 0)`, ispSettingNonMainlandKey); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect, strategy) VALUES(?, 0, 'priority')`, ispSettingNonMainlandKey); err != nil {
 		return err
 	}
 	return nil
@@ -242,38 +278,39 @@ func openEdgePlaybackTicket(token, encoded string) (edgePlaybackTicket, error) {
 // Edge node DTOs and runtime state
 
 type EdgeNode struct {
-	ID                int64             `json:"id"`
-	Name              string            `json:"name"`
-	PublicPort        int               `json:"public_port"`
-	ListenPort        int               `json:"listen_port"`
-	PublicHost        string            `json:"public_host"`
-	PublicIP          string            `json:"public_ip"`
-	DetectedIP        string            `json:"detected_ip"`
-	TLSMode           string            `json:"tls_mode"`
-	Enabled           bool              `json:"enabled"`
-	TrafficQuota      int64             `json:"traffic_quota"`
-	TrafficUsed       int64             `json:"traffic_used"`
-	ResetDay          int               `json:"traffic_reset_day"`
-	NextResetAt       string            `json:"next_reset_at,omitempty"`
-	Note              string            `json:"note"`
-	AgentVersion      string            `json:"agent_version"`
-	MasterVersion     string            `json:"master_version,omitempty"`
-	UpgradeAvailable  bool              `json:"upgrade_available"`
-	UpgradeTarget     string            `json:"upgrade_target,omitempty"`
-	UpgradeStatus     string            `json:"upgrade_status,omitempty"`
-	LastSeenAt        string            `json:"last_seen_at"`
-	Online            bool              `json:"online"`
-	TLSActive         bool              `json:"tls_active"`
-	ActiveStreams     int               `json:"active_streams"`
-	CurrentBps        int64             `json:"current_bps"`
-	MemoryBytes       uint64            `json:"memory_bytes"`
-	UptimeSec         int64             `json:"uptime_sec"`
-	UpstreamLatencies []edgeSiteLatency `json:"upstream_latencies,omitempty"`
-	PublicURL         string            `json:"public_url"`
-	Status            string            `json:"status"` // online, offline, disabled, quota, waiting
-	InstallCommand    string            `json:"install_command,omitempty"`
-	CreatedAt         string            `json:"created_at"`
-	UpdatedAt         string            `json:"updated_at"`
+	ID                int64                 `json:"id"`
+	Name              string                `json:"name"`
+	PublicPort        int                   `json:"public_port"`
+	ListenPort        int                   `json:"listen_port"`
+	PublicHost        string                `json:"public_host"`
+	PublicIP          string                `json:"public_ip"`
+	DetectedIP        string                `json:"detected_ip"`
+	TLSMode           string                `json:"tls_mode"`
+	Enabled           bool                  `json:"enabled"`
+	TrafficQuota      int64                 `json:"traffic_quota"`
+	TrafficUsed       int64                 `json:"traffic_used"`
+	ResetDay          int                   `json:"traffic_reset_day"`
+	NextResetAt       string                `json:"next_reset_at,omitempty"`
+	Note              string                `json:"note"`
+	AgentVersion      string                `json:"agent_version"`
+	MasterVersion     string                `json:"master_version,omitempty"`
+	UpgradeAvailable  bool                  `json:"upgrade_available"`
+	UpgradeTarget     string                `json:"upgrade_target,omitempty"`
+	UpgradeStatus     string                `json:"upgrade_status,omitempty"`
+	LastSeenAt        string                `json:"last_seen_at"`
+	Online            bool                  `json:"online"`
+	TLSActive         bool                  `json:"tls_active"`
+	ActiveStreams     int                   `json:"active_streams"`
+	CurrentBps        int64                 `json:"current_bps"`
+	MemoryBytes       uint64                `json:"memory_bytes"`
+	UptimeSec         int64                 `json:"uptime_sec"`
+	UpstreamLatencies []edgeSiteLatency     `json:"upstream_latencies,omitempty"`
+	SpeedMetrics      []edgeNodeSpeedMetric `json:"speed_metrics,omitempty"`
+	PublicURL         string                `json:"public_url"`
+	Status            string                `json:"status"` // online, offline, disabled, quota, waiting
+	InstallCommand    string                `json:"install_command,omitempty"`
+	CreatedAt         string                `json:"created_at"`
+	UpdatedAt         string                `json:"updated_at"`
 }
 
 type EdgeNodeInput struct {
@@ -321,8 +358,20 @@ type edgeNodeLiveState struct {
 	alertKnownOffline   bool
 	alertQuota80Period  string
 	alertQuota100Period string
+	supportsSpeedtest   bool
 
-	pending atomic.Int64
+	pending           atomic.Int64
+	persistedTotalIn  int64
+	persistedTotalOut int64
+	pendingTotalIn    atomic.Int64
+	pendingTotalOut   atomic.Int64
+}
+
+func (n *edgeNodeLiveState) totalDirections() (int64, int64) {
+	if n == nil {
+		return 0, 0
+	}
+	return n.persistedTotalIn + n.pendingTotalIn.Load(), n.persistedTotalOut + n.pendingTotalOut.Load()
 }
 
 func (n *edgeNodeLiveState) effectiveListenPort() int {
@@ -421,18 +470,29 @@ type edgeNodeRuntime struct {
 	nodes            map[int64]*edgeNodeLiveState
 	routes           map[string][]ispRouteRule // isp_group -> ordered rules
 	blocked          map[string]bool           // isp_group -> block_connect enabled
+	strategies       map[string]string         // isp_group -> priority | auto | balance
+	speedMetrics     map[int64]map[string]edgeNodeSpeedMetric
+	rrCounters       map[string]*atomic.Uint64
 	blockNonMainland bool
 	flushMu          sync.Mutex
+	speedReloadMu    sync.Mutex
 }
 
 func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNodeRuntime {
+	counters := make(map[string]*atomic.Uint64, len(allISPGroups))
+	for _, g := range allISPGroups {
+		counters[g] = &atomic.Uint64{}
+	}
 	rt := &edgeNodeRuntime{
-		db:        db,
-		pm:        pm,
-		ip2region: ip2,
-		nodes:     make(map[int64]*edgeNodeLiveState),
-		routes:    make(map[string][]ispRouteRule),
-		blocked:   make(map[string]bool),
+		db:           db,
+		pm:           pm,
+		ip2region:    ip2,
+		nodes:        make(map[int64]*edgeNodeLiveState),
+		routes:       make(map[string][]ispRouteRule),
+		blocked:      make(map[string]bool),
+		strategies:   make(map[string]string),
+		speedMetrics: make(map[int64]map[string]edgeNodeSpeedMetric),
+		rrCounters:   counters,
 	}
 	if db != nil {
 		if err := rt.reload(); err != nil {
@@ -446,12 +506,13 @@ func (rt *edgeNodeRuntime) reload() error {
 	if rt == nil || rt.db == nil {
 		return nil
 	}
-	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note, agent_version, last_seen_at FROM edge_nodes ORDER BY id`)
+	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY id`)
 	if err != nil {
 		return err
 	}
 	type loadedNode struct {
 		id, quota, used                  int64
+		totalIn, totalOut                int64
 		publicPort, listenPort, resetDay int
 		name, publicHost, publicIP       string
 		detectedIP, tlsMode              string
@@ -463,7 +524,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	for rows.Next() {
 		var item loadedNode
 		var enabled int
-		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.note, &item.version, &item.seen); err != nil {
+		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
 			rows.Close()
 			return err
 		}
@@ -499,21 +560,34 @@ func (rt *edgeNodeRuntime) reload() error {
 	routeRows.Close()
 
 	blocked := make(map[string]bool, len(allISPGroups))
+	strategies := make(map[string]string, len(allISPGroups))
+	for _, g := range allISPGroups {
+		strategies[g] = ispStrategyPriority
+	}
 	blockNonMainland := false
-	if settingRows, err := rt.db.db.Query(`SELECT isp_group, block_connect FROM isp_group_settings`); err == nil {
+	if settingRows, err := rt.db.db.Query(`SELECT isp_group, block_connect, strategy FROM isp_group_settings`); err == nil {
 		for settingRows.Next() {
-			var group string
+			var group, strategy string
 			var block int
-			if err := settingRows.Scan(&group, &block); err == nil && block != 0 {
+			if err := settingRows.Scan(&group, &block, &strategy); err == nil {
 				if group == ispSettingNonMainlandKey {
-					blockNonMainland = true
+					if block != 0 {
+						blockNonMainland = true
+					}
 				} else if validISPGroup(group) {
-					blocked[group] = true
+					if block != 0 {
+						blocked[group] = true
+					}
+					if norm, ok := normalizeISPStrategy(strategy); ok {
+						strategies[group] = norm
+					}
 				}
 			}
 		}
 		settingRows.Close()
 	}
+
+	speedMap := rt.loadSpeedMetricsFromDB()
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -543,6 +617,8 @@ func (rt *edgeNodeRuntime) reload() error {
 		state.enabled = item.enabled
 		state.quota = item.quota
 		state.persistedUsed = item.used
+		state.persistedTotalIn = item.totalIn
+		state.persistedTotalOut = item.totalOut
 		state.resetDay = item.resetDay
 		state.resetPeriod = item.resetPeriod
 		state.note = item.note
@@ -583,8 +659,176 @@ func (rt *edgeNodeRuntime) reload() error {
 	}
 	rt.routes = routes
 	rt.blocked = blocked
+	rt.strategies = strategies
+	rt.speedMetrics = speedMap
 	rt.blockNonMainland = blockNonMainland
 	return nil
+}
+
+func (rt *edgeNodeRuntime) loadSpeedMetricsFromDB() map[int64]map[string]edgeNodeSpeedMetric {
+	result := make(map[int64]map[string]edgeNodeSpeedMetric)
+	if rt == nil || rt.db == nil || rt.db.db == nil {
+		return result
+	}
+	rows, err := rt.db.db.Query(`SELECT node_id, isp_group, avg_return_bps, avg_outbound_bps, avg_return_rtt_ms, avg_outbound_rtt_ms, total_retrans, sample_count, tested_at FROM edge_node_speed_metrics`)
+	if err != nil {
+		return result
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID int64
+		var m edgeNodeSpeedMetric
+		if err := rows.Scan(&nodeID, &m.ISPGroup, &m.AvgReturnBps, &m.AvgOutboundBps, &m.AvgReturnRTTMs, &m.AvgOutboundRTTMs, &m.TotalRetrans, &m.SampleCount, &m.TestedAt); err != nil {
+			continue
+		}
+		m.ISPLabel = ispGroupLabel(m.ISPGroup)
+		m.AvgReturnMbps = roundMbps(m.AvgReturnBps)
+		m.AvgOutboundMbps = roundMbps(m.AvgOutboundBps)
+		byGroup := result[nodeID]
+		if byGroup == nil {
+			byGroup = make(map[string]edgeNodeSpeedMetric)
+			result[nodeID] = byGroup
+		}
+		byGroup[m.ISPGroup] = m
+	}
+	return result
+}
+
+func (rt *edgeNodeRuntime) reloadSpeedMetrics() {
+	if rt == nil {
+		return
+	}
+	rt.speedReloadMu.Lock()
+	defer rt.speedReloadMu.Unlock()
+	speedMap := rt.loadSpeedMetricsFromDB()
+	rt.mu.Lock()
+	rt.speedMetrics = speedMap
+	rt.mu.Unlock()
+}
+
+func (rt *edgeNodeRuntime) publicOrigins() []string {
+	if rt == nil {
+		return nil
+	}
+	rt.mu.RLock()
+	seen := make(map[string]bool, len(rt.nodes))
+	origins := make([]string, 0, len(rt.nodes))
+	for _, n := range rt.nodes {
+		if n == nil {
+			continue
+		}
+		raw := n.publicURL()
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			continue
+		}
+		origin := strings.ToLower(u.Scheme) + "://" + u.Host
+		if strings.ContainsAny(origin, " \t\r\n;,") || seen[origin] {
+			continue
+		}
+		seen[origin] = true
+		origins = append(origins, origin)
+	}
+	rt.mu.RUnlock()
+	sort.Strings(origins)
+	return origins
+}
+
+func (rt *edgeNodeRuntime) speedMetricsMapCopyLocked(nodeID int64) []edgeNodeSpeedMetric {
+	byGroup := rt.speedMetrics[nodeID]
+	if len(byGroup) == 0 {
+		return nil
+	}
+	out := make([]edgeNodeSpeedMetric, 0, len(byGroup))
+	for _, g := range allISPGroups {
+		if m, ok := byGroup[g]; ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (rt *edgeNodeRuntime) nodeSpeedMetricsCopy(nodeID int64) []edgeNodeSpeedMetric {
+	if rt == nil {
+		return nil
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.speedMetricsMapCopyLocked(nodeID)
+}
+
+func (rt *edgeNodeRuntime) strategyForGroupLocked(group string) string {
+	if rt.strategies != nil {
+		if s, ok := rt.strategies[group]; ok && s != "" {
+			return s
+		}
+	}
+	return ispStrategyPriority
+}
+
+func (rt *edgeNodeRuntime) autoScoreForNodeLocked(node *edgeNodeLiveState, group string, now time.Time) (score float64, hasMetric bool) {
+	if node == nil {
+		return 0, false
+	}
+	if byGroup := rt.speedMetrics[node.id]; byGroup != nil {
+		if m, ok := byGroup[group]; ok && m.AvgReturnBps > 0 {
+			if m.TestedAt != "" {
+				if parsed, err := time.Parse(time.RFC3339, m.TestedAt); err != nil || now.Sub(parsed) > speedtestMetricMaxAge {
+					return 0, false
+				}
+			}
+			mbps := float64(m.AvgReturnBps) * 8.0 / 1_000_000.0
+			var avgRetrans float64
+			if m.TotalRetrans > 0 {
+				avgRetrans = float64(m.TotalRetrans) / float64(max(1, m.SampleCount))
+			}
+			retransFactor := 1.0 - math.Min(0.40, avgRetrans*0.015)
+			loadFactor := 1.0 / (1.0 + 0.08*float64(max(0, node.activeStreams)))
+			return mbps * retransFactor * loadFactor, true
+		}
+	}
+	return 0, false
+}
+
+func (rt *edgeNodeRuntime) pickAutoEdgeCandidateLocked(group string, candidates []*edgeNodeLiveState, seq uint64, now time.Time) *edgeNodeLiveState {
+	if len(candidates) == 0 {
+		return nil
+	}
+	n := uint64(len(candidates))
+	var chosen *edgeNodeLiveState
+	var bestHasMetric bool
+	var bestScore float64
+	bestStreams := -1
+	for i := 0; i < len(candidates); i++ {
+		cand := candidates[(seq+uint64(i))%n]
+		score, hasMetric := rt.autoScoreForNodeLocked(cand, group, now)
+		better := false
+		if chosen == nil {
+			better = true
+		} else if hasMetric && !bestHasMetric {
+			better = true
+		} else if hasMetric == bestHasMetric {
+			if hasMetric {
+				if score > bestScore+0.01 {
+					better = true
+				} else if math.Abs(score-bestScore) <= 0.01 && cand.activeStreams < bestStreams {
+					better = true
+				}
+			} else if cand.activeStreams < bestStreams {
+				better = true
+			}
+		}
+		if better {
+			chosen = cand
+			bestHasMetric = hasMetric
+			bestScore = score
+			bestStreams = cand.activeStreams
+		}
+	}
+	return chosen
 }
 
 type edgeRouteDecision struct {
@@ -618,9 +862,18 @@ func (rt *edgeNodeRuntime) isClientBlocked(clientIP string) (bool, string) {
 	return decision.Blocked, decision.BlockReason
 }
 
-// selectNodeForIP picks the highest-priority online node for the client IP's ISP.
-// Pure in-memory; never touches SQLite on the hot path.
+// selectNodeForIP picks the highest-priority online node for the client IP's ISP
+// without mutating round-robin dispatch state (safe for policy checks and diagnostics).
 func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
+	return rt.selectNodeForIPInternal(clientIP, false)
+}
+
+// selectNodeForDispatch picks a node for live media playback and advances round-robin state.
+func (rt *edgeNodeRuntime) selectNodeForDispatch(clientIP string) edgeRouteDecision {
+	return rt.selectNodeForIPInternal(clientIP, true)
+}
+
+func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bool) edgeRouteDecision {
 	decision := edgeRouteDecision{
 		ISPGroup: ispGroupOther,
 		ISPLabel: ispGroupLabel(ispGroupOther),
@@ -662,6 +915,53 @@ func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
 		}
 	}
 	rules := rt.routes[decision.ISPGroup]
+	strategy := rt.strategyForGroupLocked(decision.ISPGroup)
+	if strategy == ispStrategyAuto || strategy == ispStrategyBalance {
+		var candidates []*edgeNodeLiveState
+		for _, rule := range rules {
+			if !rule.Enabled || rule.NodeID <= 0 {
+				continue
+			}
+			node := rt.nodes[rule.NodeID]
+			if node != nil && node.routableAt(now) {
+				candidates = append(candidates, node)
+			}
+		}
+		if len(candidates) > 0 {
+			var seq uint64
+			if advanceRR {
+				if ctr := rt.rrCounters[decision.ISPGroup]; ctr != nil {
+					seq = ctr.Add(1) - 1
+				}
+			}
+			n := uint64(len(candidates))
+			var chosen *edgeNodeLiveState
+			if strategy == ispStrategyBalance {
+				bestStreams := -1
+				for i := 0; i < len(candidates); i++ {
+					cand := candidates[(seq+uint64(i))%n]
+					if chosen == nil || cand.activeStreams < bestStreams {
+						chosen = cand
+						bestStreams = cand.activeStreams
+					}
+				}
+			} else {
+				chosen = rt.pickAutoEdgeCandidateLocked(decision.ISPGroup, candidates, seq, now)
+			}
+			if chosen != nil {
+				decision.NodeID = chosen.id
+				decision.NodeName = chosen.name
+				decision.PublicURL = chosen.publicURL()
+				decision.Token = chosen.tokenPlain
+				return decision
+			}
+		}
+		// Master acts strictly as fallback when no enabled edge node is routable.
+		decision.NodeID = 0
+		decision.NodeName = "主机"
+		return decision
+	}
+
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
@@ -711,13 +1011,28 @@ func (rt *edgeNodeRuntime) flush() {
 
 	for _, item := range items {
 		delta := item.state.pending.Swap(0)
-		if delta > 0 {
-			if _, err := rt.db.db.Exec(`UPDATE edge_nodes SET traffic_used=traffic_used+? WHERE id=?`, delta, item.state.id); err != nil {
-				item.state.pending.Add(delta)
+		inDelta := item.state.pendingTotalIn.Swap(0)
+		outDelta := item.state.pendingTotalOut.Swap(0)
+		if delta > 0 || inDelta > 0 || outDelta > 0 {
+			if _, err := rt.db.db.Exec(
+				`UPDATE edge_nodes SET traffic_used=traffic_used+?, total_bytes_in=total_bytes_in+?, total_bytes_out=total_bytes_out+? WHERE id=?`,
+				delta, inDelta, outDelta, item.state.id,
+			); err != nil {
+				if delta > 0 {
+					item.state.pending.Add(delta)
+				}
+				if inDelta > 0 {
+					item.state.pendingTotalIn.Add(inDelta)
+				}
+				if outDelta > 0 {
+					item.state.pendingTotalOut.Add(outDelta)
+				}
 				log.Printf("edge node %d: flush traffic: %v", item.state.id, err)
 			} else {
 				rt.mu.Lock()
 				item.state.persistedUsed += delta
+				item.state.persistedTotalIn += inDelta
+				item.state.persistedTotalOut += outDelta
 				rt.mu.Unlock()
 			}
 		}
@@ -832,6 +1147,7 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 	}
 	token := state.tokenPlain
 	listenPort := state.effectiveListenPort()
+	view.SpeedMetrics = a.pm.edges.speedMetricsMapCopyLocked(state.id)
 	a.pm.edges.mu.RUnlock()
 
 	if len(rawLatencies) > 0 && a.pm != nil {
@@ -1174,19 +1490,21 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 }
 
 type ispRouteNodeView struct {
-	NodeID    int64  `json:"node_id"`
-	Name      string `json:"name"`
-	IsMaster  bool   `json:"is_master"`
-	Enabled   bool   `json:"enabled"`
-	Online    bool   `json:"online"`
-	Status    string `json:"status"`
-	Active    bool   `json:"active"`
-	PublicURL string `json:"public_url,omitempty"`
+	NodeID      int64                `json:"node_id"`
+	Name        string               `json:"name"`
+	IsMaster    bool                 `json:"is_master"`
+	Enabled     bool                 `json:"enabled"`
+	Online      bool                 `json:"online"`
+	Status      string               `json:"status"`
+	Active      bool                 `json:"active"`
+	PublicURL   string               `json:"public_url,omitempty"`
+	SpeedMetric *edgeNodeSpeedMetric `json:"speed_metric,omitempty"`
 }
 
 type ispRouteGroupView struct {
 	Group        string             `json:"group"`
 	Label        string             `json:"label"`
+	Strategy     string             `json:"strategy"`
 	BlockConnect bool               `json:"block_connect"`
 	Nodes        []ispRouteNodeView `json:"nodes"`
 }
@@ -1215,23 +1533,84 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 	for _, group := range allISPGroups {
 		rules := a.pm.edges.routes[group]
 		blockConnect := a.pm.edges.blocked[group]
+		strategy := a.pm.edges.strategyForGroupLocked(group)
 		nodes := make([]ispRouteNodeView, 0, len(rules))
-		activeAssigned := blockConnect
+
+		metricPtrFor := func(nodeID int64) *edgeNodeSpeedMetric {
+			if byGroup := a.pm.edges.speedMetrics[nodeID]; byGroup != nil {
+				if m, ok := byGroup[group]; ok {
+					mc := m
+					return &mc
+				}
+			}
+			return nil
+		}
+
+		// Determine active node(s) according to the active dispatch strategy.
+		activePool := make(map[int64]bool)
+		if !blockConnect {
+			switch strategy {
+			case ispStrategyBalance:
+				for _, rule := range rules {
+					if !rule.Enabled || rule.NodeID <= 0 {
+						continue
+					}
+					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
+						activePool[node.id] = true
+					}
+				}
+				if len(activePool) == 0 {
+					activePool[0] = true
+				}
+			case ispStrategyAuto:
+				var cands []*edgeNodeLiveState
+				for _, rule := range rules {
+					if !rule.Enabled || rule.NodeID <= 0 {
+						continue
+					}
+					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
+						cands = append(cands, node)
+					}
+				}
+				if chosen := a.pm.edges.pickAutoEdgeCandidateLocked(group, cands, 0, now); chosen != nil {
+					activePool[chosen.id] = true
+				} else {
+					activePool[0] = true
+				}
+			default:
+				assigned := false
+				for _, rule := range rules {
+					if !rule.Enabled {
+						continue
+					}
+					if rule.NodeID == 0 {
+						activePool[0] = true
+						assigned = true
+						break
+					}
+					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
+						activePool[node.id] = true
+						assigned = true
+						break
+					}
+				}
+				if !assigned {
+					activePool[0] = true
+				}
+			}
+		}
+
 		for _, rule := range rules {
 			if rule.NodeID == 0 {
-				isActive := false
-				if rule.Enabled && !activeAssigned {
-					isActive = true
-					activeAssigned = true
-				}
 				nodes = append(nodes, ispRouteNodeView{
-					NodeID:   0,
-					Name:     "主机",
-					IsMaster: true,
-					Enabled:  rule.Enabled,
-					Online:   true,
-					Status:   "online",
-					Active:   isActive,
+					NodeID:      0,
+					Name:        "主机",
+					IsMaster:    true,
+					Enabled:     rule.Enabled,
+					Online:      true,
+					Status:      "online",
+					Active:      activePool[0],
+					SpeedMetric: metricPtrFor(0),
 				})
 				continue
 			}
@@ -1239,34 +1618,21 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			if node == nil {
 				continue
 			}
-			routable := node.routableAt(now)
-			isActive := false
-			if rule.Enabled && routable && !activeAssigned {
-				isActive = true
-				activeAssigned = true
-			}
 			nodes = append(nodes, ispRouteNodeView{
-				NodeID:    node.id,
-				Name:      node.name,
-				Enabled:   rule.Enabled,
-				Online:    node.isOnline(now),
-				Status:    node.statusAt(now),
-				Active:    isActive,
-				PublicURL: node.publicURL(),
+				NodeID:      node.id,
+				Name:        node.name,
+				Enabled:     rule.Enabled,
+				Online:      node.isOnline(now),
+				Status:      node.statusAt(now),
+				Active:      activePool[node.id],
+				PublicURL:   node.publicURL(),
+				SpeedMetric: metricPtrFor(node.id),
 			})
-		}
-		if !blockConnect && !activeAssigned {
-			// Fallback indicator on Master if every enabled edge node is offline.
-			for i := range nodes {
-				if nodes[i].NodeID == 0 {
-					nodes[i].Active = true
-					break
-				}
-			}
 		}
 		result = append(result, ispRouteGroupView{
 			Group:        group,
 			Label:        ispGroupLabel(group),
+			Strategy:     strategy,
 			BlockConnect: blockConnect,
 			Nodes:        nodes,
 		})
@@ -1282,9 +1648,10 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, a.buildISPRoutesPayload())
 	case http.MethodPut:
 		var req struct {
-			BlockNonMainland *bool  `json:"block_non_mainland"`
-			Group            string `json:"group"`
-			BlockConnect     *bool  `json:"block_connect"`
+			BlockNonMainland *bool   `json:"block_non_mainland"`
+			Group            string  `json:"group"`
+			Strategy         *string `json:"strategy"`
+			BlockConnect     *bool   `json:"block_connect"`
 			Nodes            []struct {
 				NodeID  int64 `json:"node_id"`
 				Enabled bool  `json:"enabled"`
@@ -1295,14 +1662,23 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Group = strings.ToLower(strings.TrimSpace(req.Group))
-		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil
+		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil || req.Strategy != nil
 		if !hasGroupOp && req.BlockNonMainland == nil {
 			a.jsonErr(w, http.StatusBadRequest, "线路配置参数无效")
 			return
 		}
-		if hasGroupOp && (!validISPGroup(req.Group) || (len(req.Nodes) == 0 && req.BlockConnect == nil)) {
+		if hasGroupOp && (!validISPGroup(req.Group) || (len(req.Nodes) == 0 && req.BlockConnect == nil && req.Strategy == nil)) {
 			a.jsonErr(w, http.StatusBadRequest, "线路分组参数无效")
 			return
+		}
+		var normalizedStrategy string
+		if req.Strategy != nil {
+			var ok bool
+			normalizedStrategy, ok = normalizeISPStrategy(*req.Strategy)
+			if !ok {
+				a.jsonErr(w, http.StatusBadRequest, "调度策略无效")
+				return
+			}
 		}
 		tx, err := a.db.db.Begin()
 		if err != nil {
@@ -1321,6 +1697,13 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
 				req.Group, sqliteBool(*req.BlockConnect)); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
+				return
+			}
+		}
+		if req.Strategy != nil {
+			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, strategy, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET strategy=excluded.strategy, updated_at=CURRENT_TIMESTAMP`,
+				req.Group, normalizedStrategy); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "保存调度策略失败")
 				return
 			}
 		}
@@ -1463,32 +1846,37 @@ type agentTrafficReport struct {
 }
 
 type agentHeartbeatRequest struct {
-	Version           string               `json:"version"`
-	ListenPort        int                  `json:"listen_port"`
-	TLSActive         bool                 `json:"tls_active"`
-	ActiveStreams     int                  `json:"active_streams"`
-	CurrentBps        int64                `json:"current_bps"`
-	MemoryBytes       uint64               `json:"memory_bytes"`
-	UptimeSec         int64                `json:"uptime_sec"`
-	UpstreamLatencies map[int64]int        `json:"upstream_latencies,omitempty"`
-	UpgradeRequestID  string               `json:"upgrade_request_id,omitempty"`
-	UpgradeStatus     string               `json:"upgrade_status,omitempty"`
-	CertFingerprint   string               `json:"cert_fingerprint"`
-	TrafficReports    []agentTrafficReport `json:"traffic_reports"`
+	Version           string                  `json:"version"`
+	ListenPort        int                     `json:"listen_port"`
+	TLSActive         bool                    `json:"tls_active"`
+	ActiveStreams     int                     `json:"active_streams"`
+	CurrentBps        int64                   `json:"current_bps"`
+	MemoryBytes       uint64                  `json:"memory_bytes"`
+	UptimeSec         int64                   `json:"uptime_sec"`
+	SupportsSpeedtest bool                    `json:"supports_speedtest,omitempty"`
+	UpstreamLatencies map[int64]int           `json:"upstream_latencies,omitempty"`
+	SpeedtestProgress *agentSpeedtestProgress `json:"speedtest_progress,omitempty"`
+	UpgradeRequestID  string                  `json:"upgrade_request_id,omitempty"`
+	UpgradeStatus     string                  `json:"upgrade_status,omitempty"`
+	CertFingerprint   string                  `json:"cert_fingerprint"`
+	TrafficReports    []agentTrafficReport    `json:"traffic_reports"`
 }
 
 type agentHeartbeatResponse struct {
-	OK               bool               `json:"ok"`
-	NodeEnabled      bool               `json:"node_enabled"`
-	BlockedUsers     []int64            `json:"blocked_users"`
-	RevokedHashes    []string           `json:"revoked_hashes"`
-	UserSpeedLimits  map[int64]int      `json:"user_speed_limits"`
-	ProbeTargets     []agentProbeTarget `json:"probe_targets,omitempty"`
-	UpgradeToVersion string             `json:"upgrade_to_version,omitempty"`
-	UpgradeRequestID string             `json:"upgrade_request_id,omitempty"`
-	TLSCertPEM       string             `json:"tls_cert_pem,omitempty"`
-	TLSKeyPEM        string             `json:"tls_key_pem,omitempty"`
-	CertFingerprint  string             `json:"cert_fingerprint,omitempty"`
+	OK                bool                `json:"ok"`
+	NodeEnabled       bool                `json:"node_enabled"`
+	BlockedUsers      []int64             `json:"blocked_users"`
+	RevokedHashes     []string            `json:"revoked_hashes"`
+	UserSpeedLimits   map[int64]int       `json:"user_speed_limits"`
+	ProbeTargets      []agentProbeTarget  `json:"probe_targets,omitempty"`
+	SpeedtestTask     *agentSpeedtestTask `json:"speedtest_task,omitempty"`
+	CancelSpeedtestID string              `json:"cancel_speedtest_id,omitempty"`
+	AckSpeedtestID    string              `json:"ack_speedtest_id,omitempty"`
+	UpgradeToVersion  string              `json:"upgrade_to_version,omitempty"`
+	UpgradeRequestID  string              `json:"upgrade_request_id,omitempty"`
+	TLSCertPEM        string              `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM         string              `json:"tls_key_pem,omitempty"`
+	CertFingerprint   string              `json:"cert_fingerprint,omitempty"`
 }
 
 func (a *App) masterTLSPEMForHost(hostname string) (certPEM, keyPEM, fingerprint string, ok bool) {
@@ -1555,13 +1943,14 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	a.pm.edges.mu.RLock()
 	node := a.pm.edges.nodes[nodeID]
-	var expectedHash, publicHost, tlsMode, nodeName string
+	var expectedHash, publicHost, tlsMode, nodeName, prevDetectedIP string
 	var nodeEnabled bool
 	if node != nil {
 		expectedHash = node.tokenHash
 		publicHost = node.publicHost
 		tlsMode = node.tlsMode
 		nodeName = node.name
+		prevDetectedIP = node.detectedIP
 		nodeEnabled = node.enabled
 	}
 	a.pm.edges.mu.RUnlock()
@@ -1583,8 +1972,8 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		parsed = parsed.Unmap()
 		if !parsed.IsLoopback() {
 			detectedIP = parsed.String()
-		} else if node.detectedIP != "" {
-			detectedIP = node.detectedIP
+		} else if prevDetectedIP != "" {
+			detectedIP = prevDetectedIP
 		}
 	} else {
 		detectedIP = ""
@@ -1594,13 +1983,15 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if a.db != nil {
 		billingMode = a.db.currentSystemSettings().TrafficBillingMode
 	}
-	var nodeBytesDelta int64
+	var nodeBytesDelta, nodeInDelta, nodeOutDelta int64
 	for _, report := range req.TrafficReports {
 		if report.BytesIn < 0 || report.BytesOut < 0 {
 			continue
 		}
 		billed := trafficBillableBytes(billingMode, report.BytesIn, report.BytesOut)
 		nodeBytesDelta += billed
+		nodeInDelta += report.BytesIn
+		nodeOutDelta += report.BytesOut
 		// Credit site traffic meters if the site is loaded.
 		if report.SiteID > 0 {
 			a.pm.recordExternalSiteTraffic(report.SiteID, report.BytesIn, report.BytesOut, report.Requests, now)
@@ -1613,9 +2004,22 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if nodeBytesDelta > 0 {
 		node.pending.Add(nodeBytesDelta)
 	}
+	if nodeInDelta > 0 {
+		node.pendingTotalIn.Add(nodeInDelta)
+	}
+	if nodeOutDelta > 0 {
+		node.pendingTotalOut.Add(nodeOutDelta)
+	}
+	var ackSpeedtestID string
+	if req.SpeedtestProgress != nil && a.speedtest != nil {
+		ackSpeedtestID = a.speedtest.applyAgentProgress(nodeID, req.SpeedtestProgress)
+	}
 
 	a.pm.edges.mu.Lock()
 	node.lastSeen = now
+	if req.SupportsSpeedtest {
+		node.supportsSpeedtest = true
+	}
 	if detectedIP != "" {
 		node.detectedIP = detectedIP
 	}
@@ -1683,6 +2087,10 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.pm.shares != nil {
 		resp.BlockedUsers, resp.RevokedHashes, resp.UserSpeedLimits = a.pm.shares.agentSyncSnapshot(now)
+	}
+	if a.speedtest != nil {
+		resp.SpeedtestTask, resp.CancelSpeedtestID = a.speedtest.nextAgentDirective(nodeID)
+		resp.AckSpeedtestID = ackSpeedtestID
 	}
 	if publicHost != "" && tlsMode == edgeNodeTLSModeAuto {
 		if certPEM, keyPEM, fp, ok := a.masterTLSPEMForHost(publicHost); ok {

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ChevronDown, MonitorSmartphone, X } from '@lucide/vue'
 import AreaChart from '@/components/charts/AreaChart.vue'
+import AnalyticsTab from '@/components/dashboard/AnalyticsTab.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import { dashboardApi, shareApi, type DashboardInsights, type LiveShareSession, type ShareUser, type TrafficSnapshot, type TrendResponse } from '@/api'
@@ -20,6 +21,7 @@ const trend = ref<TrendResponse | null>(null)
 const range = ref('realtime')
 const siteId = ref('all')
 const metric = ref<'speed' | 'volume'>('speed')
+const dashTab = ref<'overview' | 'analytics'>('overview')
 
 const RANGES = [
   { key: 'realtime', label: '实时' },
@@ -128,6 +130,16 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
   <div>
     <PageHeader title="仪表盘" :description="snapshot ? `已运行 ${uptime(snapshot.uptime_seconds)}` : ' '" />
 
+    <nav class="dash-tabs" role="tablist" aria-label="仪表盘视图">
+      <button type="button" role="tab" :aria-selected="dashTab === 'overview'" :class="{ on: dashTab === 'overview' }" @click="dashTab = 'overview'">
+        实时概览
+      </button>
+      <button type="button" role="tab" :aria-selected="dashTab === 'analytics'" :class="{ on: dashTab === 'analytics' }" @click="dashTab = 'analytics'">
+        统计看板
+      </button>
+    </nav>
+
+    <template v-if="dashTab === 'overview'">
     <dl class="stats">
       <div><dt>运行中站点</dt><dd class="num">{{ snapshot ? snapshot.running_sites : '—' }}<small>/ {{ snapshot?.total_sites ?? '—' }}</small></dd></div>
       <div><dt>本周期流量</dt><dd class="num">{{ snapshot ? formatBytes(snapshot.monthly_traffic) : '—' }}</dd></div>
@@ -229,10 +241,18 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
         </template>
       </section>
     </div>
+    </template>
+
+    <AnalyticsTab v-else />
   </div>
 </template>
 
 <style scoped>
+.dash-tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+.dash-tabs button { position: relative; height: 40px; padding: 0; border: 0; background: transparent; color: var(--text-3); font-size: 13.5px; cursor: pointer; }
+.dash-tabs button:hover { color: var(--text-2); }
+.dash-tabs button.on { color: var(--text); font-weight: 500; }
+.dash-tabs button.on::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; background: var(--text); }
 .stats { display: flex; gap: 48px; margin: 0 0 40px; flex-wrap: wrap; }
 .stats div { display: flex; flex-direction: column; gap: 2px; }
 .stats dt { font-size: 12.5px; color: var(--text-3); }

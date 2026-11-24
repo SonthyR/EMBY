@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.3.0"
+var appVersion = "v1.4.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -229,6 +229,7 @@ func main() {
 		trustedProxies:    trustedProxies,
 		clientIPRegions:   clientIPRegions,
 		ip2region:         ip2regionMgr,
+		speedtest:         newSpeedtestManager(db, pm),
 		panelHost:         panelHost,
 		routeDomain:       routeDomain,
 		routeDirect:       envBool("PANEL_ROUTE_DIRECT"),
@@ -257,6 +258,7 @@ func main() {
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
 	mux.HandleFunc("/api/dashboard-insights", cors(app.authMiddleware(app.handleDashboardInsights)))
 	mux.HandleFunc("/api/dashboard-trends", cors(app.authMiddleware(app.handleDashboardTrends)))
+	mux.HandleFunc("/api/dashboard-analytics", cors(app.authMiddleware(app.handleDashboardAnalytics)))
 	mux.HandleFunc("/api/system-settings", cors(app.authMiddleware(app.handleSystemSettings)))
 	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
 	mux.HandleFunc("/api/panel-certificate", cors(app.authMiddleware(app.handlePanelCertificate)))
@@ -289,6 +291,14 @@ func main() {
 	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))
+	mux.HandleFunc("/api/speedtest/targets", cors(app.authMiddleware(app.handleSpeedtestTargets)))
+	mux.HandleFunc("/api/speedtest/custom-targets", cors(app.authMiddleware(app.handleSpeedtestCustomTargets)))
+	mux.HandleFunc("/api/speedtest/custom-targets/", cors(app.authMiddleware(app.handleSpeedtestCustomTargetByID)))
+	mux.HandleFunc("/api/speedtest/start", cors(app.authMiddleware(app.handleSpeedtestStart)))
+	mux.HandleFunc("/api/speedtest/jobs", cors(app.authMiddleware(app.handleSpeedtestJobs)))
+	mux.HandleFunc("/api/speedtest/jobs/", cors(app.authMiddleware(app.handleSpeedtestJobByID)))
+	mux.HandleFunc("/api/speedtest/direct-targets", cors(app.authMiddleware(app.handleSpeedtestDirectTargets)))
+	mux.HandleFunc("/api/speedtest/direct-stream", cors(app.authMiddleware(app.handleSpeedtestDirectStream)))
 	mux.HandleFunc("/api/ip2region", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/ip2region/", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/agent/heartbeat", app.handleAgentHeartbeat)
@@ -319,7 +329,7 @@ func main() {
 	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeaders(mux, app.trustedProxies))),
+		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeadersWithConnectSources(mux, app.trustedProxies, pm.edges.publicOrigins))),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Shared-host site traffic can include long-running uploads. Header and
 		// per-endpoint body limits protect the panel without imposing a 30-second

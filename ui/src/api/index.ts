@@ -2,11 +2,13 @@ import { api } from './client'
 import type {
   AuthCheck,
   ClientFilterConfig,
+  DashboardAnalyticsResponse,
   EdgeNode,
   EdgeNodeInput,
   IP2RegionDBStatus,
   IP2RegionLookupResult,
   IP2RegionStatus,
+  ISPRouteStrategy,
   ISPRoutesResponse,
   LiveShareSession,
   ShareAlertSettings,
@@ -17,6 +19,11 @@ import type {
   ShareUserInput,
   Site,
   SiteAccount,
+  SpeedtestCustomTarget,
+  SpeedtestCustomTargetInput,
+  SpeedtestDirectTarget,
+  SpeedtestJob,
+  SpeedtestTargetsResponse,
 } from './types'
 
 export * from './client'
@@ -165,6 +172,7 @@ export const logsApi = {
 export const dashboardApi = {
   snapshot: () => api.get<TrafficSnapshot>('/api/dashboard'),
   insights: () => api.get<DashboardInsights>('/api/dashboard-insights'),
+  analytics: () => api.get<DashboardAnalyticsResponse>('/api/dashboard-analytics'),
   trends: (siteId: string, range: string) => api.get<TrendResponse>(`/api/dashboard-trends?site_id=${encodeURIComponent(siteId)}&range=${encodeURIComponent(range)}`),
 }
 
@@ -289,10 +297,37 @@ export const ispRoutesApi = {
   get: () => api.get<ISPRoutesResponse>('/api/isp-routes'),
   update: (group: string, nodes: { node_id: number; enabled: boolean }[]) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, nodes }),
+  setStrategy: (group: string, strategy: ISPRouteStrategy | string) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { group, strategy }),
   setGroupBlock: (group: string, blockConnect: boolean) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, block_connect: blockConnect }),
   setBlockNonMainland: (blockNonMainland: boolean) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { block_non_mainland: blockNonMainland }),
+}
+
+export const speedtestApi = {
+  targets: () => api.get<SpeedtestTargetsResponse>('/api/speedtest/targets'),
+  listCustom: () => api.get<{ targets: SpeedtestCustomTarget[] }>('/api/speedtest/custom-targets'),
+  createCustom: (input: SpeedtestCustomTargetInput) =>
+    api.post<{ id: number; target: SpeedtestCustomTarget }>('/api/speedtest/custom-targets', input),
+  updateCustom: (targetId: number, input: SpeedtestCustomTargetInput) =>
+    api.put<{ updated: boolean }>(`/api/speedtest/custom-targets/${id(targetId)}`, input),
+  removeCustom: (targetId: number) =>
+    api.del<{ deleted: boolean }>(`/api/speedtest/custom-targets/${id(targetId)}`),
+  start: (req: {
+    node_id: number
+    mode: 'builtin' | 'custom' | 'all'
+    provinces?: string[]
+    isps?: string[]
+    custom_target_ids?: number[]
+  }) => api.post<{ job: SpeedtestJob }>('/api/speedtest/start', req),
+  jobs: (nodeId?: number) =>
+    api.get<{ jobs: SpeedtestJob[] }>(
+      nodeId !== undefined ? `/api/speedtest/jobs?node_id=${encodeURIComponent(String(nodeId))}` : '/api/speedtest/jobs',
+    ),
+  job: (jobId: string) => api.get<{ job: SpeedtestJob }>(`/api/speedtest/jobs/${encodeURIComponent(jobId)}`),
+  cancel: (jobId: string) => api.post<{ canceled: boolean }>(`/api/speedtest/jobs/${encodeURIComponent(jobId)}/cancel`),
+  directTargets: () => api.get<{ targets: SpeedtestDirectTarget[] }>('/api/speedtest/direct-targets'),
 }
 
 export const ip2regionApi = {

@@ -134,6 +134,20 @@ export interface ShareUserInput {
 export type EdgeNodeStatus = 'online' | 'offline' | 'disabled' | 'quota' | 'waiting'
 export type EdgeNodeTLSMode = 'auto' | 'external' | 'http'
 
+export interface EdgeNodeSpeedMetric {
+  isp_group: 'ct' | 'cu' | 'cm' | 'other' | string
+  isp_label: string
+  avg_return_bps: number
+  avg_return_mbps: number
+  avg_outbound_bps: number
+  avg_outbound_mbps: number
+  avg_return_rtt_ms: number
+  avg_outbound_rtt_ms: number
+  total_retrans: number
+  sample_count: number
+  tested_at: string
+}
+
 export interface EdgeSiteLatency {
   site_name: string
   latency_ms: number
@@ -167,6 +181,7 @@ export interface EdgeNode {
   memory_bytes?: number
   uptime_sec?: number
   upstream_latencies?: EdgeSiteLatency[]
+  speed_metrics?: EdgeNodeSpeedMetric[]
   public_url: string
   status: EdgeNodeStatus
   install_command?: string
@@ -187,6 +202,8 @@ export interface EdgeNodeInput {
   note?: string
 }
 
+export type ISPRouteStrategy = 'priority' | 'auto' | 'balance'
+
 export interface ISPRouteNode {
   node_id: number
   name: string
@@ -196,11 +213,13 @@ export interface ISPRouteNode {
   status: EdgeNodeStatus | string
   active: boolean
   public_url?: string
+  speed_metric?: EdgeNodeSpeedMetric
 }
 
 export interface ISPRouteGroup {
   group: 'ct' | 'cu' | 'cm' | 'other' | string
   label: string
+  strategy: ISPRouteStrategy | string
   block_connect: boolean
   nodes: ISPRouteNode[]
 }
@@ -286,4 +305,176 @@ export interface ShareAlertSettings {
   enabled: boolean
   expiry_days: number
   quota_warning_pct: number
+}
+
+export interface SpeedtestProvince {
+  code: string
+  label: string
+}
+
+export interface SpeedtestISP {
+  group: string
+  label: string
+}
+
+export interface SpeedtestNodeSummary {
+  id: number
+  name: string
+  is_master: boolean
+  online: boolean
+  status: string
+  public_url?: string
+  detected_ip?: string
+  speed_metrics?: EdgeNodeSpeedMetric[]
+}
+
+export interface SpeedtestCustomTarget {
+  id: number
+  name: string
+  isp_group: string
+  isp_label: string
+  province: string
+  upload_url: string
+  download_url: string
+  method: string
+  enabled: boolean
+  created_at?: string
+}
+
+export interface SpeedtestCustomTargetInput {
+  name: string
+  isp_group: string
+  province?: string
+  upload_url?: string
+  download_url?: string
+  method?: string
+  enabled?: boolean
+}
+
+export interface SpeedtestTargetsResponse {
+  provinces: SpeedtestProvince[]
+  isps: SpeedtestISP[]
+  default_provinces: string[]
+  default_isps: string[]
+  custom_targets: SpeedtestCustomTarget[]
+  nodes: SpeedtestNodeSummary[]
+}
+
+export interface SpeedtestTargetResult {
+  target_key: string
+  label: string
+  province: string
+  isp_group: string
+  isp_label: string
+  target_kind: 'builtin' | 'custom' | string
+  resolved_ip?: string
+  status: 'pending' | 'running' | 'done' | 'error' | string
+  error?: string
+  return_mbps: number
+  return_bps: number
+  outbound_mbps: number
+  outbound_bps: number
+  return_retrans: number
+  return_rtt_ms: number
+  outbound_rtt_ms: number
+  tested_at?: string
+}
+
+export interface SpeedtestJob {
+  id: string
+  node_id: number
+  node_name: string
+  mode: string
+  provinces: string[]
+  isps: string[]
+  status: 'pending' | 'running' | 'done' | 'failed' | 'canceled' | string
+  total_targets: number
+  completed_targets: number
+  results: SpeedtestTargetResult[]
+  error?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SpeedtestDirectTarget {
+  node_id: number
+  name: string
+  is_master: boolean
+  online: boolean
+  public_url?: string
+  scheme: string
+  stream_url: string
+  size_bytes: number
+  unavailable_reason?: string
+}
+
+export interface DashboardAnalyticsSummary {
+  total_traffic: number
+  monthly_traffic: number
+  master_traffic: number
+  edge_traffic: number
+  offload_percent: number
+  total_requests: number
+  active_streams: number
+  online_sessions: number
+  share_user_count: number
+  active_edge_nodes: number
+  total_edge_nodes: number
+}
+
+export interface AnalyticsNodeTrafficItem {
+  node_id: number
+  name: string
+  is_master: boolean
+  online: boolean
+  status: string
+  active_streams: number
+  current_bps: number
+  traffic_used: number
+  traffic_quota: number
+  share_percent: number
+}
+
+export interface AnalyticsShareUserItem {
+  id: number
+  username: string
+  note: string
+  status: string
+  traffic_used: number
+  traffic_quota: number
+  session_count: number
+  playing_count: number
+  share_percent: number
+}
+
+export interface AnalyticsSiteTrafficItem {
+  id: number
+  name: string
+  running: boolean
+  traffic_used: number
+  monthly_traffic: number
+  cumulative_bytes_in: number
+  cumulative_bytes_out: number
+  requests: number
+  traffic_quota: number
+  share_percent: number
+}
+
+export interface AnalyticsDailyPoint {
+  date: string
+  label: string
+  traffic_bytes: number
+  bytes_in: number
+  bytes_out: number
+  requests: number
+}
+
+export interface DashboardAnalyticsResponse {
+  generated_at: string
+  billing_mode: string
+  summary: DashboardAnalyticsSummary
+  node_breakdown: AnalyticsNodeTrafficItem[]
+  top_share_users: AnalyticsShareUserItem[]
+  site_breakdown: AnalyticsSiteTrafficItem[]
+  daily_activity: AnalyticsDailyPoint[]
 }
