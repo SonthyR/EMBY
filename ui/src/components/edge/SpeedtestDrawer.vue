@@ -44,7 +44,10 @@ const nodes = ref<SpeedtestNodeSummary[]>([])
 const customTargets = ref<SpeedtestCustomTarget[]>([])
 
 const selectedNodeId = ref<number>(props.initialNodeId)
-const mode = ref<'builtin' | 'apple' | 'custom' | 'all'>('builtin')
+type NodeSpeedtestMode = 'builtin' | 'apple' | 'custom' | 'all'
+
+const targetMode = ref<'builtin' | 'apple'>('builtin')
+const includeCustom = ref(false)
 const selectedProvinces = ref<string[]>(['bj', 'sh', 'gd'])
 const selectedISPs = ref<string[]>(['ct', 'cu', 'cm'])
 const selectedCustomIds = ref<number[]>([])
@@ -62,7 +65,8 @@ const newCustom = ref<SpeedtestCustomTargetInput>({
   enabled: true,
 })
 
-const starting = ref(false)
+const startingMode = ref<NodeSpeedtestMode | null>(null)
+const starting = computed(() => startingMode.value !== null)
 const canceling = ref(false)
 const activeJob = ref<SpeedtestJob | null>(null)
 let pollTimer: number | null = null
@@ -85,6 +89,12 @@ let directRunId = 0
 
 const selectedNode = computed(() => nodes.value.find(n => n.id === selectedNodeId.value) || null)
 const isJobRunning = computed(() => activeJob.value?.status === 'running' || activeJob.value?.status === 'pending')
+const jobBusy = computed(() => starting.value || isJobRunning.value)
+const canStart = computed(() => !loadingTargets.value && selectedNode.value?.online !== false)
+const hasEnabledCustomTargets = computed(() => customTargets.value.some(target => target.enabled))
+const primaryMode = computed<NodeSpeedtestMode>(() =>
+  targetMode.value === 'builtin' && includeCustom.value && hasEnabledCustomTargets.value ? 'all' : targetMode.value,
+)
 const progressPct = computed(() => {
   const job = activeJob.value
   if (!job || !job.total_targets) return 0
@@ -120,6 +130,9 @@ async function loadTargets() {
     isps.value = res.isps || []
     nodes.value = res.nodes || []
     customTargets.value = res.custom_targets || []
+    const enabledCustomIds = new Set(customTargets.value.filter(target => target.enabled).map(target => target.id))
+    selectedCustomIds.value = selectedCustomIds.value.filter(id => enabledCustomIds.has(id))
+    if (!enabledCustomIds.size) includeCustom.value = false
     catalogCount.value = res.catalog_count || 0
     const validProvCodes = new Set(provinces.value.map(p => p.code))
     if (validProvCodes.size) {
@@ -331,31 +344,32 @@ async function deleteCustomTarget(target: SpeedtestCustomTarget) {
   }
 }
 
-async function startNodeSpeedtest() {
+async function startNodeSpeedtest(mode: NodeSpeedtestMode) {
+  if (jobBusy.value || loadingTargets.value) return
   if (selectedNode.value && !selectedNode.value.online) {
     toast.error('所选从机当前离线，无法执行测速')
     return
   }
-  if ((mode.value === 'custom' || mode.value === 'all') && !customTargets.value.some(t => t.enabled) && mode.value === 'custom') {
+  if (mode === 'custom' && !hasEnabledCustomTargets.value) {
     toast.error('请先添加并启用至少一个自定义测速目标')
     showCustomPanel.value = true
     return
   }
-  starting.value = true
+  startingMode.value = mode
   try {
     const res = await speedtestApi.start({
       node_id: selectedNodeId.value,
-      mode: mode.value,
+      mode,
       provinces: selectedProvinces.value,
       isps: selectedISPs.value,
-      custom_target_ids: selectedCustomIds.value,
+      custom_target_ids: mode === 'all' || mode === 'custom' ? selectedCustomIds.value : [],
     })
     activeJob.value = res.job
     startPolling(res.job.id)
   } catch (err) {
     toast.error(errorMessage(err, '启动测速失败'))
   } finally {
-    starting.value = false
+    startingMode.value = null
   }
 }
 
@@ -702,28 +716,33 @@ onBeforeUnmount(() => {
         <div class="controls-box">
           <div class="row-grid">
             <UiField label="测试节点" for="st-node">
-              <select id="st-node" v-model.number="selectedNodeId" class="select" :disabled="isJobRunning || loadingTargets" @change="handleNodeChange">
+              <select id="st-node" v-model.number="selectedNodeId" class="select" :disabled="jobBusy || loadingTargets" @change="handleNodeChange">
                 <option v-for="n in nodes" :key="n.id" :value="n.id">
                   {{ n.name }}{{ n.is_master ? ' (Master)' : n.online ? ' · 在线' : ' · 离线' }}
                 </option>
               </select>
             </UiField>
 
-            <UiField label="目标源模式" for="st-mode">
-              <select id="st-mode" v-model="mode" class="select" :disabled="isJobRunning">
-                <option value="builtin">内置三网节点（火山引擎 TOS 北上广）</option>
-                <option value="apple">Apple CDN 就近节点（默认路由）</option>
-                <option value="custom">自定义测速目标 ({{ customTargets.length }})</option>
-                <option value="all">内置三网 + 自定义全量</option>
-              </select>
-            </UiField>
+            <fieldset class="target-field" :disabled="jobBusy || loadingTargets">
+              <legend>测哪里</legend>
+              <div class="target-options">
+                <label>
+                  <input v-model="targetMode" type="radio" name="st-target" value="builtin" />
+                  <span>国内三网</span>
+                </label>
+                <label>
+                  <input v-model="targetMode" type="radio" name="st-target" value="apple" />
+                  <span>Apple CDN</span>
+                </label>
+              </div>
+            </fieldset>
           </div>
 
-          <div v-if="mode === 'builtin' || mode === 'all'" class="picker">
+          <div v-if="targetMode === 'builtin'" class="picker">
             <div class="picker-head">
               <span class="label">地区与运营商</span>
               <div class="presets">
-                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset()">北上广全选 (9项)</button>
+                <button type="button" class="link-btn" :disabled="jobBusy" @click="selectPreset()">北上广全选（{{ catalogCount || 9 }} 项）</button>
               </div>
             </div>
             <div class="chip-group">
@@ -733,7 +752,7 @@ onBeforeUnmount(() => {
                 type="button"
                 class="chip"
                 :class="{ on: selectedProvinces.includes(p.code) }"
-                :disabled="isJobRunning"
+                :disabled="jobBusy"
                 @click="toggleProvince(p.code)"
               >
                 {{ p.label }}
@@ -746,17 +765,27 @@ onBeforeUnmount(() => {
                 type="button"
                 class="chip isp"
                 :class="{ on: selectedISPs.includes(isp.group) }"
-                :disabled="isJobRunning"
+                :disabled="jobBusy"
                 @click="toggleISP(isp.group)"
               >
                 {{ isp.label }}
               </button>
             </div>
+            <label v-if="hasEnabledCustomTargets" class="include-custom">
+              <input v-model="includeCustom" type="checkbox" :disabled="jobBusy" />
+              同时测自定义目标
+            </label>
           </div>
 
           <div class="custom-bar">
-            <button type="button" class="link-btn" @click="showCustomPanel = !showCustomPanel">
-              {{ showCustomPanel ? '收起自定义测速目标' : `管理自定义测速目标 (${customTargets.length})` }}
+            <button
+              type="button"
+              class="link-btn"
+              :aria-expanded="showCustomPanel"
+              :aria-controls="showCustomPanel ? 'st-custom-panel' : undefined"
+              @click="showCustomPanel = !showCustomPanel"
+            >
+              自定义测速<span v-if="customTargets.length">（{{ customTargets.length }}）</span>
             </button>
             <div class="action-right">
               <UiButton
@@ -772,20 +801,36 @@ onBeforeUnmount(() => {
                 v-else
                 variant="primary"
                 size="sm"
-                :loading="starting"
-                :disabled="selectedNode !== null && !selectedNode.online"
-                @click="startNodeSpeedtest"
+                :loading="starting && startingMode !== 'custom'"
+                :disabled="!canStart || jobBusy"
+                @click="startNodeSpeedtest(primaryMode)"
               >
-                <Gauge />{{ selectedNode && !selectedNode.online ? '节点离线' : '开始单线程测速' }}
+                <Gauge />{{ selectedNode && !selectedNode.online ? '节点离线' : '开始测速' }}
               </UiButton>
             </div>
           </div>
 
-          <div v-if="showCustomPanel" class="custom-panel">
+          <div v-if="showCustomPanel" id="st-custom-panel" class="custom-panel">
+            <div v-if="hasEnabledCustomTargets" class="custom-test-actions">
+              <span class="faint">未勾选时测全部已启用目标</span>
+              <UiButton
+                size="sm"
+                :loading="startingMode === 'custom'"
+                :disabled="!canStart || jobBusy"
+                @click="startNodeSpeedtest('custom')"
+              >
+                仅测自定义目标
+              </UiButton>
+            </div>
             <ul v-if="customTargets.length" class="custom-list">
               <li v-for="ct in customTargets" :key="ct.id">
                 <label class="ct-check">
-                  <input type="checkbox" :checked="selectedCustomIds.includes(ct.id)" @change="toggleCustomSelection(ct.id)" />
+                  <input
+                    type="checkbox"
+                    :checked="selectedCustomIds.includes(ct.id)"
+                    :disabled="jobBusy || !ct.enabled"
+                    @change="toggleCustomSelection(ct.id)"
+                  />
                   <span class="ct-name">{{ ct.name }}</span>
                   <span class="tag">{{ ct.isp_label }}</span>
                   <span v-if="ct.province" class="faint">{{ ct.province }}</span>
@@ -820,7 +865,7 @@ onBeforeUnmount(() => {
                 </UiField>
               </div>
               <div class="cf-actions">
-                <select v-model="newCustom.method" class="select method-sel">
+                <select v-model="newCustom.method" class="select method-sel" aria-label="上传方法">
                   <option value="POST">POST</option>
                   <option value="PUT">PUT</option>
                 </select>
@@ -966,6 +1011,16 @@ onBeforeUnmount(() => {
 
 .controls-box { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
 .row-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.target-field { min-width: 0; margin: 0; padding: 0; border: 0; }
+.target-field legend { margin-bottom: 6px; padding: 0; color: var(--text-2); font-size: 13px; font-weight: 500; }
+.target-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.target-options label { position: relative; min-width: 0; cursor: pointer; }
+.target-options input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.target-options span { display: grid; place-items: center; min-height: 29px; padding: 3px 6px; border-radius: var(--radius-xs); color: var(--text-2); font-size: 13px; text-align: center; }
+.target-options input:checked + span { background: var(--bg-elev); color: var(--text); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
+.target-options input:focus-visible + span { outline: 2px solid var(--text-2); outline-offset: -2px; }
+.target-field:disabled .target-options { opacity: 0.6; }
+.target-field:disabled .target-options label { cursor: default; }
 .picker { display: flex; flex-direction: column; gap: 8px; }
 .picker-head { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; }
 .picker-head .label { color: var(--text-2); font-weight: 500; }
@@ -979,10 +1034,12 @@ onBeforeUnmount(() => {
 .chip.on { border-color: var(--text); background: var(--surface); color: var(--text); font-weight: 500; }
 .chip.isp.on { border-color: var(--good); color: var(--good); background: var(--good-soft); }
 
+.include-custom { display: inline-flex; align-items: center; align-self: flex-start; gap: 6px; color: var(--text-2); font-size: 12.5px; }
 .custom-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--border); }
 .action-right { display: flex; align-items: center; gap: 8px; }
 
 .custom-panel { display: flex; flex-direction: column; gap: 12px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.custom-test-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-size: 12.5px; }
 .custom-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .custom-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); font-size: 12.5px; }
 .ct-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }

@@ -1372,13 +1372,14 @@ func (m *speedtestManager) loadTOSCatalog(ctx context.Context) map[string][]stri
 	if m.tosCatalogURL == "" || m.dohClient == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, tosCatalogTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.tosCatalogURL, nil)
 	if err != nil {
 		return nil
 	}
 	client := *m.dohClient
+	client.Timeout = 0 // The catalog request has its own deadline, separate from DoH.
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}

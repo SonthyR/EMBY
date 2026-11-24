@@ -194,6 +194,51 @@ func TestISPRoutingAutoAndBalanceStrategies(t *testing.T) {
 	}
 }
 
+func TestTOSTargetsUseGroupFallbackWhenCatalogIsUnavailable(t *testing.T) {
+	province, _ := lookupSpeedtestProvince("bj")
+	for _, tc := range []struct {
+		name       string
+		httpStatus int
+		body       string
+		wantIPs    string
+	}{
+		{
+			name:       "unavailable",
+			httpStatus: http.StatusServiceUnavailable,
+			wantIPs:    "119.250.10.100,119.250.10.0,119.250.10.102,221.194.175.109,119.250.10.101",
+		},
+		{
+			name:       "live catalog",
+			httpStatus: http.StatusOK,
+			body:       "tos\t4\t北京\t联通\tnode.example\t119.250.10.108\t443\ttos-cn-beijing.volces.com\n",
+			wantIPs:    "119.250.10.108,119.250.10.101,119.250.10.100",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.httpStatus)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer catalog.Close()
+			manager := newSpeedtestManager(nil, nil)
+			manager.tosCatalogURL = catalog.URL
+			manager.dohClient = catalog.Client()
+			manager.dohResolver = func(context.Context, string, string) ([]string, error) {
+				return []string{"119.250.10.101", "119.250.10.100"}, nil
+			}
+
+			targets := manager.buildTOSTargets([]speedtestProvinceDef{province}, []string{ispGroupCU}, time.Second)
+			var ips []string
+			for _, candidate := range targets[0].Candidates {
+				ips = append(ips, candidate.ResolvedIP)
+			}
+			if got := strings.Join(ips, ","); got != tc.wantIPs {
+				t.Fatalf("target candidates = %s, want %s", got, tc.wantIPs)
+			}
+		})
+	}
+}
+
 func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	app, rt := setupEdgeRoutingTestApp(t)
 	app.speedtest.phaseDuration = 200 * time.Millisecond

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -24,7 +25,23 @@ const (
 	maxTOSCandidates          = maxTOSDirectoryCandidates + maxSpeedtestDNSCandidates
 	tosProbeParallelism       = 4
 	tosProbeTimeout           = 4 * time.Second
+	tosCatalogTimeout         = 5 * time.Second
 )
+
+// IPv4 snapshot of the public TcpQuality TOS catalog on 2026-11-24
+// (https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=tos).
+// Use only when the live catalog has no addresses for the matching group.
+var tosCatalogFallback = map[string][]string{
+	"bj-ct": {"42.81.80.86"},
+	"bj-cu": {"119.250.10.100", "119.250.10.0", "119.250.10.102", "221.194.175.109"},
+	"bj-cm": {"120.255.0.180"},
+	"sh-ct": {"180.97.50.1"},
+	"sh-cu": {"122.97.126.101", "122.97.126.106", "116.147.21.1"},
+	"sh-cm": {"36.150.251.100", "36.150.251.10", "36.156.86.79", "36.156.86.18", "223.109.53.225", "223.109.53.191", "36.151.164.131"},
+	"gd-ct": {"14.119.66.1"},
+	"gd-cu": {"36.249.75.208", "36.249.75.222", "36.250.245.237", "36.249.75.220", "157.255.228.102"},
+	"gd-cm": {"112.48.236.196", "112.47.9.244", "112.48.236.199", "112.48.236.253", "112.48.236.197", "112.48.201.216", "183.232.151.102"},
+}
 
 func tosTransferBps(bytes int64, elapsed time.Duration) int64 {
 	return int64(float64(bytes) / max(elapsed, 10*time.Millisecond).Seconds())
@@ -134,7 +151,12 @@ func (m *speedtestManager) buildTOSTargets(provinces []speedtestProvinceDef, gro
 	targets := make([]agentSpeedtestTarget, 0, len(resolved))
 	for pi, def := range provinces {
 		for gi, group := range groups {
-			targets = append(targets, newTOSTarget(def, group, catalog[def.Code+"-"+group], resolved[pi*len(groups)+gi], duration))
+			key := def.Code + "-" + group
+			directoryIPs := catalog[key]
+			if len(directoryIPs) == 0 {
+				directoryIPs = tosCatalogFallback[key]
+			}
+			targets = append(targets, newTOSTarget(def, group, directoryIPs, resolved[pi*len(groups)+gi], duration))
 		}
 	}
 	return targets
@@ -163,8 +185,16 @@ func probeTOSCandidate(ctx context.Context, target agentSpeedtestTarget, transpo
 	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, province.TOSHost, tosProbeTimeout, transport)
 	resp, err := client.Do(req)
 	if err != nil {
+		var netErr net.Error
+		timedOut := errors.As(err, &netErr) && netErr.Timeout()
 		if getConn() == nil {
+			if timedOut {
+				return errors.New("TCP 443 连接超时")
+			}
 			return fmt.Errorf("TCP 443 连接失败（%s）", conciseSpeedtestError(err.Error()))
+		}
+		if timedOut {
+			return errors.New("HTTPS 探测超时")
 		}
 		return fmt.Errorf("HTTPS 探测失败（%s）", conciseSpeedtestError(err.Error()))
 	}
