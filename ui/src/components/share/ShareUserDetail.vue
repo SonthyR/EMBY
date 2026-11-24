@@ -235,19 +235,25 @@ async function saveSites() {
       <section class="block sites-block">
         <div class="block-head">
           <h3>分配源站</h3>
-          <span v-if="detail.route_prefix && draftSites.length > 1" class="faint hint">首位为首选生效源站（按启用状态顺位）</span>
+          <span v-if="detail.route_prefix && draftSites.length > 1" class="faint hint">首位为首选生效源站</span>
         </div>
-        <div v-if="sites.length" class="site-pills">
-          <div v-for="site in sites" :key="site.id" class="site-chip-wrap">
+        <div v-if="sites.length" class="site-list">
+          <div
+            v-for="site in sites"
+            :key="site.id"
+            class="site-row"
+            :class="{ on: assignedIndex(site.id) >= 0, off: !site.enabled }"
+          >
             <button
               type="button"
-              class="site-chip"
-              :class="{ on: assignedIndex(site.id) >= 0, off: !site.enabled }"
+              class="site-toggle"
               :disabled="!!busy"
               @click="toggleDraftSite(site)"
             >
-              <Check v-if="assignedIndex(site.id) >= 0" class="chip-ico" />
-              <span>{{ site.name }}</span>
+              <span class="site-check" :class="{ checked: assignedIndex(site.id) >= 0 }">
+                <Check v-if="assignedIndex(site.id) >= 0" />
+              </span>
+              <span class="site-name" :title="site.name">{{ site.name }}</span>
               <span v-if="!site.enabled" class="off-tag">停用</span>
               <span v-else-if="detail.route_prefix && detail.active_site_id === site.id && assignedIndex(site.id) >= 0" class="active-tag">生效</span>
               <span v-else-if="detail.route_prefix && draftSites.length > 1 && assignedIndex(site.id) === 0" class="prio-tag">首选</span>
@@ -341,18 +347,22 @@ async function saveSites() {
 .hint { font-size: 11.5px; }
 h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
 .sites-block { padding-bottom: 18px; border-bottom: 1px solid var(--border); }
-.site-pills { display: flex; flex-wrap: wrap; gap: 8px; }
-.site-chip-wrap { display: inline-flex; align-items: center; gap: 4px; }
-.site-chip { display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-2); font-size: 12.5px; cursor: pointer; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease); }
-.site-chip:hover:not(:disabled) { border-color: var(--text-3); color: var(--text); }
-.site-chip.on { border-color: var(--text); background: var(--surface); color: var(--text); font-weight: 500; }
-.site-chip.off { opacity: 0.65; }
-.site-chip:disabled { opacity: 0.5; cursor: default; }
-.chip-ico { width: 13px; height: 13px; }
-.active-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: var(--good-soft); color: var(--good); font-weight: 500; }
-.prio-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-weight: 500; }
-.off-tag { font-size: 10.5px; padding: 1px 5px; border-radius: 999px; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-weight: 500; }
-.pin-btn { height: 22px; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-3); font-size: 11px; cursor: pointer; }
+.site-list { display: flex; flex-direction: column; gap: 6px; }
+.site-row { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.site-row:hover { border-color: var(--text-3); }
+.site-row.on { border-color: color-mix(in srgb, var(--text) 32%, var(--border)); background: var(--surface); }
+.site-row.off { opacity: 0.65; }
+.site-toggle { flex: 1; min-width: 0; height: 34px; display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--text-2); font-size: 13px; text-align: left; cursor: pointer; }
+.site-row.on .site-toggle { color: var(--text); font-weight: 500; }
+.site-toggle:disabled { opacity: 0.55; cursor: default; }
+.site-check { width: 15px; height: 15px; flex: 0 0 15px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); color: var(--bg); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.site-check.checked { border-color: var(--text); background: var(--text); }
+.site-check svg { width: 11px; height: 11px; }
+.site-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.active-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--good-soft); color: var(--good); font-weight: 500; }
+.prio-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-weight: 500; }
+.off-tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-weight: 500; }
+.pin-btn { flex: 0 0 auto; height: 24px; padding: 0 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elev); color: var(--text-2); font-size: 11.5px; cursor: pointer; white-space: nowrap; }
 .pin-btn:hover:not(:disabled) { border-color: var(--text); color: var(--text); }
 .pin-btn:disabled { opacity: 0.5; cursor: default; }
 .site-save-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }

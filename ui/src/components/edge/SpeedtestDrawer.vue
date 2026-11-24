@@ -121,6 +121,10 @@ async function loadTargets() {
     nodes.value = res.nodes || []
     customTargets.value = res.custom_targets || []
     catalogCount.value = res.catalog_count || 0
+    const validProvCodes = new Set(provinces.value.map(p => p.code))
+    if (validProvCodes.size) {
+      selectedProvinces.value = selectedProvinces.value.filter(code => validProvCodes.has(code))
+    }
     if (!selectedProvinces.value.length && res.default_provinces?.length) {
       selectedProvinces.value = [...res.default_provinces]
     }
@@ -263,14 +267,9 @@ function toggleISP(group: string) {
   }
 }
 
-function selectPreset(preset: 'top3' | 'all') {
-  if (preset === 'top3') {
-    selectedProvinces.value = ['bj', 'sh', 'gd']
-    selectedISPs.value = ['ct', 'cu', 'cm']
-  } else {
-    selectedProvinces.value = provinces.value.map(p => p.code)
-    selectedISPs.value = ['ct', 'cu', 'cm']
-  }
+function selectPreset() {
+  selectedProvinces.value = provinces.value.length ? provinces.value.map(p => p.code) : ['bj', 'sh', 'gd']
+  selectedISPs.value = ['ct', 'cu', 'cm']
 }
 
 function toggleCustomSelection(targetId: number) {
@@ -712,7 +711,7 @@ onBeforeUnmount(() => {
 
             <UiField label="目标源模式" for="st-mode">
               <select id="st-mode" v-model="mode" class="select" :disabled="isJobRunning">
-                <option value="builtin">内置三网节点（公开三网测速库）</option>
+                <option value="builtin">内置三网节点（火山引擎 TOS 北上广）</option>
                 <option value="apple">Apple CDN 就近节点（默认路由）</option>
                 <option value="custom">自定义测速目标 ({{ customTargets.length }})</option>
                 <option value="all">内置三网 + 自定义全量</option>
@@ -722,10 +721,9 @@ onBeforeUnmount(() => {
 
           <div v-if="mode === 'builtin' || mode === 'all'" class="picker">
             <div class="picker-head">
-              <span class="label">省份与运营商</span>
+              <span class="label">地区与运营商</span>
               <div class="presets">
-                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset('top3')">北上广默认 (9项)</button>
-                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset('all')">全量 12 省 (36项)</button>
+                <button type="button" class="link-btn" :disabled="isJobRunning" @click="selectPreset()">北上广全选 (9项)</button>
               </div>
             </div>
             <div class="chip-group">
@@ -892,7 +890,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-else class="empty-hint">
-          尚未对该节点运行三网测速，选择省份与运营商后点击「开始单线程测速」。
+          尚未对该节点运行三网测速，选择地区与运营商后点击「开始单线程测速」。
         </div>
       </template>
 

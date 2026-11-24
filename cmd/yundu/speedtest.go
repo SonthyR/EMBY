@@ -10,7 +10,6 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,15 +35,17 @@ const (
 	appleSpeedtestUserAgent   = "networkQuality/194.80.3 CFNetwork/3860.400.51 Darwin/25.3.0"
 	speedtestBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-	defaultSpeedtestCatalogCSVURL  = "https://raw.githubusercontent.com/spiritLHLS/speedtest.cn-CN-ID/main/CN.csv"
-	defaultSpeedtestCatalogJSONURL = "https://raw.githubusercontent.com/oneclickvirt/speedtest/main/model/snapshot/speedtest-servers.json"
-	speedtestCatalogTTL            = 6 * time.Hour
-	speedtestCatalogRetryTTL       = 5 * time.Minute
-	maxSpeedtestCandidatesPerNode  = 6
-	defaultSpeedtestDownloadBytes  = 104857600
-	minValidUploadBytes            = int64(256 << 10)
-	minFastTestUploadBytes         = int64(64 << 10)
-	maxDirectReportSessions        = 128
+	volcengineTOSBeijingHost      = "probe-bucket-beijing.tos-cn-beijing.volces.com"
+	volcengineTOSShanghaiHost     = "probe-bucket-shanghai.tos-cn-shanghai.volces.com"
+	volcengineTOSGuangzhouHost    = "probe-bucket-guangzhou.tos-cn-guangzhou.volces.com"
+	defaultDoHAliDNSURL           = "https://dns.alidns.com/resolve"
+	defaultDoHGoogleURL           = "https://dns.google/resolve"
+	tosDNSCacheTTL                = 10 * time.Minute
+	maxSpeedtestCandidatesPerNode = 3
+	volcengineTOSDownloadRange    = "bytes=0-536870911"
+	minValidUploadBytes           = int64(256 << 10)
+	minFastTestUploadBytes        = int64(64 << 10)
+	maxDirectReportSessions       = 128
 
 	edgeSpeedtestPathPrefix       = "/_yundu/st/"
 	edgeSpeedtestUIPathPrefix     = "/_yundu/st-ui/"
@@ -154,33 +155,56 @@ var speedtestPatternChunk = func() []byte {
 }()
 
 type speedtestProvinceDef struct {
-	Code   string `json:"code"`
-	Label  string `json:"label"`
-	Region string `json:"-"`
+	Code    string `json:"code"`
+	Label   string `json:"label"`
+	Region  string `json:"-"`
+	TOSHost string `json:"-"`
+	CTECS   string `json:"-"`
+	CUECS   string `json:"-"`
+	CMECS   string `json:"-"`
+}
+
+func (d speedtestProvinceDef) ecsForISP(ispGroup string) string {
+	switch ispGroup {
+	case "ct":
+		return d.CTECS
+	case "cu":
+		return d.CUECS
+	case "cm":
+		return d.CMECS
+	default:
+		return ""
+	}
 }
 
 var speedtestProvinceCatalog = []speedtestProvinceDef{
-	{Code: "bj", Label: "北京", Region: "north"},
-	{Code: "sh", Label: "上海", Region: "east"},
-	{Code: "gd", Label: "广东", Region: "south"},
-	{Code: "js", Label: "江苏", Region: "east"},
-	{Code: "zj", Label: "浙江", Region: "east"},
-	{Code: "sc", Label: "四川", Region: "southwest"},
-	{Code: "hb", Label: "湖北", Region: "central"},
-	{Code: "fj", Label: "福建", Region: "east"},
-	{Code: "sd", Label: "山东", Region: "north"},
-	{Code: "sn", Label: "陕西", Region: "northwest"},
-	{Code: "ln", Label: "辽宁", Region: "north"},
-	{Code: "cq", Label: "重庆", Region: "southwest"},
-}
-
-var speedtestRegionFallbackOrder = map[string][]string{
-	"north":     {"north", "east", "central", "south", "southwest", "northwest"},
-	"east":      {"east", "central", "north", "south", "southwest", "northwest"},
-	"south":     {"south", "east", "central", "southwest", "north", "northwest"},
-	"central":   {"central", "east", "north", "south", "southwest", "northwest"},
-	"southwest": {"southwest", "central", "south", "east", "north", "northwest"},
-	"northwest": {"northwest", "north", "southwest", "central", "east", "south"},
+	{
+		Code:    "bj",
+		Label:   "北京",
+		Region:  "north",
+		TOSHost: volcengineTOSBeijingHost,
+		CTECS:   "219.141.136.0/24",
+		CUECS:   "202.106.0.0/24",
+		CMECS:   "211.136.112.0/24",
+	},
+	{
+		Code:    "sh",
+		Label:   "上海",
+		Region:  "east",
+		TOSHost: volcengineTOSShanghaiHost,
+		CTECS:   "202.96.209.0/24",
+		CUECS:   "210.22.70.0/24",
+		CMECS:   "211.136.150.0/24",
+	},
+	{
+		Code:    "gd",
+		Label:   "广东",
+		Region:  "south",
+		TOSHost: volcengineTOSGuangzhouHost,
+		CTECS:   "202.96.128.0/24",
+		CUECS:   "210.21.196.0/24",
+		CMECS:   "211.136.192.0/24",
+	},
 }
 
 var defaultSpeedtestProvinces = []string{"bj", "sh", "gd"}
@@ -194,161 +218,6 @@ func lookupSpeedtestProvince(codeOrLabel string) (speedtestProvinceDef, bool) {
 		}
 	}
 	return speedtestProvinceDef{}, false
-}
-
-type speedtestLocationAlias struct {
-	keywords []string
-	code     string
-	label    string
-	region   string
-}
-
-var speedtestLocationAliases = []speedtestLocationAlias{
-	{keywords: []string{"北京", "beijing"}, code: "bj", label: "北京", region: "north"},
-	{keywords: []string{"上海", "shanghai"}, code: "sh", label: "上海", region: "east"},
-	{keywords: []string{"广东", "广州", "深圳", "guangzh", "guangzhou", "shenzhen"}, code: "gd", label: "广东", region: "south"},
-	{keywords: []string{"江苏", "南京", "苏州", "镇江", "无锡", "连云港", "nanjing", "suzhou", "zhenj", "zhenjiang", "wuxi"}, code: "js", label: "江苏", region: "east"},
-	{keywords: []string{"浙江", "杭州", "宁波", "温州", "hangzhou", "ningbo", "wenzhou"}, code: "zj", label: "浙江", region: "east"},
-	{keywords: []string{"四川", "成都", "绵阳", "南充", "chengdu", "mianyang", "nanchong"}, code: "sc", label: "四川", region: "southwest"},
-	{keywords: []string{"湖北", "武汉", "wuhan", "hubei"}, code: "hb", label: "湖北", region: "central"},
-	{keywords: []string{"福建", "福州", "厦门", "fujian", "fuzhou", "xiamen"}, code: "fj", label: "福建", region: "east"},
-	{keywords: []string{"山东", "济南", "青岛", "shandong", "jinan", "qingdao"}, code: "sd", label: "山东", region: "north"},
-	{keywords: []string{"陕西", "西安", "shaanxi", "xian"}, code: "sn", label: "陕西", region: "northwest"},
-	{keywords: []string{"辽宁", "沈阳", "大连", "liaoning", "shenyang", "dalian"}, code: "ln", label: "辽宁", region: "north"},
-	{keywords: []string{"重庆", "chongqing"}, code: "cq", label: "重庆", region: "southwest"},
-	{keywords: []string{"天津", "tianjin"}, code: "tj", label: "天津", region: "north"},
-	{keywords: []string{"山西", "太原", "taiyuan"}, code: "sx", label: "山西", region: "north"},
-	{keywords: []string{"河北", "石家庄", "shijiazhuang"}, code: "he", label: "河北", region: "north"},
-	{keywords: []string{"河南", "郑州", "zhengzhou"}, code: "ha", label: "河南", region: "central"},
-	{keywords: []string{"湖南", "长沙", "changsha"}, code: "hn", label: "湖南", region: "central"},
-	{keywords: []string{"安徽", "合肥", "hefei"}, code: "ah", label: "安徽", region: "east"},
-	{keywords: []string{"江西", "南昌", "nanchang"}, code: "jx", label: "江西", region: "east"},
-	{keywords: []string{"广西", "南宁", "nanning"}, code: "gx", label: "广西", region: "south"},
-	{keywords: []string{"海南", "海口", "haikou"}, code: "hi", label: "海南", region: "south"},
-	{keywords: []string{"甘肃", "兰州", "lanzhou"}, code: "gs", label: "甘肃", region: "northwest"},
-	{keywords: []string{"贵州", "贵阳", "guiyang"}, code: "gz", label: "贵州", region: "southwest"},
-	{keywords: []string{"云南", "昆明", "kunming"}, code: "yn", label: "云南", region: "southwest"},
-	{keywords: []string{"吉林", "长春", "changchun"}, code: "jl", label: "吉林", region: "north"},
-	{keywords: []string{"黑龙江", "哈尔滨", "harbin"}, code: "hl", label: "黑龙江", region: "north"},
-}
-
-func normalizeSpeedtestCatalogLocation(provRaw, cityRaw string) (provCode, provLabel, region string) {
-	combined := strings.ToLower(strings.TrimSpace(provRaw) + " " + strings.TrimSpace(cityRaw))
-	if combined == "" {
-		return "", "", ""
-	}
-	for _, entry := range speedtestLocationAliases {
-		for _, kw := range entry.keywords {
-			if strings.Contains(combined, kw) {
-				return entry.code, entry.label, entry.region
-			}
-		}
-	}
-	return "", "", ""
-}
-
-func mapSpeedtestOperator(raw string) string {
-	v := strings.ToLower(strings.TrimSpace(raw))
-	switch v {
-	case "ct", "电信", "中国电信", "chinatelecom":
-		return "ct"
-	case "cu", "联通", "中国联通", "chinaunicom":
-		return "cu"
-	case "cm", "移动", "中国移动", "chinamobile":
-		return "cm"
-	}
-	switch {
-	case strings.Contains(v, "电信") || strings.Contains(v, "telecom"):
-		return "ct"
-	case strings.Contains(v, "联通") || strings.Contains(v, "unicom"):
-		return "cu"
-	case strings.Contains(v, "移动") || strings.Contains(v, "mobile"):
-		return "cm"
-	default:
-		return ""
-	}
-}
-
-type speedtestCatalogNode struct {
-	Host        string
-	Label       string
-	ProvCode    string
-	ProvLabel   string
-	Region      string
-	ISPGroup    string
-	DownloadURL string
-	UploadURL   string
-	Method      string
-	DirectHTTP  bool
-}
-
-var embeddedChinaSpeedtestCatalog = []speedtestCatalogNode{
-	// 电信 CT
-	{Host: "speedtest1.online.sh.cn:8080", Label: "上海电信", ProvCode: "sh", ProvLabel: "上海", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "5gnanjing.speedtest.jsinfo.net:8080", Label: "江苏南京电信", ProvCode: "js", ProvLabel: "江苏", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "5gzhenjiang.speedtest.jsinfo.net:8080", Label: "江苏镇江电信", ProvCode: "js", ProvLabel: "江苏", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "4gsuzhou1.speedtest.jsinfo.net:8080", Label: "江苏苏州电信", ProvCode: "js", ProvLabel: "江苏", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "cesu-hz.zjtelecom.com.cn:8080", Label: "浙江杭州电信", ProvCode: "zj", ProvLabel: "浙江", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "cesu-nb.zjtelecom.com.cn:8080", Label: "浙江宁波电信", ProvCode: "zj", ProvLabel: "浙江", Region: "east", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "vipspeedtest8.wuhan.net.cn:8080", Label: "湖北武汉电信", ProvCode: "hb", ProvLabel: "湖北", Region: "central", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "hntelecom5g.cn:8080", Label: "湖南长沙电信", ProvCode: "hn", ProvLabel: "湖南", Region: "central", ISPGroup: "ct", DirectHTTP: true},
-	{Host: "speedtest1.sc.189.cn:8080", Label: "四川成都电信", ProvCode: "sc", ProvLabel: "四川", Region: "southwest", ISPGroup: "ct", DirectHTTP: true},
-	// 联通 CU
-	{Host: "beijing.unicomtest.com:8080", Label: "北京联通", ProvCode: "bj", ProvLabel: "北京", Region: "north", ISPGroup: "cu", DirectHTTP: true},
-	{Host: "speedtest3.online.tj.cn:8080", Label: "天津联通", ProvCode: "tj", ProvLabel: "天津", Region: "north", ISPGroup: "cu", DirectHTTP: true},
-	{Host: "mobile.shunicomtest.com:8080", Label: "上海联通", ProvCode: "sh", ProvLabel: "上海", Region: "east", ISPGroup: "cu", DirectHTTP: true},
-	{Host: "cuscspeed.169ol.com:8080", Label: "四川成都联通", ProvCode: "sc", ProvLabel: "四川", Region: "southwest", ISPGroup: "cu", DirectHTTP: true},
-	{Host: "mycuspeed.169ol.com:8080", Label: "四川绵阳联通", ProvCode: "sc", ProvLabel: "四川", Region: "southwest", ISPGroup: "cu", DirectHTTP: true},
-	// 移动 CM
-	{Host: "speedtest.bmcc.com.cn:8080", Label: "北京移动", ProvCode: "bj", ProvLabel: "北京", Region: "north", ISPGroup: "cm", DirectHTTP: true},
-	{Host: "speedtest.jsqiuying.com:8080", Label: "江苏苏州移动", ProvCode: "js", ProvLabel: "江苏", Region: "east", ISPGroup: "cm", DirectHTTP: true},
-	{Host: "csfw.fj.chinamobile.com:8080", Label: "福建福州移动", ProvCode: "fj", ProvLabel: "福建", Region: "east", ISPGroup: "cm", DirectHTTP: true},
-	{Host: "speedtest1.sc.chinamobile.com:8080", Label: "四川成都移动", ProvCode: "sc", ProvLabel: "四川", Region: "southwest", ISPGroup: "cm", DirectHTTP: true},
-}
-
-func normalizeSpeedtestDownloadURL(raw string) string {
-	cleaned, err := validateCustomSpeedtestTargetURL(raw, false)
-	if err != nil || cleaned == "" {
-		return ""
-	}
-	u, err := url.Parse(cleaned)
-	if err != nil {
-		return ""
-	}
-	trimmedPath := strings.TrimRight(u.Path, "/")
-	if strings.HasSuffix(trimmedPath, "/download") && u.RawQuery == "" {
-		u.RawQuery = "size=" + strconv.Itoa(defaultSpeedtestDownloadBytes)
-	}
-	return u.String()
-}
-
-func makeHTTPSiblingForOoklaPort(rawURL string) string {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || u.Scheme != "https" {
-		return ""
-	}
-	port := u.Port()
-	if port != "8080" && port != "8088" {
-		return ""
-	}
-	if strings.HasSuffix(strings.ToLower(u.Hostname()), ".ooklaserver.net") {
-		return ""
-	}
-	clone := *u
-	clone.Scheme = "http"
-	return clone.String()
-}
-
-func buildEmbeddedChinaCatalog() []speedtestCatalogNode {
-	out := make([]speedtestCatalogNode, 0, len(embeddedChinaSpeedtestCatalog))
-	for _, n := range embeddedChinaSpeedtestCatalog {
-		item := n
-		item.DownloadURL = normalizeSpeedtestDownloadURL("http://" + item.Host + "/download")
-		item.UploadURL = "http://" + item.Host + "/upload"
-		item.Method = http.MethodPost
-		out = append(out, item)
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +809,15 @@ func conciseSpeedtestError(raw string) string {
 	if s == "" {
 		return ""
 	}
+	for _, prefix := range []string{`Put "`, `Post "`, `Get "`, `Head "`} {
+		if strings.HasPrefix(s, prefix) {
+			rest := s[len(prefix):]
+			if endQuote := strings.Index(rest, `": `); endQuote >= 0 {
+				s = strings.TrimSpace(rest[endQuote+3:])
+			}
+			break
+		}
+	}
 	runes := []rune(s)
 	if len(runes) > 120 {
 		return string(runes[:117]) + "..."
@@ -1106,7 +984,10 @@ func measureSingleUpload(ctx context.Context, target agentSpeedtestTarget, dur t
 	if method != http.MethodPut {
 		method = http.MethodPost
 	}
-	plannedBytes := int64(64 << 20)
+	plannedBytes := int64(256 << 20)
+	if target.IsAppleCDN {
+		plannedBytes = int64(64 << 20)
+	}
 	if dur < time.Second {
 		plannedBytes = int64(4 << 20)
 	}
@@ -1206,6 +1087,9 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 	req.Header.Set("Cache-Control", "no-store")
 
 	targetHost := targetHostnameForURL(target.DownloadURL)
+	if strings.HasSuffix(strings.ToLower(targetHost), ".volces.com") {
+		req.Header.Set("Range", volcengineTOSDownloadRange)
+	}
 	client, getConn := newSpeedtestSingleConnHTTPClient(target.ResolvedIP, targetHost, dur+10*time.Second, transportOverride)
 	resp, doErr := client.Do(req)
 	if doErr != nil {
@@ -1302,275 +1186,175 @@ func measureSingleDownload(ctx context.Context, target agentSpeedtestTarget, dur
 }
 
 // ---------------------------------------------------------------------------
-// Public China 3-ISP Speedtest Catalog (remote refresh + embedded fallback)
+// Volcengine TOS Public Probe DNS-over-HTTPS (ECS) Resolution
 
-func csvFieldValue(row []string, idx int) string {
-	if idx < 0 || idx >= len(row) {
-		return ""
-	}
-	return strings.TrimSpace(row[idx])
+type speedtestDNSCacheEntry struct {
+	ips       []string
+	expiresAt time.Time
 }
 
-func formatCatalogNodeLabel(provLabel, city, ispGroup string) string {
-	ispLbl := ispGroupLabel(ispGroup)
-	p := strings.TrimSpace(provLabel)
-	c := strings.TrimSpace(city)
-	if p == "" {
-		if c != "" {
-			return c + ispLbl
+func filterPublicIPv4Candidates(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, maxSpeedtestCandidatesPerNode)
+	for _, s := range raw {
+		addr, err := netip.ParseAddr(strings.TrimSpace(s))
+		if err != nil {
+			continue
 		}
-		return ispLbl
-	}
-	if c == "" || strings.Contains(strings.ToLower(p), strings.ToLower(c)) || strings.Contains(strings.ToLower(c), strings.ToLower(p)) {
-		return p + ispLbl
-	}
-	// Skip appending ASCII city names when province label is already clear.
-	hasNonASCII := false
-	for _, r := range c {
-		if r > 127 {
-			hasNonASCII = true
+		addr = addr.Unmap()
+		if !addr.Is4() || !isPublicSpeedtestIP(addr) {
+			continue
+		}
+		ipStr := addr.String()
+		if seen[ipStr] {
+			continue
+		}
+		seen[ipStr] = true
+		out = append(out, ipStr)
+		if len(out) >= maxSpeedtestCandidatesPerNode {
 			break
 		}
-	}
-	if !hasNonASCII {
-		return p + ispLbl
-	}
-	return p + c + " · " + ispLbl
-}
-
-func appendNormalizedCatalogVariants(dst []speedtestCatalogNode, base speedtestCatalogNode, dlRaw, ulRaw string) []speedtestCatalogNode {
-	dlNorm := normalizeSpeedtestDownloadURL(dlRaw)
-	ulClean, ulErr := validateCustomSpeedtestTargetURL(ulRaw, false)
-	if dlNorm == "" || ulErr != nil || ulClean == "" {
-		return dst
-	}
-	if httpDL, httpUL := makeHTTPSiblingForOoklaPort(dlNorm), makeHTTPSiblingForOoklaPort(ulClean); httpDL != "" && httpUL != "" {
-		httpNode := base
-		httpNode.DownloadURL = normalizeSpeedtestDownloadURL(httpDL)
-		httpNode.UploadURL = httpUL
-		httpNode.Method = http.MethodPost
-		httpNode.DirectHTTP = true
-		dst = append(dst, httpNode)
-	}
-	node := base
-	node.DownloadURL = dlNorm
-	node.UploadURL = ulClean
-	node.Method = http.MethodPost
-	lowerDL := strings.ToLower(dlNorm)
-	node.DirectHTTP = strings.HasPrefix(lowerDL, "http://") && !strings.Contains(lowerDL, ".ooklaserver.net")
-	return append(dst, node)
-}
-
-func parseSpeedtestCatalogCSV(data []byte) []speedtestCatalogNode {
-	if len(data) == 0 {
-		return nil
-	}
-	r := csv.NewReader(strings.NewReader(string(data)))
-	r.FieldsPerRecord = -1
-	header, err := r.Read()
-	if err != nil || len(header) == 0 {
-		return nil
-	}
-	cols := make(map[string]int, len(header))
-	for i, name := range header {
-		key := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(name, "\ufeff")))
-		cols[key] = i
-	}
-	idxOf := func(name string) int {
-		if idx, ok := cols[name]; ok {
-			return idx
-		}
-		return -1
-	}
-	activeIdx := idxOf("active")
-	verIdx := idxOf("ver")
-	opIdx := idxOf("operator")
-	provIdx := idxOf("province")
-	cityIdx := idxOf("city")
-	hostIdx := idxOf("host")
-	dlIdx := idxOf("downloadurl")
-	ulIdx := idxOf("uploadurl")
-	if verIdx < 0 || opIdx < 0 || dlIdx < 0 || ulIdx < 0 {
-		return nil
-	}
-
-	var out []speedtestCatalogNode
-	for {
-		rec, readErr := r.Read()
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			continue
-		}
-		if activeIdx >= 0 && csvFieldValue(rec, activeIdx) != "1" {
-			continue
-		}
-		if csvFieldValue(rec, verIdx) != "1" {
-			continue
-		}
-		isp := mapSpeedtestOperator(csvFieldValue(rec, opIdx))
-		if isp == "" {
-			continue
-		}
-		provRaw := csvFieldValue(rec, provIdx)
-		cityRaw := csvFieldValue(rec, cityIdx)
-		provCode, provLabel, region := normalizeSpeedtestCatalogLocation(provRaw, cityRaw)
-		if provCode == "" {
-			continue
-		}
-		base := speedtestCatalogNode{
-			Host:      csvFieldValue(rec, hostIdx),
-			Label:     formatCatalogNodeLabel(provLabel, cityRaw, isp),
-			ProvCode:  provCode,
-			ProvLabel: provLabel,
-			Region:    region,
-			ISPGroup:  isp,
-		}
-		out = appendNormalizedCatalogVariants(out, base, csvFieldValue(rec, dlIdx), csvFieldValue(rec, ulIdx))
 	}
 	return out
 }
 
-func parseSpeedtestCatalogJSON(data []byte) []speedtestCatalogNode {
+func parseDoHAnswerIPv4(data []byte) []string {
 	if len(data) == 0 {
 		return nil
 	}
-	var items []struct {
-		Name     string `json:"name"`
-		Host     string `json:"host"`
-		URL      string `json:"url"`
-		Provider string `json:"provider"`
-		Country  string `json:"country"`
-		City     string `json:"city"`
+	var payload struct {
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
 	}
-	if err := json.Unmarshal(data, &items); err != nil {
+	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil
 	}
-	var out []speedtestCatalogNode
-	for _, item := range items {
-		if !strings.EqualFold(strings.TrimSpace(item.Country), "China") {
-			continue
+	raw := make([]string, 0, len(payload.Answer))
+	for _, ans := range payload.Answer {
+		if ans.Type == 1 && strings.TrimSpace(ans.Data) != "" {
+			raw = append(raw, ans.Data)
 		}
-		isp := mapSpeedtestOperator(item.Provider)
-		if isp == "" {
-			continue
-		}
-		provCode, provLabel, region := normalizeSpeedtestCatalogLocation(item.Name, item.City)
-		if provCode == "" {
-			continue
-		}
-		ulRaw := strings.TrimSpace(item.URL)
-		if ulRaw == "" && strings.TrimSpace(item.Host) != "" {
-			ulRaw = "http://" + strings.TrimSpace(item.Host) + "/upload"
-		}
-		u, err := url.Parse(ulRaw)
-		if err != nil || u.Host == "" {
-			continue
-		}
-		port := u.Port()
-		if port != "8080" && port != "8088" {
-			continue
-		}
-		dlURL := url.URL{
-			Scheme:   u.Scheme,
-			Host:     u.Host,
-			Path:     "/download",
-			RawQuery: "size=" + strconv.Itoa(defaultSpeedtestDownloadBytes),
-		}
-		base := speedtestCatalogNode{
-			Host:      strings.TrimSpace(item.Host),
-			Label:     formatCatalogNodeLabel(provLabel, item.City, isp),
-			ProvCode:  provCode,
-			ProvLabel: provLabel,
-			Region:    region,
-			ISPGroup:  isp,
-		}
-		out = appendNormalizedCatalogVariants(out, base, dlURL.String(), ulRaw)
 	}
-	return out
+	return filterPublicIPv4Candidates(raw)
 }
 
-func catalogPriorityRank(n speedtestCatalogNode) int {
-	if n.DirectHTTP {
-		return 0
+func (m *speedtestManager) fetchDoHIPv4(ctx context.Context, client *http.Client, endpoint, host, ecs string) []string {
+	if client == nil || strings.TrimSpace(endpoint) == "" || strings.TrimSpace(host) == "" {
+		return nil
 	}
-	if strings.HasPrefix(strings.ToLower(n.DownloadURL), "http://") {
-		return 1
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil
 	}
-	return 2
+	q := u.Query()
+	q.Set("name", host)
+	q.Set("type", "A")
+	if strings.TrimSpace(ecs) != "" {
+		q.Set("edns_client_subnet", ecs)
+	}
+	u.RawQuery = q.Encode()
+
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	req.Header.Set("User-Agent", speedtestBrowserUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return nil
+	}
+	return parseDoHAnswerIPv4(body)
 }
 
-func mergeSpeedtestCatalogNodes(remote, fallback []speedtestCatalogNode) []speedtestCatalogNode {
-	combined := make([]speedtestCatalogNode, 0, len(remote)+len(fallback))
-	combined = append(combined, remote...)
-	combined = append(combined, fallback...)
-
-	seen := make(map[string]bool, len(combined))
-	deduped := make([]speedtestCatalogNode, 0, len(combined))
-	for _, n := range combined {
-		key := strings.ToLower(n.DownloadURL) + "|" + strings.ToLower(n.UploadURL)
-		if n.DownloadURL == "" || n.UploadURL == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		deduped = append(deduped, n)
-	}
-	sort.SliceStable(deduped, func(i, j int) bool {
-		return catalogPriorityRank(deduped[i]) < catalogPriorityRank(deduped[j])
-	})
-	return deduped
-}
-
-func selectSpeedtestCandidates(catalog []speedtestCatalogNode, prov speedtestProvinceDef, ispGroup string) []speedtestCandidate {
-	out := make([]speedtestCandidate, 0, maxSpeedtestCandidatesPerNode)
-	seen := make(map[string]bool, maxSpeedtestCandidatesPerNode)
-	appendNode := func(n speedtestCatalogNode) bool {
-		key := n.DownloadURL + "|" + n.UploadURL
-		if seen[key] {
-			return false
-		}
-		seen[key] = true
-		out = append(out, speedtestCandidate{
-			Label:       n.Label,
-			UploadURL:   n.UploadURL,
-			DownloadURL: n.DownloadURL,
-			Method:      n.Method,
-		})
-		return len(out) >= maxSpeedtestCandidatesPerNode
+func (m *speedtestManager) resolveVolcengineTOSIPs(ctx context.Context, host, ecs string) []string {
+	host = strings.TrimSpace(host)
+	ecs = strings.TrimSpace(ecs)
+	if host == "" {
+		return nil
 	}
 
-	// Tier 1: Exact province + ISP matches.
-	for _, n := range catalog {
-		if n.ISPGroup == ispGroup && n.ProvCode == prov.Code {
-			if appendNode(n) {
-				return out
+	m.mu.Lock()
+	customResolver := m.dohResolver
+	client := m.dohClient
+	endpoints := append([]string(nil), m.dohEndpoints...)
+	cacheKey := host + "|" + ecs
+	if customResolver == nil && m.dnsCache != nil {
+		if entry, ok := m.dnsCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) && len(entry.ips) > 0 {
+			cached := append([]string(nil), entry.ips...)
+			m.mu.Unlock()
+			return cached
+		}
+	}
+	m.mu.Unlock()
+
+	if customResolver != nil {
+		ips, err := customResolver(ctx, host, ecs)
+		if err != nil {
+			return nil
+		}
+		return filterPublicIPv4Candidates(ips)
+	}
+
+	var resolved []string
+	for _, ep := range endpoints {
+		if ctx.Err() != nil {
+			break
+		}
+		if ips := m.fetchDoHIPv4(ctx, client, ep, host, ecs); len(ips) > 0 {
+			resolved = ips
+			break
+		}
+	}
+
+	if len(resolved) == 0 && ctx.Err() == nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		addrs, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", host)
+		cancel()
+		if err == nil {
+			raw := make([]string, 0, len(addrs))
+			for _, a := range addrs {
+				raw = append(raw, a.String())
 			}
+			resolved = filterPublicIPv4Candidates(raw)
 		}
 	}
-	// Tier 2: Regional fallback in geographic proximity order.
-	regions := speedtestRegionFallbackOrder[prov.Region]
-	if len(regions) == 0 {
-		regions = []string{"east", "north", "central", "south", "southwest", "northwest"}
-	}
-	for _, reg := range regions {
-		for _, n := range catalog {
-			if n.ISPGroup == ispGroup && n.Region == reg {
-				if appendNode(n) {
-					return out
+
+	if len(resolved) > 0 {
+		now := time.Now()
+		m.mu.Lock()
+		if m.dnsCache == nil {
+			m.dnsCache = make(map[string]speedtestDNSCacheEntry)
+		}
+		if len(m.dnsCache) > 64 {
+			for k, v := range m.dnsCache {
+				if now.After(v.expiresAt) {
+					delete(m.dnsCache, k)
 				}
 			}
 		}
-	}
-	// Tier 3: Remaining nationwide matches for this ISP.
-	for _, n := range catalog {
-		if n.ISPGroup == ispGroup {
-			if appendNode(n) {
-				return out
-			}
+		m.dnsCache[cacheKey] = speedtestDNSCacheEntry{
+			ips:       append([]string(nil), resolved...),
+			expiresAt: now.Add(tosDNSCacheTTL),
 		}
+		m.mu.Unlock()
 	}
-	return out
+	return resolved
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,19 +1376,15 @@ type directSpeedtestReportState struct {
 type speedtestManager struct {
 	db              *DB
 	pm              *ProxyManager
-	catalogClient   *http.Client
-	catalogCSVURL   string
-	catalogJSONURL  string
+	dohClient       *http.Client
+	dohEndpoints    []string
+	dohResolver     func(ctx context.Context, host, ecs string) ([]string, error)
 	targetTransport *http.Transport
 	phaseDuration   time.Duration
 	customTargetMu  sync.Mutex
 
 	mu                sync.Mutex
-	catalogNodes      []speedtestCatalogNode
-	catalogUpdated    time.Time
-	catalogExpiresAt  time.Time
-	catalogRefreshing bool
-	catalogWaitCh     chan struct{}
+	dnsCache          map[string]speedtestDNSCacheEntry
 	directReports     map[string]*directSpeedtestReportState
 	activeNode        map[int64]string // node_id -> job_id or "preparing:..."
 	masterCanc        map[string]context.CancelFunc
@@ -1623,12 +1403,12 @@ func newSpeedtestManager(db *DB, pm *ProxyManager) *speedtestManager {
 	mgr := &speedtestManager{
 		db: db,
 		pm: pm,
-		catalogClient: &http.Client{
+		dohClient: &http.Client{
 			Transport: tr,
-			Timeout:   5 * time.Second,
+			Timeout:   4 * time.Second,
 		},
-		catalogCSVURL:     defaultSpeedtestCatalogCSVURL,
-		catalogJSONURL:    defaultSpeedtestCatalogJSONURL,
+		dohEndpoints:      []string{defaultDoHAliDNSURL, defaultDoHGoogleURL},
+		dnsCache:          make(map[string]speedtestDNSCacheEntry),
 		phaseDuration:     defaultSpeedtestPhaseDuration,
 		directReports:     make(map[string]*directSpeedtestReportState),
 		activeNode:        make(map[int64]string),
@@ -1652,135 +1432,6 @@ func newSpeedtestManager(db *DB, pm *ProxyManager) *speedtestManager {
 
 func newSpeedtestJobID() string {
 	return "st_" + newSpeedtestRandomHex(8)
-}
-
-func fetchCatalogBytes(ctx context.Context, client *http.Client, rawURL string) []byte {
-	if client == nil {
-		return nil
-	}
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("User-Agent", speedtestBrowserUserAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return nil
-	}
-	return body
-}
-
-func (m *speedtestManager) catalogSnapshot() (int, string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.catalogNodes) > 0 {
-		updated := ""
-		if !m.catalogUpdated.IsZero() {
-			updated = m.catalogUpdated.UTC().Format(time.RFC3339)
-		}
-		return len(m.catalogNodes), updated
-	}
-	return len(embeddedChinaSpeedtestCatalog), ""
-}
-
-func (m *speedtestManager) loadCatalog(ctx context.Context) []speedtestCatalogNode {
-	for {
-		now := time.Now()
-		m.mu.Lock()
-		if len(m.catalogNodes) > 0 && now.Before(m.catalogExpiresAt) {
-			cached := append([]speedtestCatalogNode(nil), m.catalogNodes...)
-			m.mu.Unlock()
-			return cached
-		}
-		if m.catalogRefreshing && m.catalogWaitCh != nil {
-			waitCh := m.catalogWaitCh
-			m.mu.Unlock()
-			select {
-			case <-waitCh:
-				continue
-			case <-ctx.Done():
-				m.mu.Lock()
-				cached := append([]speedtestCatalogNode(nil), m.catalogNodes...)
-				m.mu.Unlock()
-				if len(cached) > 0 {
-					return cached
-				}
-				return buildEmbeddedChinaCatalog()
-			}
-		}
-		m.catalogRefreshing = true
-		waitCh := make(chan struct{})
-		m.catalogWaitCh = waitCh
-		client := m.catalogClient
-		csvURL := m.catalogCSVURL
-		jsonURL := m.catalogJSONURL
-		m.mu.Unlock()
-
-		var csvData, jsonData []byte
-		var wg sync.WaitGroup
-		if strings.TrimSpace(csvURL) != "" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				csvData = fetchCatalogBytes(ctx, client, csvURL)
-			}()
-		}
-		if strings.TrimSpace(jsonURL) != "" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				jsonData = fetchCatalogBytes(ctx, client, jsonURL)
-			}()
-		}
-		wg.Wait()
-
-		var remote []speedtestCatalogNode
-		if len(csvData) > 0 {
-			remote = append(remote, parseSpeedtestCatalogCSV(csvData)...)
-		}
-		if len(jsonData) > 0 {
-			remote = append(remote, parseSpeedtestCatalogJSON(jsonData)...)
-		}
-
-		embedded := buildEmbeddedChinaCatalog()
-		now = time.Now()
-
-		m.mu.Lock()
-		var result []speedtestCatalogNode
-		if len(remote) > 0 {
-			result = mergeSpeedtestCatalogNodes(remote, embedded)
-			m.catalogNodes = result
-			m.catalogUpdated = now
-			m.catalogExpiresAt = now.Add(speedtestCatalogTTL)
-		} else if len(m.catalogNodes) > 0 && !m.catalogUpdated.IsZero() {
-			result = m.catalogNodes
-			m.catalogExpiresAt = now.Add(speedtestCatalogRetryTTL)
-		} else {
-			result = embedded
-			m.catalogNodes = result
-			m.catalogExpiresAt = now.Add(speedtestCatalogRetryTTL)
-		}
-		m.catalogRefreshing = false
-		m.catalogWaitCh = nil
-		close(waitCh)
-		out := append([]speedtestCatalogNode(nil), result...)
-		m.mu.Unlock()
-		return out
-	}
 }
 
 func (m *speedtestManager) createDirectReportSession(nodeID int64) (string, string) {
@@ -2019,6 +1670,21 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 			isps = append([]string(nil), defaultSpeedtestISPs...)
 		}
 		seenProv := make(map[string]bool, len(provinces))
+		validProvs := make([]speedtestProvinceDef, 0, len(provinces))
+		for _, pCode := range provinces {
+			if def, ok := lookupSpeedtestProvince(pCode); ok && !seenProv[def.Code] {
+				seenProv[def.Code] = true
+				validProvs = append(validProvs, def)
+			}
+		}
+		if len(validProvs) == 0 {
+			for _, pCode := range defaultSpeedtestProvinces {
+				if def, ok := lookupSpeedtestProvince(pCode); ok {
+					validProvs = append(validProvs, def)
+				}
+			}
+		}
+
 		seenISP := make(map[string]bool, len(isps))
 		for _, isp := range isps {
 			g := strings.ToLower(strings.TrimSpace(isp))
@@ -2027,24 +1693,52 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 				cleanISPs = append(cleanISPs, g)
 			}
 		}
-		catalogCtx, catalogCancel := context.WithTimeout(context.Background(), 6*time.Second)
-		catalog := m.loadCatalog(catalogCtx)
-		catalogCancel()
+		if len(cleanISPs) == 0 {
+			cleanISPs = append([]string(nil), defaultSpeedtestISPs...)
+		}
 
-		for _, pCode := range provinces {
-			def, ok := lookupSpeedtestProvince(pCode)
-			if !ok || seenProv[def.Code] {
-				continue
+		resolvedGrid := make([][][]string, len(validProvs))
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 6*time.Second)
+		var resolveWG sync.WaitGroup
+		for pi, def := range validProvs {
+			resolvedGrid[pi] = make([][]string, len(cleanISPs))
+			for ii, g := range cleanISPs {
+				resolveWG.Add(1)
+				go func(pIdx, iIdx int, host, ecs string) {
+					defer resolveWG.Done()
+					resolvedGrid[pIdx][iIdx] = m.resolveVolcengineTOSIPs(resolveCtx, host, ecs)
+				}(pi, ii, def.TOSHost, def.ecsForISP(g))
 			}
-			seenProv[def.Code] = true
+		}
+		resolveWG.Wait()
+		resolveCancel()
+
+		for pi, def := range validProvs {
 			cleanProvs = append(cleanProvs, def.Code)
-			for _, g := range cleanISPs {
+			for ii, g := range cleanISPs {
 				if len(targets) >= maxSpeedtestTargetsPerJob {
 					break
 				}
-				cands := selectSpeedtestCandidates(catalog, def, g)
-				if len(cands) == 0 {
-					continue
+				ips := resolvedGrid[pi][ii]
+				dlURL := "https://" + def.TOSHost + "/download/test"
+				cands := make([]speedtestCandidate, 0, max(len(ips), 1))
+				if len(ips) > 0 {
+					for _, ip := range ips {
+						cands = append(cands, speedtestCandidate{
+							Label:       ip,
+							ResolvedIP:  ip,
+							UploadURL:   "https://" + def.TOSHost + "/upload/yundu-" + newSpeedtestRandomHex(8),
+							DownloadURL: dlURL,
+							Method:      http.MethodPut,
+						})
+					}
+				} else {
+					cands = append(cands, speedtestCandidate{
+						Label:       def.TOSHost,
+						UploadURL:   "https://" + def.TOSHost + "/upload/yundu-" + newSpeedtestRandomHex(8),
+						DownloadURL: dlURL,
+						Method:      http.MethodPut,
+					})
 				}
 				ispLbl := ispGroupLabel(g)
 				first := cands[0]
@@ -2700,7 +2394,7 @@ func (a *App) handleSpeedtestTargets(w http.ResponseWriter, r *http.Request) {
 		a.pm.edges.mu.RUnlock()
 	}
 
-	catalogCount, catalogUpdatedAt := a.speedtest.catalogSnapshot()
+	catalogCount := len(speedtestProvinceCatalog) * len(defaultSpeedtestISPs)
 	a.jsonOK(w, map[string]any{
 		"provinces":          provs,
 		"isps":               isps,
@@ -2709,7 +2403,7 @@ func (a *App) handleSpeedtestTargets(w http.ResponseWriter, r *http.Request) {
 		"custom_targets":     custom,
 		"nodes":              nodes,
 		"catalog_count":      catalogCount,
-		"catalog_updated_at": catalogUpdatedAt,
+		"catalog_updated_at": "",
 	})
 }
 

@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -196,52 +197,70 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	app, rt := setupEdgeRoutingTestApp(t)
 	app.speedtest.phaseDuration = 200 * time.Millisecond
 
-	// 1. Mock public 3-ISP CSV catalog (tests filtering, http:// preference, and multi-candidate failover)
-	// alongside dual HTTP (:8080) + HTTPS (:443) target servers.
-	csvBody := strings.Join([]string{
-		"id,active,https,ver,operator,province,city,host,downloadUrl,uploadUrl",
-		"1,0,0,1,电信,北京,北京,skip-inactive.example.com:8080,http://skip-inactive.example.com:8080/download,http://skip-inactive.example.com:8080/upload",
-		"2,1,0,2,电信,北京,北京,skip-ver2.example.com:51090,http://skip-ver2.example.com:51090/download,http://skip-ver2.example.com:51090/upload",
-		"3,1,0,1,电信,北京,朝阳,bad-bj.example.com:8080,http://bad-bj.example.com:8080/download,http://bad-bj.example.com:8080/upload",
-		"4,1,0,1,电信,北京,海淀,good-bj.example.com:8080,http://good-bj.example.com:8080/download,http://good-bj.example.com:8080/upload",
-		"5,1,1,1,电信,上海,上海,sh-ct.example.com:8080,https://sh-ct.example.com:8080/download,https://sh-ct.example.com:8080/upload",
-		"6,1,0,1,移动,广东,广州,good-gd-cm.example.com:8080,http://good-gd-cm.example.com:8080/download,http://good-gd-cm.example.com:8080/upload",
-	}, "\n")
-	parsedCSV := parseSpeedtestCatalogCSV([]byte(csvBody))
-	if len(parsedCSV) < 4 || parsedCSV[0].Host != "bad-bj.example.com:8080" {
-		t.Fatalf("unexpected parsed catalog: %+v", parsedCSV)
+	// 1. Verify DoH ECS IPv4 answer parsing, DoH cache/resolution, error prefix stripping, and multi-IP Volcengine TOS failover.
+	parsedDoH := parseDoHAnswerIPv4([]byte(`{
+		"Answer":[
+			{"type":5,"data":"tos20-cp-public.cn-beijing.tos.volces.com."},
+			{"type":1,"data":"127.0.0.1"},
+			{"type":1,"data":"10.0.0.1"},
+			{"type":1,"data":"180.213.185.21"},
+			{"type":1,"data":"180.213.185.21"},
+			{"type":1,"data":"180.213.185.40"},
+			{"type":28,"data":"240e:100::1"}
+		]
+	}`))
+	if len(parsedDoH) != 2 || parsedDoH[0] != "180.213.185.21" || parsedDoH[1] != "180.213.185.40" {
+		t.Fatalf("unexpected parsedDoH IPs: %+v", parsedDoH)
 	}
-	foundSHHTTP := false
-	for _, item := range parsedCSV {
-		if item.ProvCode == "sh" && strings.HasPrefix(item.DownloadURL, "http://sh-ct.example.com:8080/download?size=") {
-			foundSHHTTP = true
-			break
-		}
-	}
-	if !foundSHHTTP {
-		t.Fatalf("expected :8080 https catalog row to emit preferred http:// variant, got %+v", parsedCSV)
+	if gotErr := conciseSpeedtestError(`Put "https://probe-bucket-beijing.tos-cn-beijing.volces.com/upload/yundu-123": dial tcp4 180.213.185.21:443: i/o timeout`); gotErr != "dial tcp4 180.213.185.21:443: i/o timeout" {
+		t.Fatalf("conciseSpeedtestError stripped unexpected result: %q", gotErr)
 	}
 
-	catalogSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-		_, _ = io.WriteString(w, csvBody)
+	var dohHits atomic.Int32
+	dohSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dohHits.Add(1)
+		w.Header().Set("Content-Type", "application/dns-json")
+		_, _ = io.WriteString(w, `{"Answer":[{"type":1,"data":"180.213.185.21"}]}`)
 	}))
-	defer catalogSrv.Close()
+	defer dohSrv.Close()
+	app.speedtest.dohClient = dohSrv.Client()
+	app.speedtest.dohEndpoints = []string{dohSrv.URL}
+	if firstIPs := app.speedtest.resolveVolcengineTOSIPs(context.Background(), volcengineTOSBeijingHost, "219.141.136.0/24"); len(firstIPs) != 1 || firstIPs[0] != "180.213.185.21" {
+		t.Fatalf("resolveVolcengineTOSIPs returned %+v", firstIPs)
+	}
+	// Second call must hit in-memory TTL cache without re-querying DoH server.
+	if secondIPs := app.speedtest.resolveVolcengineTOSIPs(context.Background(), volcengineTOSBeijingHost, "219.141.136.0/24"); len(secondIPs) != 1 || dohHits.Load() != 1 {
+		t.Fatalf("expected cached DoH resolution (hits=%d), got %+v", dohHits.Load(), secondIPs)
+	}
 
+	var bjTOSAttempts atomic.Int32
 	chunk := bytes.Repeat([]byte("SPEEDTEST-PAYLOAD-"), 4096)
 	targetHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.Host, "bad-bj.example.com") {
-			http.Error(w, "upstream overloaded", http.StatusBadGateway)
-			return
-		}
-		switch r.URL.Path {
-		case "/upload":
-			if r.ContentLength <= 0 {
-				http.Error(w, "missing explicit content-length", http.StatusLengthRequired)
+		if strings.HasPrefix(r.URL.Path, "/upload/yundu-") {
+			if r.Method != http.MethodPut || r.ContentLength <= 0 {
+				http.Error(w, "invalid TOS PUT upload", http.StatusBadRequest)
+				return
+			}
+			// Fail first Beijing TOS candidate to exercise multi-IP failover.
+			if strings.EqualFold(r.Host, volcengineTOSBeijingHost) && bjTOSAttempts.Add(1) == 1 {
+				http.Error(w, "upstream overloaded", http.StatusBadGateway)
 				return
 			}
 			_, _ = io.Copy(io.Discard, r.Body)
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		switch r.URL.Path {
+		case "/download/test":
+			if r.Header.Get("Range") != volcengineTOSDownloadRange {
+				http.Error(w, "missing expected TOS Range header", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusPartialContent)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write(chunk)
+			}
 		case "/api/v1/gm/slurp":
 			if r.Method != http.MethodPut || r.Header.Get("Upload-Draft-Interop-Version") != "6" {
 				http.Error(w, "invalid apple cdn upload headers", http.StatusBadRequest)
@@ -262,7 +281,7 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		case "/up":
 			_, _ = io.Copy(io.Discard, r.Body)
 			w.WriteHeader(http.StatusOK)
-		case "/download", "/down", "/api/v1/gm/large":
+		case "/down", "/api/v1/gm/large":
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.WriteHeader(http.StatusOK)
 			for i := 0; i < 8; i++ {
@@ -272,8 +291,6 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	})
-	plainSrv := httptest.NewServer(targetHandler)
-	defer plainSrv.Close()
 
 	targetSrv := httptest.NewUnstartedServer(targetHandler)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -287,8 +304,13 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{appleSpeedtestHost},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames: []string{
+			appleSpeedtestHost,
+			volcengineTOSBeijingHost,
+			volcengineTOSShanghaiHost,
+			volcengineTOSGuangzhouHost,
+		},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -319,17 +341,14 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		ResponseHeaderTimeout: 5 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			var d net.Dialer
-			if strings.HasSuffix(addr, ":443") {
-				return d.DialContext(ctx, "tcp", targetSrv.Listener.Addr().String())
-			}
-			return d.DialContext(ctx, "tcp", plainSrv.Listener.Addr().String())
+			return d.DialContext(ctx, "tcp", targetSrv.Listener.Addr().String())
 		},
 	}
 	mockTransport.TLSClientConfig.RootCAs = pool
 
-	app.speedtest.catalogClient = catalogSrv.Client()
-	app.speedtest.catalogCSVURL = catalogSrv.URL
-	app.speedtest.catalogJSONURL = ""
+	app.speedtest.dohResolver = func(_ context.Context, _ string, _ string) ([]string, error) {
+		return []string{"180.213.185.21", "180.213.185.40"}, nil
+	}
 	app.speedtest.targetTransport = mockTransport
 
 	// 2. Test SSRF rejection and custom target CRUD API.
@@ -397,11 +416,8 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 			t.Fatalf("unexpected master result row: %+v", r)
 		}
 		if r.TargetKind == "builtin" {
-			if r.ResolvedNode != "北京海淀 · 电信" {
-				t.Fatalf("expected failover to second candidate (北京海淀 · 电信), got %+v", r)
-			}
-			if r.ResolvedIP == "" {
-				t.Fatalf("expected dialed remote IP recorded on builtin result: %+v", r)
+			if r.ResolvedNode != "180.213.185.40" || r.ResolvedIP != "180.213.185.40" {
+				t.Fatalf("expected failover to second TOS IP candidate (180.213.185.40), got %+v", r)
 			}
 		}
 	}
@@ -483,14 +499,18 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 		t.Fatalf("expected measureSingleUpload to reject immediate HTTP 413 with 0 reads")
 	}
 
-	// Verify Ookla JSON catalog parsing keeps :8080/:8088 China nodes and filters invalid entries.
-	parsedNodes := parseSpeedtestCatalogJSON([]byte(`[
-		{"name":"Beijing Telecom","host":"ookla-bj.example.com:8080","provider":"China Telecom","country":"China","city":"Beijing"},
-		{"name":"Beijing Unicom 443","host":"ookla-443.example.com:443","provider":"China Unicom","country":"China","city":"Beijing"},
-		{"name":"Tokyo Node","host":"ookla-jp.example.com:8080","provider":"China Telecom","country":"Japan","city":"Tokyo"}
-	]`))
-	if len(parsedNodes) != 1 || parsedNodes[0].Host != "ookla-bj.example.com:8080" || !parsedNodes[0].DirectHTTP {
-		t.Fatalf("unexpected parsed JSON catalog nodes: %+v", parsedNodes)
+	// Verify /api/speedtest/targets exposes exactly the 3 Volcengine TOS regions (9 targets).
+	targetsRec := httptest.NewRecorder()
+	app.handleSpeedtestTargets(targetsRec, httptest.NewRequest(http.MethodGet, "/api/speedtest/targets", nil))
+	if targetsRec.Code != http.StatusOK {
+		t.Fatalf("targets status=%d body=%s", targetsRec.Code, targetsRec.Body.String())
+	}
+	var targetsResp struct {
+		Provinces    []speedtestProvinceDef `json:"provinces"`
+		CatalogCount int                    `json:"catalog_count"`
+	}
+	if err := json.Unmarshal(targetsRec.Body.Bytes(), &targetsResp); err != nil || len(targetsResp.Provinces) != 3 || targetsResp.CatalogCount != 9 {
+		t.Fatalf("unexpected speedtest targets metadata: %s", targetsRec.Body.String())
 	}
 
 	// Verify SSRF guards reject NAT64, zoned link-local/site-local, loopback IPs and block dialing them in production client.
