@@ -1969,9 +1969,8 @@ func (m *speedtestManager) runMasterJob(ctx context.Context, doneCh chan struct{
 			finalErr = "全部测速目标执行失败"
 		}
 	}
-	if m.saveJobProgress(jobID, finalStatus, completed, results, finalErr) {
-		m.persistNodeSpeedSummary(nodeID, results)
-	}
+	m.persistNodeSpeedSummary(nodeID, results)
+	m.saveJobProgress(jobID, finalStatus, completed, results, finalErr)
 }
 
 func (m *speedtestManager) saveJobProgress(jobID, status string, completed int, results []speedtestTargetResult, jobErr string) bool {
@@ -2155,11 +2154,12 @@ func (m *speedtestManager) applyAgentProgress(nodeID int64, p *agentSpeedtestPro
 	if status == "" {
 		status = "running"
 	}
-	savedOK := m.saveJobProgress(p.TaskID, status, p.CompletedTargets, p.Results, p.Error)
 	if !terminal {
+		m.saveJobProgress(p.TaskID, status, p.CompletedTargets, p.Results, p.Error)
 		return ""
 	}
-	if savedOK {
+	m.persistNodeSpeedSummary(nodeID, p.Results)
+	if m.saveJobProgress(p.TaskID, status, p.CompletedTargets, p.Results, p.Error) {
 		m.mu.Lock()
 		if m.activeNode[nodeID] == p.TaskID {
 			delete(m.activeNode, nodeID)
@@ -2168,7 +2168,6 @@ func (m *speedtestManager) applyAgentProgress(nodeID int64, p *agentSpeedtestPro
 			delete(m.agentTaskLastProg, nodeID)
 		}
 		m.mu.Unlock()
-		m.persistNodeSpeedSummary(nodeID, p.Results)
 		return p.TaskID
 	}
 
