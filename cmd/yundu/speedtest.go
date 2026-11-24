@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,8 @@ const (
 	volcengineTOSGuangzhouHost    = "probe-bucket-guangzhou.tos-cn-guangzhou.volces.com"
 	defaultDoHAliDNSURL           = "https://dns.alidns.com/resolve"
 	defaultDoHGoogleURL           = "https://dns.google/resolve"
+	defaultTOSCatalogURL          = "https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=tos"
+	maxTOSCatalogBytes            = 128 << 10
 	tosDNSCacheTTL                = 10 * time.Minute
 	maxSpeedtestCandidatesPerNode = 3
 	volcengineTOSDownloadRange    = "bytes=0-536870911"
@@ -1282,6 +1285,61 @@ func (m *speedtestManager) fetchDoHIPv4(ctx context.Context, client *http.Client
 	return parseDoHAnswerIPv4(body)
 }
 
+// loadTOSCatalog reads the published ISP-specific addresses. URLs and ports
+// still come from our local TOS configuration, never from the catalog.
+func (m *speedtestManager) loadTOSCatalog(ctx context.Context) map[string][]string {
+	if m.tosCatalogURL == "" || m.dohClient == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.tosCatalogURL, nil)
+	if err != nil {
+		return nil
+	}
+	client := *m.dohClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTOSCatalogBytes+1))
+	if err != nil || len(body) > maxTOSCatalogBytes {
+		return nil
+	}
+
+	out := make(map[string][]string)
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Split(strings.TrimSuffix(line, "\r"), "\t")
+		if len(fields) < 8 || fields[0] != "tos" || fields[1] != "4" || fields[6] != "443" {
+			continue
+		}
+		def, ok := lookupSpeedtestProvince(fields[2])
+		if !ok {
+			continue
+		}
+		_, regionHost, _ := strings.Cut(def.TOSHost, ".")
+		if !strings.EqualFold(strings.TrimSuffix(fields[7], "."), regionHost) {
+			continue
+		}
+		group := classifyISPGroup(fields[3])
+		if def.ecsForISP(group) == "" {
+			continue
+		}
+		key := def.Code + "-" + group
+		if len(out[key]) < maxSpeedtestCandidatesPerNode {
+			out[key] = filterPublicIPv4Candidates(append(out[key], fields[5]))
+		}
+	}
+	return out
+}
+
 func (m *speedtestManager) resolveVolcengineTOSIPs(ctx context.Context, host, ecs string) []string {
 	host = strings.TrimSpace(host)
 	ecs = strings.TrimSpace(ecs)
@@ -1378,6 +1436,7 @@ type speedtestManager struct {
 	pm              *ProxyManager
 	dohClient       *http.Client
 	dohEndpoints    []string
+	tosCatalogURL   string
 	dohResolver     func(ctx context.Context, host, ecs string) ([]string, error)
 	targetTransport *http.Transport
 	phaseDuration   time.Duration
@@ -1408,6 +1467,7 @@ func newSpeedtestManager(db *DB, pm *ProxyManager) *speedtestManager {
 			Timeout:   4 * time.Second,
 		},
 		dohEndpoints:      []string{defaultDoHAliDNSURL, defaultDoHGoogleURL},
+		tosCatalogURL:     defaultTOSCatalogURL,
 		dnsCache:          make(map[string]speedtestDNSCacheEntry),
 		phaseDuration:     defaultSpeedtestPhaseDuration,
 		directReports:     make(map[string]*directSpeedtestReportState),
@@ -1700,6 +1760,8 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 		resolvedGrid := make([][][]string, len(validProvs))
 		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 6*time.Second)
 		var resolveWG sync.WaitGroup
+		var catalog map[string][]string
+		resolveWG.Go(func() { catalog = m.loadTOSCatalog(resolveCtx) })
 		for pi, def := range validProvs {
 			resolvedGrid[pi] = make([][]string, len(cleanISPs))
 			for ii, g := range cleanISPs {
@@ -1719,7 +1781,7 @@ func (m *speedtestManager) createJob(nodeID int64, nodeName, mode string, provin
 				if len(targets) >= maxSpeedtestTargetsPerJob {
 					break
 				}
-				ips := resolvedGrid[pi][ii]
+				ips := filterPublicIPv4Candidates(slices.Concat(catalog[def.Code+"-"+g], resolvedGrid[pi][ii]))
 				dlURL := "https://" + def.TOSHost + "/download/test"
 				cands := make([]speedtestCandidate, 0, max(len(ips), 1))
 				if len(ips) > 0 {

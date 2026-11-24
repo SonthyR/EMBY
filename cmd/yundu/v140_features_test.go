@@ -217,7 +217,20 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	}
 
 	var dohHits atomic.Int32
+	var catalogHits atomic.Int32
 	dohSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/getNodes" {
+			catalogHits.Add(1)
+			if r.URL.Query().Get("format") != "tsv" || r.URL.Query().Get("scope") != "tos" {
+				t.Error("unexpected TOS catalog query")
+			}
+			_, _ = io.WriteString(w, strings.Join([]string{
+				"tos\t4\t北京\t电信\tnode.example\t127.0.0.1\t443\ttos-cn-beijing.volces.com",
+				"tos\t4\t北京\t电信\tnode.example\t180.213.185.50\t443\ttos-cn-shanghai.volces.com",
+				"tos\t4\t北京\t电信\tnode.example\t180.213.185.21\t443\ttos-cn-beijing.volces.com",
+			}, "\r\n"))
+			return
+		}
 		dohHits.Add(1)
 		w.Header().Set("Content-Type", "application/dns-json")
 		_, _ = io.WriteString(w, `{"Answer":[{"type":1,"data":"180.213.185.21"}]}`)
@@ -225,6 +238,10 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	defer dohSrv.Close()
 	app.speedtest.dohClient = dohSrv.Client()
 	app.speedtest.dohEndpoints = []string{dohSrv.URL}
+	app.speedtest.tosCatalogURL = dohSrv.URL + "/getNodes?format=tsv&scope=tos"
+	if catalog := app.speedtest.loadTOSCatalog(context.Background()); len(catalog["bj-ct"]) != 1 || catalog["bj-ct"][0] != "180.213.185.21" {
+		t.Fatalf("unexpected vetted TOS catalog: %+v", catalog)
+	}
 	if firstIPs := app.speedtest.resolveVolcengineTOSIPs(context.Background(), volcengineTOSBeijingHost, "219.141.136.0/24"); len(firstIPs) != 1 || firstIPs[0] != "180.213.185.21" {
 		t.Fatalf("resolveVolcengineTOSIPs returned %+v", firstIPs)
 	}
@@ -347,7 +364,7 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	mockTransport.TLSClientConfig.RootCAs = pool
 
 	app.speedtest.dohResolver = func(_ context.Context, _ string, _ string) ([]string, error) {
-		return []string{"180.213.185.21", "180.213.185.40"}, nil
+		return []string{"180.213.185.40", "180.213.185.21"}, nil
 	}
 	app.speedtest.targetTransport = mockTransport
 
@@ -383,8 +400,11 @@ func TestSpeedtestMasterAndAgentEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(startRec.Body.Bytes(), &startResp); err != nil {
 		t.Fatalf("decode start resp: %v", err)
 	}
-	if startResp.Job.TotalTargets != 2 {
-		t.Fatalf("master job total_targets=%d, want 2 (1 builtin + 1 custom)", startResp.Job.TotalTargets)
+	if startResp.Job.TotalTargets != 2 || len(startResp.Job.Results) != 2 {
+		t.Fatalf("master job total_targets=%d, results=%d, want 2 (1 builtin + 1 custom)", startResp.Job.TotalTargets, len(startResp.Job.Results))
+	}
+	if catalogHits.Load() != 2 || startResp.Job.Results[0].ResolvedIP != "180.213.185.21" {
+		t.Fatalf("expected the live catalog address before DoH candidates: %+v", startResp.Job.Results)
 	}
 
 	waitSpeedtestJob := func(jobID string) speedtestJobView {
