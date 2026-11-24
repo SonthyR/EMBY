@@ -309,6 +309,7 @@ type EdgeNode struct {
 	PublicURL         string                `json:"public_url"`
 	Status            string                `json:"status"` // online, offline, disabled, quota, waiting
 	InstallCommand    string                `json:"install_command,omitempty"`
+	UninstallCommand  string                `json:"uninstall_command,omitempty"`
 	CreatedAt         string                `json:"created_at"`
 	UpdatedAt         string                `json:"updated_at"`
 }
@@ -1096,6 +1097,10 @@ func (a *App) edgeNodeInstallCommand(nodeID int64, listenPort int, token, origin
 		edgeInstallScriptRawBase, origin, nodeID, token, listenPort)
 }
 
+func edgeNodeUninstallCommand() string {
+	return fmt.Sprintf("bash <(curl -fsSL %s) agent --uninstall", edgeInstallScriptRawBase)
+}
+
 func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (EdgeNode, bool) {
 	if a.pm == nil || a.pm.edges == nil {
 		return EdgeNode{}, false
@@ -1173,8 +1178,11 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 			view.NextResetAt = next.Format("2006-01-02")
 		}
 	}
-	if includeCommand && token != "" {
-		view.InstallCommand = a.edgeNodeInstallCommand(view.ID, listenPort, token, origin)
+	if includeCommand {
+		if token != "" {
+			view.InstallCommand = a.edgeNodeInstallCommand(view.ID, listenPort, token, origin)
+		}
+		view.UninstallCommand = edgeNodeUninstallCommand()
 	}
 	return view, true
 }

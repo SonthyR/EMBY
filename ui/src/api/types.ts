@@ -185,6 +185,7 @@ export interface EdgeNode {
   public_url: string
   status: EdgeNodeStatus
   install_command?: string
+  uninstall_command?: string
   created_at: string
   updated_at: string
 }

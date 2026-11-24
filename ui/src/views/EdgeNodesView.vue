@@ -42,6 +42,9 @@ const errors = reactive<Record<string, string>>({})
 const installOpen = ref(false)
 const installNode = ref<EdgeNode | null>(null)
 const upgradingId = ref<number | null>(null)
+const upgradingAll = ref(false)
+const DEFAULT_UNINSTALL_COMMAND = 'bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent --uninstall'
+const uninstallCommand = computed(() => installNode.value?.uninstall_command || DEFAULT_UNINSTALL_COMMAND)
 
 const STATUS_LABEL: Record<EdgeNodeStatus, string> = {
   online: '在线',
@@ -118,6 +121,12 @@ function isUpgradeBusy(node: EdgeNode): boolean {
   return st === 'pending' || st === 'queued' || st === 'updating' || st === 'restarting'
 }
 
+function isNodeUpgradeable(node: EdgeNode): boolean {
+  return !!(node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node))
+}
+
+const upgradeableNodes = computed(() => nodes.value.filter(isNodeUpgradeable))
+
 async function upgradeNode(node: EdgeNode) {
   const target = node.master_version || '最新版本'
   if (
@@ -137,6 +146,45 @@ async function upgradeNode(node: EdgeNode) {
     toast.error(errorMessage(error, '下发升级指令失败'))
   } finally {
     upgradingId.value = null
+  }
+}
+
+async function upgradeAllNodes() {
+  const targets = [...upgradeableNodes.value]
+  if (!targets.length || upgradingAll.value) return
+  const targetVersion = targets[0]?.master_version || '最新版本'
+  const previewNames = targets
+    .slice(0, 5)
+    .map(n => n.name)
+    .join('、')
+  const suffix = targets.length > 5 ? ` 等 ${targets.length} 台从机` : ''
+  if (
+    !(await confirm({
+      title: `一键升级 ${targets.length} 台从机到 ${targetVersion}？`,
+      message: `将向 ${previewNames}${suffix} 同时下发远程升级指令，升级并重启期间正在播放的视频会短暂中断。`,
+      confirmText: `升级全部（${targets.length} 台）`,
+    }))
+  )
+    return
+  upgradingAll.value = true
+  try {
+    const results = await Promise.allSettled(targets.map(n => edgeApi.upgrade(n.id, n.master_version || '')))
+    const failedNames: string[] = []
+    let succeeded = 0
+    results.forEach((res, idx) => {
+      if (res.status === 'fulfilled') succeeded++
+      else failedNames.push(targets[idx].name)
+    })
+    if (failedNames.length === 0) {
+      toast.success(`已向 ${succeeded} 台从机下发升级指令`)
+    } else if (succeeded > 0) {
+      toast.error(`${succeeded} 台已下发升级，${failedNames.length} 台失败（${failedNames.join('、')}）`)
+    } else {
+      toast.error(`全部 ${failedNames.length} 台下发升级指令失败`)
+    }
+    await load(true)
+  } finally {
+    upgradingAll.value = false
   }
 }
 
@@ -311,6 +359,13 @@ async function copyInstallCommand() {
   else toast.error('复制失败，请手动选中复制')
 }
 
+async function copyUninstallCommand() {
+  const cmd = uninstallCommand.value
+  if (!cmd) return
+  if (await copyText(cmd)) toast.success('一键卸载命令已复制')
+  else toast.error('复制失败，请手动选中复制')
+}
+
 async function toggleEnabled(node: EdgeNode) {
   try {
     await edgeApi.update(node.id, {
@@ -404,6 +459,15 @@ function speedPillTone(mbps: number): string {
 <template>
   <div>
     <PageHeader title="从机" description="添加普通 VPS 或 NAT 小鸡作为轻量媒体中转节点，视频播放自动就近卸载，登录与海报仍由主机接管。">
+      <UiButton
+        v-if="upgradeableNodes.length"
+        variant="accent"
+        :loading="upgradingAll"
+        :disabled="upgradingId !== null"
+        @click="upgradeAllNodes"
+      >
+        <ArrowUpCircle />全部升级（{{ upgradeableNodes.length }}）
+      </UiButton>
       <UiButton @click="openSpeedtest(0)"><Activity />测速中心</UiButton>
       <UiButton variant="primary" @click="openCreate"><Plus />添加从机</UiButton>
     </PageHeader>
@@ -509,10 +573,11 @@ function speedPillTone(mbps: number): string {
 
         <div class="card-actions">
           <UiButton
-            v-if="node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node)"
+            v-if="isNodeUpgradeable(node)"
             size="sm"
             variant="primary"
             :loading="upgradingId === node.id"
+            :disabled="upgradingAll"
             @click="upgradeNode(node)"
           >
             <ArrowUpCircle />升级 {{ node.master_version }}
@@ -520,7 +585,7 @@ function speedPillTone(mbps: number): string {
           <UiButton size="sm" :disabled="!node.online" :title="node.online ? '三网单线程测速' : '从机离线'" @click="openSpeedtest(node.id)">
             <Activity />测速
           </UiButton>
-          <UiButton size="sm" :variant="node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
+          <UiButton size="sm" :variant="isNodeUpgradeable(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
             <Terminal />安装命令
           </UiButton>
           <UiButton size="sm" @click="openEdit(node)"><Pencil />编辑</UiButton>
@@ -627,7 +692,7 @@ function speedPillTone(mbps: number): string {
       </template>
     </UiDrawer>
 
-    <UiDialog :open="installOpen" :title="`部署从机 · ${installNode?.name || ''}`" :width="600" @close="installOpen = false">
+    <UiDialog :open="installOpen" :title="`部署从机 · ${installNode?.name || ''}`" :width="620" @close="installOpen = false">
       <div v-if="installNode" class="install-box">
         <p class="faint">在目标 Linux 服务器（普通 VPS 或 NAT 小鸡均可）以 root 或 sudo 权限执行以下命令：</p>
         <pre class="cmd"><code>{{ installNode.install_command }}</code></pre>
@@ -641,9 +706,18 @@ function speedPillTone(mbps: number): string {
             未填写域名：从机首次心跳会自动上报公网 IP 并生成 <code>http://IP:{{ installNode.public_port }}</code> 接入地址。
           </li>
         </ul>
+
+        <div class="uninstall-section">
+          <div class="uninstall-head">
+            <strong>卸载该从机</strong>
+            <span class="faint">如需停用并彻底清理从机服务与配置，在从机服务器执行：</span>
+          </div>
+          <pre class="cmd cmd-uninstall"><code>{{ uninstallCommand }}</code></pre>
+        </div>
       </div>
       <template #footer>
         <UiButton @click="installOpen = false">关闭</UiButton>
+        <UiButton variant="secondary" @click="copyUninstallCommand"><Copy />复制卸载命令</UiButton>
         <UiButton variant="primary" @click="copyInstallCommand"><Copy />复制安装命令</UiButton>
       </template>
     </UiDialog>
@@ -722,6 +796,10 @@ legend + * { clear: both; }
 .adv-toggle.open .chev { transform: rotate(180deg); }
 .install-box p { margin: 0 0 12px; font-size: 13.5px; }
 .cmd { margin: 0 0 14px; padding: 14px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all; }
+.uninstall-section { margin-top: 18px; padding-top: 16px; border-top: 1px dashed var(--border-strong); }
+.uninstall-head { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; font-size: 12.5px; }
+.uninstall-head strong { font-size: 13px; color: var(--text); }
+.cmd-uninstall { margin-bottom: 0; }
 .tips { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-2); line-height: 1.55; }
 .tips code { font-family: var(--mono); font-size: 12px; padding: 1px 6px; border-radius: 5px; background: var(--surface-2); }
 @media (max-width: 960px) { .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .list { grid-template-columns: 1fr; } }

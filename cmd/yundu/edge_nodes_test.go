@@ -315,8 +315,8 @@ func TestEdgeNodeMasterAgentEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
 		t.Fatalf("decode created node: %v", err)
 	}
-	if created.Status != "waiting" || created.InstallCommand == "" {
-		t.Fatalf("expected waiting node with install_command, got %+v", created)
+	if created.Status != "waiting" || created.InstallCommand == "" || !strings.Contains(created.UninstallCommand, "agent --uninstall") {
+		t.Fatalf("expected waiting node with install_command and uninstall_command, got %+v", created)
 	}
 
 	// Read node plaintext token from runtime to launch real edgeAgent
