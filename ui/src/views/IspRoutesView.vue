@@ -185,7 +185,7 @@ async function toggleGroupBlock(group: ISPRouteGroup, value: boolean) {
 }
 
 function nodeStatusText(node: ISPRouteNode): string {
-  if (node.is_master) return '兜底主机'
+  if (node.is_master) return node.status === 'quota' ? '超额' : '主机'
   switch (node.status) {
     case 'online':
       return '在线'
@@ -203,8 +203,9 @@ function nodeStatusText(node: ISPRouteNode): string {
 }
 
 function nodeStatusClass(node: ISPRouteNode): string {
+  if (node.status === 'quota') return 'warn'
   if (node.is_master || node.status === 'online') return 'good'
-  if (node.status === 'waiting' || node.status === 'quota') return 'warn'
+  if (node.status === 'waiting') return 'warn'
   if (node.status === 'offline') return 'bad'
   return 'muted'
 }
@@ -221,9 +222,40 @@ const speedtestOpen = ref(false)
 
 const STRATEGIES: { key: ISPRouteStrategy; label: string }[] = [
   { key: 'priority', label: '手动优先级' },
-  { key: 'auto', label: '自动择优' },
   { key: 'balance', label: '负载均衡' },
 ]
+
+async function updateNodeBalanceCap(groupKey: string, node: ISPRouteNode, event: Event) {
+  const input = event.target as HTMLInputElement
+  const raw = Number.parseInt(input.value.trim(), 10)
+  if (!Number.isInteger(raw) || raw < 1 || raw > 99) {
+    input.value = String(node.max_balance_streams || 2)
+    toast.error('负载均衡上限应为 1–99 路')
+    return
+  }
+  if (raw === (node.max_balance_streams || 2)) return
+  const group = groups.value.find(g => g.group === groupKey)
+  if (!group || savingGroup.value) return
+  savingGroup.value = groupKey
+  try {
+    const res = await ispRoutesApi.update(
+      groupKey,
+      group.nodes.map(n => ({
+        node_id: n.node_id,
+        enabled: n.enabled,
+        ...(n.node_id === node.node_id ? { max_balance_streams: raw } : {}),
+      })),
+    )
+    groups.value = res.groups || []
+    toast.success(`「${node.name}」负载上限已设为 ${raw} 路`)
+  } catch (error) {
+    input.value = String(node.max_balance_streams || 2)
+    toast.error(errorMessage(error, '保存负载上限失败'))
+    await load(true)
+  } finally {
+    savingGroup.value = null
+  }
+}
 
 function hasSpeedMetrics(group: ISPRouteGroup): boolean {
   return group.nodes.some(n => (n.speed_metric?.avg_return_bps || 0) > 0)
@@ -307,7 +339,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 
 <template>
   <div class="routes-page">
-    <PageHeader title="线路" description="按访问者运营商智能分流媒体播放流：支持手动优先级、基于单线程测速的自动择优与负载均衡。">
+    <PageHeader title="线路" description="按访问者运营商智能分流媒体播放流：支持手动优先级与按排序阶梯填满的负载均衡。">
       <UiButton @click="speedtestOpen = true"><Activity />单线程测速</UiButton>
       <UiButton @click="load()"><RefreshCw />刷新</UiButton>
     </PageHeader>
@@ -391,11 +423,8 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                 <ArrowDownWideNarrow />按速度排序
               </UiButton>
             </div>
-            <p v-if="!group.block_connect && group.strategy === 'auto'" class="strategy-hint faint">
-              自动择优：仅在已启用且在线的从机间按实测回程速率、重传率与负载选优，主机仅作全从机不可用时的兜底。
-            </p>
-            <p v-else-if="!group.block_connect && group.strategy === 'balance'" class="strategy-hint faint">
-              负载均衡：仅在已启用且在线的从机间按最低活跃连接数与轮询均衡分发，主机仅作全从机不可用时的兜底。
+            <p v-if="!group.block_connect && group.strategy === 'balance'" class="strategy-hint faint">
+              负载均衡：按拖拽顺序依次填满每台播放路数上限（1 台观看设备计 1 路，全站共享单机上限），全满后按排序轮流顺延；主机开启开关即平等参与。
             </p>
 
             <TransitionGroup name="list" tag="ul" class="node-list" :class="{ dimmed: group.block_connect }">
@@ -449,6 +478,28 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                   >
                     <ArrowUpToLine />
                   </button>
+                  <label
+                    v-if="group.strategy === 'balance'"
+                    class="cap-pill"
+                    title="该节点全局负载均衡流数上限（1–99 路，1 台观看设备计 1 路；修改后所有线路组同步生效）"
+                    @pointerdown.stop
+                    @click.stop
+                  >
+                    <span class="cap-cur num">{{ node.active_sessions || 0 }}/</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="99"
+                      step="1"
+                      inputmode="numeric"
+                      class="cap-input num"
+                      :value="node.max_balance_streams || 2"
+                      :disabled="!!savingGroup"
+                      aria-label="负载均衡流数上限"
+                      @change="updateNodeBalanceCap(group.group, node, $event)"
+                    />
+                    <span class="cap-unit">路</span>
+                  </label>
                   <UiSwitch
                     :model-value="node.enabled"
                     :disabled="!!savingGroup"
@@ -673,6 +724,13 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .status-dot.bad { color: var(--bad); }
 
 .node-ctrl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.cap-pill { display: inline-flex; align-items: center; gap: 2px; height: 26px; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); font-size: 11.5px; color: var(--text-2); cursor: default; }
+.cap-pill:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.cap-cur { color: var(--text-3); font-weight: 600; }
+.cap-input { width: 32px; border: 0; background: transparent; color: var(--text); font-size: 12px; font-weight: 700; text-align: center; outline: none; padding: 0; -moz-appearance: textfield; }
+.cap-input::-webkit-outer-spin-button,
+.cap-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.cap-unit { color: var(--text-3); }
 .icon-btn { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .icon-btn:hover { background: var(--surface); color: var(--accent); }
 .icon-btn svg { width: 14px; height: 14px; }

@@ -272,7 +272,7 @@ func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *Proxy
 	filename := sanitizeEdgeFilename(targetURL.Path)
 	redirectURL := strings.TrimRight(decision.PublicURL, "/") + edgeTicketPathPrefix + sealed + "/" + filename
 	if pm != nil && pm.shares != nil && shareTokenHash != "" {
-		pm.shares.markEdgePlayback(shareTokenHash, decision.NodeName)
+		pm.shares.markEdgePlayback(shareTokenHash, decision.NodeID, decision.NodeName)
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("X-Yundu-Edge-Node", decision.NodeName)
@@ -308,9 +308,12 @@ func tryRedirectToEdgeNode(
 		}
 		decision = edgeCtx.edgeFullDecision
 	} else {
-		decision = pm.edges.selectNodeForDispatch(clientIP)
+		decision = pm.edges.selectNodeForSessionDispatch(clientIP, shareTokenHash)
 	}
 	if decision.NodeID <= 0 {
+		if decision.NodeID == 0 && pm != nil && pm.shares != nil && shareTokenHash != "" {
+			pm.shares.markMasterPlayback(shareTokenHash, decision.NodeName)
+		}
 		return false
 	}
 	upstream := target
@@ -362,9 +365,12 @@ func tryRedirectDynamicResourceToEdgeNode(
 		}
 		decision = edgeCtx.edgeFullDecision
 	} else {
-		decision = pm.edges.selectNodeForDispatch(edgeCtx.clientIP)
+		decision = pm.edges.selectNodeForSessionDispatch(edgeCtx.clientIP, edgeCtx.shareTokenHash)
 	}
 	if decision.NodeID <= 0 {
+		if decision.NodeID == 0 && pm != nil && pm.shares != nil && edgeCtx.shareTokenHash != "" {
+			pm.shares.markMasterPlayback(edgeCtx.shareTokenHash, decision.NodeName)
+		}
 		return false
 	}
 	extraKeys := make([]string, 0, len(requiredHeaders))

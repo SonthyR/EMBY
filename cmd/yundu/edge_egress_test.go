@@ -394,7 +394,7 @@ func TestEdgeFullSingleIPFullChainLifecycle(t *testing.T) {
 	// Step 2: Simulate active playback on Edge-1 and change CT ISP priority to Edge-2 first!
 	// Because Alice's session is actively watching on Edge-1, subsequent API + genuine 404 +
 	// video 307 + WebSocket MUST stay pinned on Edge-1 without interrupting playback!
-	pm.shares.markEdgePlayback(shareTokenHash("tok-strict-1"), "Edge-1")
+	pm.shares.markEdgePlayback(shareTokenHash("tok-strict-1"), edge1ID, "Edge-1")
 	setCTOrder(edge2ID, edge1ID)
 
 	// 2a. Metadata API -> Edge-1

@@ -176,6 +176,8 @@ type shareSessionActivity struct {
 	activeStreams  int
 	playing        bool
 	lastPlaybackAt time.Time
+	lastNodeID     int64
+	hasNode        bool
 	lastNodeName   string
 	draining       bool
 	drainingSince  time.Time
@@ -953,6 +955,8 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 				act.playing = false
 				if act.activeStreams == 0 {
 					act.lastPlaybackAt = time.Time{}
+					act.hasNode = false
+					act.lastNodeID = 0
 				}
 				if act.draining {
 					revokeNow = true
@@ -1093,7 +1097,7 @@ func (rt *shareUserRuntime) effectiveSpeedLimitMbps(user *shareUserState) int {
 	return limit
 }
 
-func (rt *shareUserRuntime) markEdgePlayback(tokenHash, nodeName string) {
+func (rt *shareUserRuntime) markEdgePlayback(tokenHash string, nodeID int64, nodeName string) {
 	if rt == nil || tokenHash == "" {
 		return
 	}
@@ -1106,10 +1110,72 @@ func (rt *shareUserRuntime) markEdgePlayback(tokenHash, nodeName string) {
 	}
 	act.playing = true
 	act.lastPlaybackAt = now
+	act.lastNodeID = nodeID
+	act.hasNode = true
 	if strings.TrimSpace(nodeName) != "" {
 		act.lastNodeName = strings.TrimSpace(nodeName)
 	}
 	rt.mu.Unlock()
+}
+
+func (rt *shareUserRuntime) markMasterPlayback(tokenHash, masterName string) {
+	if rt == nil || tokenHash == "" {
+		return
+	}
+	now := time.Now()
+	rt.mu.Lock()
+	act := rt.activity[tokenHash]
+	if act == nil {
+		act = &shareSessionActivity{}
+		rt.activity[tokenHash] = act
+	}
+	act.playing = true
+	act.lastPlaybackAt = now
+	act.lastNodeID = 0
+	act.hasNode = true
+	if strings.TrimSpace(masterName) != "" {
+		act.lastNodeName = strings.TrimSpace(masterName)
+	}
+	rt.mu.Unlock()
+}
+
+func (rt *shareUserRuntime) activeWatchingSessionNode(tokenHash string, now time.Time) (int64, bool) {
+	if rt == nil || tokenHash == "" {
+		return 0, false
+	}
+	rt.mu.RLock()
+	act := rt.activity[tokenHash]
+	var nodeID int64
+	var ok bool
+	if act != nil && act.isWatching(now) && act.hasNode {
+		nodeID = act.lastNodeID
+		ok = true
+	}
+	rt.mu.RUnlock()
+	return nodeID, ok
+}
+
+// activeWatchingCountsByNode counts active watching device sessions globally
+// per node ID (0 = Master, >0 = Edge). One watching device counts as 1 stream
+// regardless of parallel Range connections opened by clients like Infuse.
+func (rt *shareUserRuntime) activeWatchingCountsByNode(now time.Time, excludeTokenHash string) map[int64]int {
+	counts := make(map[int64]int)
+	if rt == nil {
+		return counts
+	}
+	rt.mu.RLock()
+	for hash, act := range rt.activity {
+		if hash == excludeTokenHash || act == nil || !act.isWatching(now) {
+			continue
+		}
+		if act.hasNode {
+			counts[act.lastNodeID]++
+		} else {
+			counts[0]++
+		}
+	}
+	rt.mu.RUnlock()
+	return counts
 }
 
 func (rt *shareUserRuntime) sessionEgressNodeID(tokenHash string) (int64, bool) {

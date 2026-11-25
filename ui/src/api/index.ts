@@ -315,7 +315,7 @@ export const edgeAutoHttpsApi = {
 
 export const ispRoutesApi = {
   get: () => api.get<ISPRoutesResponse>('/api/isp-routes'),
-  update: (group: string, nodes: { node_id: number; enabled: boolean }[]) =>
+  update: (group: string, nodes: { node_id: number; enabled: boolean; max_balance_streams?: number }[]) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, nodes }),
   setStrategy: (group: string, strategy: ISPRouteStrategy | string) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, strategy }),

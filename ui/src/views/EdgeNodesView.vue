@@ -35,6 +35,7 @@ const masterForm = reactive({
   name: '',
   quota_gb: '',
   traffic_reset_day: 0,
+  max_balance_streams: '2',
   note: '',
 })
 const masterErrors = reactive<Record<string, string>>({})
@@ -50,6 +51,7 @@ const form = reactive({
   enabled: true,
   quota_gb: '',
   traffic_reset_day: 0,
+  max_balance_streams: '2',
   note: '',
 })
 const errors = reactive<Record<string, string>>({})
@@ -314,6 +316,7 @@ function openMasterEdit() {
     name: m.name || '主机',
     quota_gb: m.traffic_quota > 0 ? String(Math.round((m.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: m.traffic_reset_day || 0,
+    max_balance_streams: String(m.max_balance_streams || 2),
     note: m.note || '',
   })
   masterFormOpen.value = true
@@ -333,6 +336,11 @@ async function saveMasterForm() {
     }
   }
 
+  const maxBalance = Number.parseInt(String(masterForm.max_balance_streams).trim(), 10)
+  if (!Number.isInteger(maxBalance) || maxBalance < 1 || maxBalance > 99) {
+    masterErrors.max_balance_streams = '请输入 1–99 的整数'
+  }
+
   if (Object.keys(masterErrors).length) return
 
   const quotaBytes = quotaGB > 0 ? Math.round(quotaGB * GB) : 0
@@ -340,6 +348,7 @@ async function saveMasterForm() {
     name,
     traffic_quota: quotaBytes,
     traffic_reset_day: quotaBytes > 0 ? Number(masterForm.traffic_reset_day) || 0 : 0,
+    max_balance_streams: maxBalance,
     note: masterForm.note.trim(),
   }
 
@@ -394,6 +403,7 @@ function openCreate() {
     enabled: true,
     quota_gb: '',
     traffic_reset_day: 0,
+    max_balance_streams: '2',
     note: '',
   })
   formOpen.value = true
@@ -411,6 +421,7 @@ function openEdit(node: EdgeNode) {
     node.public_ip ||
     (node.listen_port && node.listen_port !== node.public_port) ||
     node.traffic_quota > 0 ||
+    (node.max_balance_streams && node.max_balance_streams !== 2) ||
     node.note
   )
   Object.assign(form, {
@@ -424,6 +435,7 @@ function openEdit(node: EdgeNode) {
     enabled: node.enabled,
     quota_gb: node.traffic_quota > 0 ? String(Math.round((node.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: node.traffic_reset_day || 0,
+    max_balance_streams: String(node.max_balance_streams || 2),
     note: node.note || '',
   })
   formOpen.value = true
@@ -457,6 +469,11 @@ async function saveForm() {
     }
   }
 
+  const maxBalance = Number.parseInt(String(form.max_balance_streams).trim(), 10)
+  if (!Number.isInteger(maxBalance) || maxBalance < 1 || maxBalance > 99) {
+    errors.max_balance_streams = '请输入 1–99 的整数'
+  }
+
   if (Object.keys(errors).length) return
 
   const quotaBytes = quotaGB > 0 ? Math.round(quotaGB * GB) : 0
@@ -471,6 +488,7 @@ async function saveForm() {
     enabled: form.enabled,
     traffic_quota: quotaBytes,
     traffic_reset_day: quotaBytes > 0 ? Number(form.traffic_reset_day) || 0 : 0,
+    max_balance_streams: maxBalance,
     note: form.note.trim(),
   }
 
@@ -870,6 +888,15 @@ function speedPillTone(mbps: number): string {
             </UiField>
           </div>
 
+          <UiField
+            label="负载均衡承载流数（路）"
+            for="mn-balance-cap"
+            :error="masterErrors.max_balance_streams"
+            help="线路设为「负载均衡」时，该节点优先承接的观看设备数（1–99，默认 2）；满额后顺位溢出到下一台节点。"
+          >
+            <input id="mn-balance-cap" v-model="masterForm.max_balance_streams" class="input num" type="number" min="1" max="99" step="1" inputmode="numeric" />
+          </UiField>
+
           <UiField label="备注" for="mn-note">
             <input id="mn-note" v-model="masterForm.note" class="input" maxlength="200" placeholder="可选，例如机房位置、带宽规格" />
           </UiField>
@@ -973,6 +1000,15 @@ function speedPillTone(mbps: number): string {
                 </select>
               </UiField>
             </div>
+
+            <UiField
+              label="负载均衡承载流数（路）"
+              for="en-balance-cap"
+              :error="errors.max_balance_streams"
+              help="线路设为「负载均衡」时，该从机优先承接的观看设备数（1–99，默认 2）；满额后顺位溢出到下一台节点。"
+            >
+              <input id="en-balance-cap" v-model="form.max_balance_streams" class="input num" type="number" min="1" max="99" step="1" inputmode="numeric" />
+            </UiField>
 
             <UiField label="备注" for="en-note">
               <input id="en-note" v-model="form.note" class="input" maxlength="200" placeholder="可选，例如线路说明、机房位置" />

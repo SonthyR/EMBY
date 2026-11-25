@@ -509,6 +509,12 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	delete(rt.dirtyClientIP, tokenHash)
 	if act := rt.activity[tokenHash]; act != nil {
 		act.lastNodeName = newNodeName
+		if eval.targetLockedID > 0 {
+			act.lastNodeID = eval.targetLockedID
+		} else {
+			act.lastNodeID = 0
+		}
+		act.hasNode = true
 	}
 	rt.mu.Unlock()
 

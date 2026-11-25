@@ -15,9 +15,25 @@ import (
 )
 
 const (
-	defaultMasterNodeName     = "主机"
-	masterBandwidthSampleTick = 5 * time.Second
+	defaultMasterNodeName        = "主机"
+	masterBandwidthSampleTick    = 5 * time.Second
+	defaultNodeMaxBalanceStreams = 2
+	minNodeMaxBalanceStreams     = 1
+	maxNodeMaxBalanceStreams     = 99
 )
+
+func normalizeMaxBalanceStreams(v int) int {
+	if v <= 0 {
+		return defaultNodeMaxBalanceStreams
+	}
+	if v < minNodeMaxBalanceStreams {
+		return minNodeMaxBalanceStreams
+	}
+	if v > maxNodeMaxBalanceStreams {
+		return maxNodeMaxBalanceStreams
+	}
+	return v
+}
 
 const masterNodeSchemaSQL = `
 CREATE TABLE IF NOT EXISTS master_node_settings (
@@ -28,14 +44,26 @@ CREATE TABLE IF NOT EXISTS master_node_settings (
 	traffic_reset_day INTEGER NOT NULL DEFAULT 0,
 	traffic_reset_period TEXT NOT NULL DEFAULT '',
 	note TEXT NOT NULL DEFAULT '',
+	max_balance_streams INTEGER NOT NULL DEFAULT 2,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 INSERT OR IGNORE INTO master_node_settings (id) VALUES (1);
 `
 
 func ensureMasterNodeSchema(ctx context.Context, conn *sql.Conn) error {
-	_, err := conn.ExecContext(ctx, masterNodeSchemaSQL)
-	return err
+	if _, err := conn.ExecContext(ctx, masterNodeSchemaSQL); err != nil {
+		return err
+	}
+	var exists int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('master_node_settings') WHERE name='max_balance_streams'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE master_node_settings ADD COLUMN max_balance_streams INTEGER NOT NULL DEFAULT 2`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type masterNodeState struct {
@@ -45,6 +73,7 @@ type masterNodeState struct {
 	resetDay            int
 	resetPeriod         string
 	note                string
+	maxBalanceStreams   int
 	latencies           map[int64]int
 	currentBps          int64
 	alertQuota80Period  string
@@ -56,10 +85,11 @@ type masterNodeState struct {
 }
 
 type MasterNodeInput struct {
-	Name         string `json:"name"`
-	TrafficQuota int64  `json:"traffic_quota"`
-	ResetDay     int    `json:"traffic_reset_day"`
-	Note         string `json:"note"`
+	Name              string `json:"name"`
+	TrafficQuota      int64  `json:"traffic_quota"`
+	ResetDay          int    `json:"traffic_reset_day"`
+	MaxBalanceStreams int    `json:"max_balance_streams"`
+	Note              string `json:"note"`
 }
 
 func (m *masterNodeState) displayName() string {
@@ -207,15 +237,16 @@ func runMasterNodeMonitor(ctx context.Context, rt *edgeNodeRuntime) {
 func (a *App) buildMasterNodeView(origin string) EdgeNode {
 	now := time.Now()
 	var (
-		name         = defaultMasterNodeName
-		quota        int64
-		used         int64
-		resetDay     int
-		note         string
-		currentBps   int64
-		status       = "online"
-		rawLatencies map[int64]int
-		speedMetrics []edgeNodeSpeedMetric
+		name              = defaultMasterNodeName
+		quota             int64
+		used              int64
+		resetDay          int
+		note              string
+		maxBalanceStreams = defaultNodeMaxBalanceStreams
+		currentBps        int64
+		status            = "online"
+		rawLatencies      map[int64]int
+		speedMetrics      []edgeNodeSpeedMetric
 	)
 	if a != nil && a.pm != nil && a.pm.edges != nil {
 		a.pm.edges.mu.RLock()
@@ -224,6 +255,7 @@ func (a *App) buildMasterNodeView(origin string) EdgeNode {
 		used = a.pm.edges.master.totalUsed()
 		resetDay = a.pm.edges.master.resetDay
 		note = a.pm.edges.master.note
+		maxBalanceStreams = normalizeMaxBalanceStreams(a.pm.edges.master.maxBalanceStreams)
 		currentBps = max(int64(0), a.pm.edges.master.currentBps)
 		status = a.pm.edges.master.status()
 		if len(a.pm.edges.master.latencies) > 0 {
@@ -284,6 +316,7 @@ func (a *App) buildMasterNodeView(origin string) EdgeNode {
 		TrafficUsed:       used,
 		ResetDay:          resetDay,
 		NextResetAt:       nextResetAt,
+		MaxBalanceStreams: maxBalanceStreams,
 		Note:              note,
 		UpstreamLatencies: latViews,
 		SpeedMetrics:      speedMetrics,
@@ -304,6 +337,9 @@ func normalizeMasterNodeInput(input MasterNodeInput) (MasterNodeInput, error) {
 	}
 	if input.ResetDay < 0 || input.ResetDay > 28 {
 		return input, errors.New("每月重置日需在 0–28 之间")
+	}
+	if input.MaxBalanceStreams < 0 || input.MaxBalanceStreams > maxNodeMaxBalanceStreams {
+		return input, errors.New("负载均衡上限应为 1–99 路")
 	}
 	if len(input.Note) > 200 {
 		input.Note = input.Note[:200]
@@ -338,8 +374,8 @@ func (a *App) handleMasterNode(w http.ResponseWriter, r *http.Request) {
 			period, _ = shareResetPeriod(time.Now().In(a.db.shareLocation()), input.ResetDay)
 		}
 		if _, err := a.db.db.Exec(
-			`UPDATE master_node_settings SET name=?, traffic_quota=?, traffic_reset_day=?, traffic_reset_period=?, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
-			input.Name, input.TrafficQuota, input.ResetDay, period, input.Note,
+			`UPDATE master_node_settings SET name=?, traffic_quota=?, traffic_reset_day=?, traffic_reset_period=?, note=?, max_balance_streams=CASE WHEN ? > 0 THEN ? ELSE max_balance_streams END, updated_at=CURRENT_TIMESTAMP WHERE id=1`,
+			input.Name, input.TrafficQuota, input.ResetDay, period, input.Note, input.MaxBalanceStreams, input.MaxBalanceStreams,
 		); err != nil {
 			log.Printf("master node: update settings: %v", err)
 			a.jsonErr(w, http.StatusInternalServerError, "保存主机配置失败")

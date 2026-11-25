@@ -930,7 +930,7 @@ func TestLiveSessionsSingleDeviceKickAndSelfNetwork(t *testing.T) {
 	}
 	hash1 := shareTokenHash(tok1)
 	hash2 := shareTokenHash(tok2)
-	pm.shares.markEdgePlayback(hash2, "香港从机")
+	pm.shares.markEdgePlayback(hash2, 1, "香港从机")
 
 	// 1. GET /api/live-sessions should return both sessions with playing session first + region + node_name
 	liveRec := httptest.NewRecorder()

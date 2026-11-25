@@ -86,8 +86,16 @@ func TestISPRoutingAutoAndBalanceStrategies(t *testing.T) {
 	edgeA, _ := insertTestEdgeNode(t, rt, "HK-CT-Fast", "203.0.113.10", 19090)
 	edgeB, _ := insertTestEdgeNode(t, rt, "JP-CT-Clean", "203.0.113.20", 19090)
 
-	// Persist explicit priority order where Master (0) is #1 so we prove auto/balance never select Master while edges are healthy.
-	body := `{"group":"ct","strategy":"auto","nodes":[{"node_id":0,"enabled":true},{"node_id":1,"enabled":true},{"node_id":2,"enabled":true}]}`
+	// Legacy 'auto' strategy is rejected by API (replaced by priority + waterfall balance).
+	autoReq := httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"group":"ct","strategy":"auto"}`))
+	autoRec := httptest.NewRecorder()
+	app.handleISPRoutes(autoRec, autoReq)
+	if autoRec.Code != http.StatusBadRequest {
+		t.Fatalf("PUT strategy=auto status=%d, want 400", autoRec.Code)
+	}
+
+	// Put edgeA #1 (cap 2), edgeB #2 (cap 2), Master disabled for balance testing.
+	body := `{"group":"ct","strategy":"balance","nodes":[{"node_id":1,"enabled":true,"max_balance_streams":2},{"node_id":2,"enabled":true,"max_balance_streams":2},{"node_id":0,"enabled":false}]}`
 	req := httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	app.handleISPRoutes(rec, req)
@@ -95,91 +103,35 @@ func TestISPRoutingAutoAndBalanceStrategies(t *testing.T) {
 		t.Fatalf("PUT /api/isp-routes status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Insert measured speed metrics: edgeA has 800 Mbps, 0 retrans; edgeB has 400 Mbps, 10 retrans.
-	for _, item := range []struct {
-		id      int64
-		bps     int64
-		retrans int
-	}{
-		{id: edgeA, bps: 100_000_000, retrans: 0},
-		{id: edgeB, bps: 50_000_000, retrans: 10},
-	} {
-		if _, err := app.db.db.Exec(
-			`INSERT INTO edge_node_speed_metrics(node_id, isp_group, avg_return_bps, avg_outbound_bps, avg_return_rtt_ms, avg_outbound_rtt_ms, total_retrans, sample_count, tested_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-			item.id, "ct", item.bps, item.bps/2, 45, 50, item.retrans, 3, time.Now().UTC().Format(time.RFC3339),
-		); err != nil {
-			t.Fatalf("insert speed metric: %v", err)
-		}
-	}
-	rt.reloadSpeedMetrics()
-
-	// 1. Auto mode picks highest score (edgeA), ignoring Master at priority #1.
-	dec := rt.selectNodeForIP("1.2.3.4")
-	if dec.ISPGroup != "ct" || dec.NodeID != edgeA {
-		t.Fatalf("auto pick = %+v, want NodeID=%d", dec, edgeA)
-	}
-
-	// 2. When edgeA gets heavily loaded (activeStreams=20 -> 800/(1+1.6)=307 < 384), auto shifts to edgeB.
+	// 1. Waterfall fills edgeA first while activeStreams < 2.
 	rt.mu.Lock()
-	rt.nodes[edgeA].activeStreams = 20
+	rt.nodes[edgeA].activeStreams = 1
+	rt.nodes[edgeB].activeStreams = 0
+	rt.blocked["cm"] = true
 	rt.mu.Unlock()
-	dec = rt.selectNodeForIP("1.2.3.4")
-	if dec.NodeID != edgeB {
-		t.Fatalf("auto under load picked NodeID=%d, want %d", dec.NodeID, edgeB)
+	if blocked, _ := rt.isClientBlocked("1.2.3.4"); blocked {
+		t.Fatalf("unexpected block on ct client")
+	}
+	if d := rt.selectNodeForDispatch("1.2.3.4"); d.NodeID != edgeA {
+		t.Fatalf("waterfall under cap picked NodeID=%d, want %d", d.NodeID, edgeA)
 	}
 
-	// 3. When all enabled edge nodes go offline/disabled, auto falls back to Master (0).
+	// 2. Once edgeA hits cap (2/2), overflow moves to edgeB.
 	rt.mu.Lock()
-	rt.nodes[edgeA].activeStreams = 0
+	rt.nodes[edgeA].activeStreams = 2
+	rt.nodes[edgeB].activeStreams = 0
+	rt.mu.Unlock()
+	if d := rt.selectNodeForDispatch("1.2.3.4"); d.NodeID != edgeB {
+		t.Fatalf("waterfall overflow picked NodeID=%d, want %d", d.NodeID, edgeB)
+	}
+
+	// 3. When all enabled edge nodes go offline/disabled, falls back to Master (0).
+	rt.mu.Lock()
 	rt.nodes[edgeA].lastSeen = time.Now().Add(-2 * time.Minute)
 	rt.nodes[edgeB].enabled = false
 	rt.mu.Unlock()
-	dec = rt.selectNodeForIP("1.2.3.4")
-	if dec.NodeID != 0 {
-		t.Fatalf("auto all-edge-unavailable fallback = NodeID=%d, want 0 (Master)", dec.NodeID)
-	}
-
-	// 4. Switch ct to balance mode via PUT API and restore both edge nodes.
-	balReq := httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"group":"ct","strategy":"balance"}`))
-	balRec := httptest.NewRecorder()
-	app.handleISPRoutes(balRec, balReq)
-	if balRec.Code != http.StatusOK {
-		t.Fatalf("PUT strategy=balance status=%d", balRec.Code)
-	}
-	rt.mu.Lock()
-	rt.nodes[edgeA].lastSeen = time.Now()
-	rt.nodes[edgeA].activeStreams = 0
-	rt.nodes[edgeB].enabled = true
-	rt.nodes[edgeB].lastSeen = time.Now()
-	rt.nodes[edgeB].activeStreams = 0
-	// Enable an unrelated group block so isClientBlocked runs selectNodeForIP before selectNodeForDispatch.
-	rt.blocked["cm"] = true
-	rt.mu.Unlock()
-
-	seen := map[int64]bool{}
-	for i := 0; i < 4; i++ {
-		if blocked, _ := rt.isClientBlocked("1.2.3.4"); blocked {
-			t.Fatalf("unexpected block on ct client")
-		}
-		d := rt.selectNodeForDispatch("1.2.3.4")
-		if d.NodeID == 0 {
-			t.Fatalf("balance picked Master while edge nodes were healthy")
-		}
-		seen[d.NodeID] = true
-	}
-	if !seen[edgeA] || !seen[edgeB] {
-		t.Fatalf("balance should distribute across both edge nodes even with block policy active, got %+v", seen)
-	}
-
-	// With unequal activeStreams, balance prefers least activeStreams edge node.
-	rt.mu.Lock()
-	rt.nodes[edgeA].activeStreams = 6
-	rt.nodes[edgeB].activeStreams = 1
-	rt.mu.Unlock()
-	for i := 0; i < 3; i++ {
-		if d := rt.selectNodeForDispatch("1.2.3.4"); d.NodeID != edgeB {
-			t.Fatalf("balance with unequal streams picked %d, want %d", d.NodeID, edgeB)
-		}
+	if dec := rt.selectNodeForIP("1.2.3.4"); dec.NodeID != 0 {
+		t.Fatalf("all-edge-unavailable fallback = NodeID=%d, want 0 (Master)", dec.NodeID)
 	}
 
 	// Reload from DB confirms strategy survived reload.

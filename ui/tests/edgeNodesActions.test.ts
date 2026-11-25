@@ -200,6 +200,7 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
       name: '美国主机',
       traffic_quota: 0,
       traffic_reset_day: 0,
+      max_balance_streams: 2,
       note: '',
     })
     expect(wrapper.find('article.card.master h3').text()).toBe('美国主机')

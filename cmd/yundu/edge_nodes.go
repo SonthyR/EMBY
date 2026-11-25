@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -47,7 +46,6 @@ const (
 	edgeInstallScriptRawBase = "https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh"
 	ispSettingNonMainlandKey = "_non_mainland"
 	ispStrategyPriority      = "priority"
-	ispStrategyAuto          = "auto"
 	ispStrategyBalance       = "balance"
 	speedtestMetricMaxAge    = 30 * 24 * time.Hour
 )
@@ -55,7 +53,7 @@ const (
 func normalizeISPStrategy(raw string) (string, bool) {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	switch s {
-	case ispStrategyPriority, ispStrategyAuto, ispStrategyBalance:
+	case ispStrategyPriority, ispStrategyBalance:
 		return s, true
 	default:
 		return ispStrategyPriority, false
@@ -113,6 +111,7 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		{"edge_nodes", "cf_record_ip", `ALTER TABLE edge_nodes ADD COLUMN cf_record_ip TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "cf_dns_status", `ALTER TABLE edge_nodes ADD COLUMN cf_dns_status TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "sort_order", `ALTER TABLE edge_nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`},
+		{"edge_nodes", "max_balance_streams", `ALTER TABLE edge_nodes ADD COLUMN max_balance_streams INTEGER NOT NULL DEFAULT 2`},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+col.table+"') WHERE name=?", col.name).Scan(&exists); err != nil {
@@ -143,6 +142,10 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		}
 	}
 	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect, strategy) VALUES(?, 0, 'priority')`, ispSettingNonMainlandKey); err != nil {
+		return err
+	}
+	// Migrate legacy removed 'auto' strategy to 'priority'.
+	if _, err := conn.ExecContext(ctx, `UPDATE isp_group_settings SET strategy='priority' WHERE strategy='auto'`); err != nil {
 		return err
 	}
 	if err := ensureMasterNodeSchema(ctx, conn); err != nil {
@@ -405,6 +408,7 @@ type EdgeNode struct {
 	TrafficUsed       int64                 `json:"traffic_used"`
 	ResetDay          int                   `json:"traffic_reset_day"`
 	NextResetAt       string                `json:"next_reset_at,omitempty"`
+	MaxBalanceStreams int                   `json:"max_balance_streams"`
 	Note              string                `json:"note"`
 	AgentVersion      string                `json:"agent_version"`
 	MasterVersion     string                `json:"master_version,omitempty"`
@@ -437,9 +441,10 @@ type EdgeNodeInput struct {
 	TLSMode      string `json:"tls_mode"`
 	AutoHTTPS    bool   `json:"auto_https"`
 	Enabled      *bool  `json:"enabled"`
-	TrafficQuota int64  `json:"traffic_quota"`
-	ResetDay     int    `json:"traffic_reset_day"`
-	Note         string `json:"note"`
+	TrafficQuota      int64  `json:"traffic_quota"`
+	ResetDay          int    `json:"traffic_reset_day"`
+	MaxBalanceStreams int    `json:"max_balance_streams"`
+	Note              string `json:"note"`
 }
 
 type edgeNodeLiveState struct {
@@ -463,6 +468,7 @@ type edgeNodeLiveState struct {
 	persistedUsed       int64
 	resetDay            int
 	resetPeriod         string
+	maxBalanceStreams   int
 	note                string
 	agentVersion        string
 	lastSeen            time.Time
@@ -664,28 +670,28 @@ func (rt *edgeNodeRuntime) reload() error {
 	if rt == nil || rt.db == nil {
 		return nil
 	}
-	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, auto_https, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY id`)
+	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, auto_https, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, max_balance_streams, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return err
 	}
 	type loadedNode struct {
-		id, quota, used                  int64
-		totalIn, totalOut                int64
-		publicPort, listenPort, resetDay int
-		name, publicHost, publicIP       string
-		detectedIP, tlsMode              string
-		autoHTTPS                        bool
-		cfRecordID, cfRecordType         string
-		cfRecordIP, cfDNSStatus          string
-		tokenHash, tokenCipher           string
-		resetPeriod, note, version, seen string
-		enabled                          bool
+		id, quota, used                              int64
+		totalIn, totalOut                            int64
+		publicPort, listenPort, resetDay, maxBalance int
+		name, publicHost, publicIP                   string
+		detectedIP, tlsMode                          string
+		autoHTTPS                                    bool
+		cfRecordID, cfRecordType                     string
+		cfRecordIP, cfDNSStatus                      string
+		tokenHash, tokenCipher                       string
+		resetPeriod, note, version, seen             string
+		enabled                                      bool
 	}
 	var list []loadedNode
 	for rows.Next() {
 		var item loadedNode
 		var enabled, autoHTTPSInt int
-		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &autoHTTPSInt, &item.cfRecordID, &item.cfRecordType, &item.cfRecordIP, &item.cfDNSStatus, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
+		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &autoHTTPSInt, &item.cfRecordID, &item.cfRecordType, &item.cfRecordIP, &item.cfDNSStatus, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.maxBalance, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
 			rows.Close()
 			return err
 		}
@@ -757,10 +763,11 @@ func (rt *edgeNodeRuntime) reload() error {
 		mUsed        int64
 		mResetDay    int
 		mResetPeriod string
+		mMaxBalance  = defaultNodeMaxBalanceStreams
 		mNote        string
 	)
-	_ = rt.db.db.QueryRow(`SELECT name, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note FROM master_node_settings WHERE id=1`).
-		Scan(&mName, &mQuota, &mUsed, &mResetDay, &mResetPeriod, &mNote)
+	_ = rt.db.db.QueryRow(`SELECT name, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, max_balance_streams, note FROM master_node_settings WHERE id=1`).
+		Scan(&mName, &mQuota, &mUsed, &mResetDay, &mResetPeriod, &mMaxBalance, &mNote)
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -772,6 +779,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	rt.master.persistedUsed = mUsed
 	rt.master.resetDay = mResetDay
 	rt.master.resetPeriod = mResetPeriod
+	rt.master.maxBalanceStreams = normalizeMaxBalanceStreams(mMaxBalance)
 	rt.master.note = mNote
 	seen := make(map[int64]bool, len(list))
 	for _, item := range list {
@@ -808,6 +816,7 @@ func (rt *edgeNodeRuntime) reload() error {
 		state.persistedTotalOut = item.totalOut
 		state.resetDay = item.resetDay
 		state.resetPeriod = item.resetPeriod
+		state.maxBalanceStreams = normalizeMaxBalanceStreams(item.maxBalance)
 		state.note = item.note
 		if state.agentVersion == "" {
 			state.agentVersion = item.version
@@ -956,68 +965,6 @@ func (rt *edgeNodeRuntime) strategyForGroupLocked(group string) string {
 	return ispStrategyPriority
 }
 
-func (rt *edgeNodeRuntime) autoScoreForNodeLocked(node *edgeNodeLiveState, group string, now time.Time) (score float64, hasMetric bool) {
-	if node == nil {
-		return 0, false
-	}
-	if byGroup := rt.speedMetrics[node.id]; byGroup != nil {
-		if m, ok := byGroup[group]; ok && m.AvgReturnBps > 0 {
-			if m.TestedAt != "" {
-				if parsed, err := time.Parse(time.RFC3339, m.TestedAt); err != nil || now.Sub(parsed) > speedtestMetricMaxAge {
-					return 0, false
-				}
-			}
-			mbps := float64(m.AvgReturnBps) * 8.0 / 1_000_000.0
-			var avgRetrans float64
-			if m.TotalRetrans > 0 {
-				avgRetrans = float64(m.TotalRetrans) / float64(max(1, m.SampleCount))
-			}
-			retransFactor := 1.0 - math.Min(0.40, avgRetrans*0.015)
-			loadFactor := 1.0 / (1.0 + 0.08*float64(max(0, node.activeStreams)))
-			return mbps * retransFactor * loadFactor, true
-		}
-	}
-	return 0, false
-}
-
-func (rt *edgeNodeRuntime) pickAutoEdgeCandidateLocked(group string, candidates []*edgeNodeLiveState, seq uint64, now time.Time) *edgeNodeLiveState {
-	if len(candidates) == 0 {
-		return nil
-	}
-	n := uint64(len(candidates))
-	var chosen *edgeNodeLiveState
-	var bestHasMetric bool
-	var bestScore float64
-	bestStreams := -1
-	for i := 0; i < len(candidates); i++ {
-		cand := candidates[(seq+uint64(i))%n]
-		score, hasMetric := rt.autoScoreForNodeLocked(cand, group, now)
-		better := false
-		if chosen == nil {
-			better = true
-		} else if hasMetric && !bestHasMetric {
-			better = true
-		} else if hasMetric == bestHasMetric {
-			if hasMetric {
-				if score > bestScore+0.01 {
-					better = true
-				} else if math.Abs(score-bestScore) <= 0.01 && cand.activeStreams < bestStreams {
-					better = true
-				}
-			} else if cand.activeStreams < bestStreams {
-				better = true
-			}
-		}
-		if better {
-			chosen = cand
-			bestHasMetric = hasMetric
-			bestScore = score
-			bestStreams = cand.activeStreams
-		}
-	}
-	return chosen
-}
-
 type edgeRouteDecision struct {
 	ISPGroup      string
 	ISPLabel      string
@@ -1049,15 +996,88 @@ func (rt *edgeNodeRuntime) isClientBlocked(clientIP string) (bool, string) {
 	return decision.Blocked, decision.BlockReason
 }
 
-// selectNodeForIP picks the highest-priority online node for the client IP's ISP
-// without mutating round-robin dispatch state (safe for policy checks and diagnostics).
-func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
-	return rt.selectNodeForIPInternal(clientIP, false)
+// balanceCandidate represents a routable node (Master = 0 or Edge > 0) in exact
+// user-configured drag-sort order within an ISP group.
+type balanceCandidate struct {
+	nodeID            int64
+	name              string
+	publicURL         string
+	token             string
+	maxBalanceStreams int
+	fallbackStreams   int
 }
 
-// selectNodeForDispatch picks a node for live media playback and advances round-robin state.
+// pickBalanceCandidateLocked selects a node in Waterfall + Ordered Overflow order:
+//  1. Sticky: if the watching device session already has an assigned node that is
+//     still in candidates, keep it on that node.
+//  2. Phase 1 (Waterfall fill): scan candidates #1 -> #N in drag-sort order and pick
+//     the first node whose active watching session count < maxBalanceStreams.
+//  3. Phase 2 (All full -> Ordered overflow): pick the node with the smallest
+//     excess (activeSessions - maxBalanceStreams), breaking ties strictly by #1 -> #N
+//     order (e.g. for 3 nodes capped at 2: #7->#1, #8->#2, #9->#3, #10->#1).
+func pickBalanceCandidateLocked(
+	candidates []balanceCandidate,
+	watchingCounts map[int64]int,
+	hasShareCounts bool,
+	stickyNodeID int64,
+	hasSticky bool,
+) *balanceCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if hasSticky {
+		for i := range candidates {
+			if candidates[i].nodeID == stickyNodeID {
+				return &candidates[i]
+			}
+		}
+	}
+	loadFor := func(c balanceCandidate) int {
+		if hasShareCounts && len(watchingCounts) > 0 {
+			return watchingCounts[c.nodeID]
+		}
+		if hasShareCounts && watchingCounts[c.nodeID] > 0 {
+			return watchingCounts[c.nodeID]
+		}
+		return c.fallbackStreams
+	}
+	// Phase 1: fill each node in drag-sort order up to its cap.
+	for i := range candidates {
+		capStreams := normalizeMaxBalanceStreams(candidates[i].maxBalanceStreams)
+		if loadFor(candidates[i]) < capStreams {
+			return &candidates[i]
+		}
+	}
+	// Phase 2: all nodes are at/above cap; distribute evenly in #1 -> #N order.
+	bestIdx := 0
+	bestExcess := loadFor(candidates[0]) - normalizeMaxBalanceStreams(candidates[0].maxBalanceStreams)
+	for i := 1; i < len(candidates); i++ {
+		excess := loadFor(candidates[i]) - normalizeMaxBalanceStreams(candidates[i].maxBalanceStreams)
+		if excess < bestExcess {
+			bestExcess = excess
+			bestIdx = i
+		}
+	}
+	return &candidates[bestIdx]
+}
+
+// selectNodeForIP picks the highest-priority / next-balanced online node for the
+// client IP's ISP without mutating any session or round-robin state (safe for
+// policy checks and diagnostics).
+func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
+	return rt.selectNodeForIPInternal(clientIP, "", false)
+}
+
+// selectNodeForDispatch picks a node for live media playback when no share token
+// is present (e.g. direct admin playback or tests).
 func (rt *edgeNodeRuntime) selectNodeForDispatch(clientIP string) edgeRouteDecision {
-	return rt.selectNodeForIPInternal(clientIP, true)
+	return rt.selectNodeForIPInternal(clientIP, "", true)
+}
+
+// selectNodeForSessionDispatch picks a node for a share-user playback session,
+// respecting active watching session stickiness and global per-node session caps.
+func (rt *edgeNodeRuntime) selectNodeForSessionDispatch(clientIP, shareTokenHash string) edgeRouteDecision {
+	return rt.selectNodeForIPInternal(clientIP, shareTokenHash, true)
 }
 
 // nodeDecisionByID returns a routable edge decision for a specific node ID.
@@ -1103,7 +1123,7 @@ func (rt *edgeNodeRuntime) lookupISPGroup(clientIP string) string {
 	return ispGroupOther
 }
 
-func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool, now time.Time) (edgeRouteDecision, int64) {
+func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, watchingCounts map[int64]int, hasShareCounts bool, now time.Time) (edgeRouteDecision, int64) {
 	decision := edgeRouteDecision{
 		ISPGroup: group,
 		ISPLabel: ispGroupLabel(group),
@@ -1112,45 +1132,45 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool
 	}
 	rules := rt.routes[group]
 	strategy := rt.strategyForGroupLocked(group)
-	if strategy == ispStrategyAuto || strategy == ispStrategyBalance {
-		var candidates []*edgeNodeLiveState
+	if strategy == ispStrategyBalance {
+		candidates := make([]balanceCandidate, 0, len(rules))
 		for _, rule := range rules {
-			if !rule.Enabled || rule.NodeID <= 0 {
+			if !rule.Enabled {
+				continue
+			}
+			if rule.NodeID == 0 {
+				if rt.masterQuotaExceededLocked() {
+					continue
+				}
+				candidates = append(candidates, balanceCandidate{
+					nodeID:            0,
+					name:              decision.NodeName,
+					maxBalanceStreams: rt.master.maxBalanceStreams,
+					fallbackStreams:   watchingCounts[0],
+				})
 				continue
 			}
 			node := rt.nodes[rule.NodeID]
 			if node != nil && node.routableAt(now) && node.supportsEgressControl() {
-				candidates = append(candidates, node)
+				candidates = append(candidates, balanceCandidate{
+					nodeID:            node.id,
+					name:              node.name,
+					publicURL:         node.publicURL(),
+					token:             node.tokenPlain,
+					maxBalanceStreams: node.maxBalanceStreams,
+					fallbackStreams:   node.activeStreams,
+				})
 			}
 		}
-		if len(candidates) > 0 {
-			var seq uint64
-			if advanceRR {
-				if ctr := rt.rrCounters[group]; ctr != nil {
-					seq = ctr.Add(1) - 1
-				}
+		if chosen := pickBalanceCandidateLocked(candidates, watchingCounts, hasShareCounts, 0, false); chosen != nil {
+			if chosen.nodeID == 0 {
+				return decision, -1
 			}
-			n := uint64(len(candidates))
-			var chosen *edgeNodeLiveState
-			if strategy == ispStrategyBalance {
-				bestStreams := -1
-				for i := 0; i < len(candidates); i++ {
-					cand := candidates[(seq+uint64(i))%n]
-					if chosen == nil || cand.activeStreams < bestStreams {
-						chosen = cand
-						bestStreams = cand.activeStreams
-					}
-				}
-			} else {
-				chosen = rt.pickAutoEdgeCandidateLocked(group, candidates, seq, now)
-			}
-			if chosen != nil {
-				decision.NodeID = chosen.id
-				decision.NodeName = chosen.name
-				decision.PublicURL = chosen.publicURL()
-				decision.Token = chosen.tokenPlain
-				return decision, chosen.id
-			}
+			decision.NodeID = chosen.nodeID
+			decision.NodeName = chosen.name
+			decision.PublicURL = chosen.publicURL
+			decision.Token = chosen.token
+			return decision, chosen.nodeID
 		}
 		return decision, -1
 	}
@@ -1181,15 +1201,21 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool
 
 // selectEgressDecision picks the best online egress-capable node (or master = -1)
 // for a client IP in edge_full mode.
-func (rt *edgeNodeRuntime) selectEgressDecision(clientIP string, advanceRR bool) (edgeRouteDecision, int64) {
+func (rt *edgeNodeRuntime) selectEgressDecision(clientIP string, _ bool) (edgeRouteDecision, int64) {
 	group := rt.lookupISPGroup(clientIP)
 	if rt == nil {
 		return edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: defaultMasterNodeName}, -1
 	}
 	now := time.Now()
+	var watchingCounts map[int64]int
+	hasShareCounts := false
+	if rt.pm != nil && rt.pm.shares != nil {
+		watchingCounts = rt.pm.shares.activeWatchingCountsByNode(now, "")
+		hasShareCounts = true
+	}
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	return rt.selectEgressTargetLocked(group, advanceRR, now)
+	return rt.selectEgressTargetLocked(group, watchingCounts, hasShareCounts, now)
 }
 
 type edgeHandoffEval struct {
@@ -1219,13 +1245,19 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 		return eval
 	}
 	now := time.Now()
+	var watchingCounts map[int64]int
+	hasShareCounts := false
+	if rt.pm != nil && rt.pm.shares != nil {
+		watchingCounts = rt.pm.shares.activeWatchingCountsByNode(now, "")
+		hasShareCounts = true
+	}
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	eval.targetDecision.NodeName = rt.masterDisplayNameLocked()
 
 	eval.strategy = rt.strategyForGroupLocked(group)
 	if currentNodeID < 0 {
-		eval.currentRoutable = true
+		eval.currentRoutable = !rt.masterQuotaExceededLocked()
 	} else if currentNodeID > 0 {
 		node := rt.nodes[currentNodeID]
 		eval.currentRoutable = node != nil && node.routableAt(now) && node.supportsEgressControl()
@@ -1242,10 +1274,8 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 		}
 	}
 
-	// Pick best target without advancing RR unless we actually hand off; for
-	// balance/auto on a brand-new ISP we still advance when picking a fresh node.
 	ispChanged := currentISPGroup != "" && group != currentISPGroup
-	eval.targetDecision, eval.targetLockedID = rt.selectEgressTargetLocked(group, ispChanged || !eval.currentRoutable, now)
+	eval.targetDecision, eval.targetLockedID = rt.selectEgressTargetLocked(group, watchingCounts, hasShareCounts, now)
 
 	if currentNodeID == 0 || eval.targetLockedID == currentNodeID {
 		return eval
@@ -1275,7 +1305,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 	return eval
 }
 
-func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bool) edgeRouteDecision {
+func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash string, _ bool) edgeRouteDecision {
 	decision := edgeRouteDecision{
 		ISPGroup: ispGroupOther,
 		ISPLabel: ispGroupLabel(ispGroupOther),
@@ -1298,6 +1328,19 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 		decision.NonMainlandCN = res.NonMainlandCN
 	}
 	now := time.Now()
+	// Fetch share watching counts & session stickiness BEFORE acquiring rt.mu
+	// to guarantee zero lock inversion between edges.mu and shares.mu.
+	var watchingCounts map[int64]int
+	var hasShareCounts bool
+	var stickyNodeID int64
+	var hasSticky bool
+	if rt.pm != nil && rt.pm.shares != nil {
+		watchingCounts = rt.pm.shares.activeWatchingCountsByNode(now, shareTokenHash)
+		hasShareCounts = true
+		if shareTokenHash != "" {
+			stickyNodeID, hasSticky = rt.pm.shares.activeWatchingSessionNode(shareTokenHash, now)
+		}
+	}
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	masterName := rt.masterDisplayNameLocked()
@@ -1320,47 +1363,44 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 	}
 	rules := rt.routes[decision.ISPGroup]
 	strategy := rt.strategyForGroupLocked(decision.ISPGroup)
-	if strategy == ispStrategyAuto || strategy == ispStrategyBalance {
-		var candidates []*edgeNodeLiveState
+	if strategy == ispStrategyBalance {
+		candidates := make([]balanceCandidate, 0, len(rules))
 		for _, rule := range rules {
-			if !rule.Enabled || rule.NodeID <= 0 {
+			if !rule.Enabled {
+				continue
+			}
+			if rule.NodeID == 0 {
+				if rt.masterQuotaExceededLocked() {
+					continue
+				}
+				candidates = append(candidates, balanceCandidate{
+					nodeID:            0,
+					name:              masterName,
+					maxBalanceStreams: rt.master.maxBalanceStreams,
+					fallbackStreams:   watchingCounts[0],
+				})
 				continue
 			}
 			node := rt.nodes[rule.NodeID]
 			if node != nil && node.routableAt(now) {
-				candidates = append(candidates, node)
+				candidates = append(candidates, balanceCandidate{
+					nodeID:            node.id,
+					name:              node.name,
+					publicURL:         node.publicURL(),
+					token:             node.tokenPlain,
+					maxBalanceStreams: node.maxBalanceStreams,
+					fallbackStreams:   node.activeStreams,
+				})
 			}
 		}
-		if len(candidates) > 0 {
-			var seq uint64
-			if advanceRR {
-				if ctr := rt.rrCounters[decision.ISPGroup]; ctr != nil {
-					seq = ctr.Add(1) - 1
-				}
-			}
-			n := uint64(len(candidates))
-			var chosen *edgeNodeLiveState
-			if strategy == ispStrategyBalance {
-				bestStreams := -1
-				for i := 0; i < len(candidates); i++ {
-					cand := candidates[(seq+uint64(i))%n]
-					if chosen == nil || cand.activeStreams < bestStreams {
-						chosen = cand
-						bestStreams = cand.activeStreams
-					}
-				}
-			} else {
-				chosen = rt.pickAutoEdgeCandidateLocked(decision.ISPGroup, candidates, seq, now)
-			}
-			if chosen != nil {
-				decision.NodeID = chosen.id
-				decision.NodeName = chosen.name
-				decision.PublicURL = chosen.publicURL()
-				decision.Token = chosen.tokenPlain
-				return decision
-			}
+		if chosen := pickBalanceCandidateLocked(candidates, watchingCounts, hasShareCounts, stickyNodeID, hasSticky); chosen != nil {
+			decision.NodeID = chosen.nodeID
+			decision.NodeName = chosen.name
+			decision.PublicURL = chosen.publicURL
+			decision.Token = chosen.token
+			return decision
 		}
-		// Master acts strictly as fallback when no enabled edge node is routable.
+		// Always fall back to Master if every enabled node in the group is unavailable.
 		decision.NodeID = 0
 		decision.NodeName = masterName
 		return decision
@@ -1559,10 +1599,11 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 		CFDNSStatus:      state.cfDNSStatus,
 		CFRecordIP:       state.cfRecordIP,
 		Enabled:          state.enabled,
-		TrafficQuota:     state.quota,
-		TrafficUsed:      state.totalUsed(),
-		ResetDay:         state.resetDay,
-		Note:             state.note,
+		TrafficQuota:      state.quota,
+		TrafficUsed:       state.totalUsed(),
+		ResetDay:          state.resetDay,
+		MaxBalanceStreams: normalizeMaxBalanceStreams(state.maxBalanceStreams),
+		Note:              state.note,
 		AgentVersion:     state.agentVersion,
 		MasterVersion:    appVersion,
 		UpgradeAvailable: online && state.agentVersion != "" && state.agentVersion != appVersion,
@@ -1671,6 +1712,9 @@ func normalizeEdgeNodeInput(input EdgeNodeInput) (EdgeNodeInput, error) {
 	if input.ResetDay < 0 || input.ResetDay > 28 {
 		return input, errors.New("流量重置日应为 1–28，0 表示不自动重置")
 	}
+	if input.MaxBalanceStreams < 0 || input.MaxBalanceStreams > maxNodeMaxBalanceStreams {
+		return input, errors.New("负载均衡上限应为 1–99 路")
+	}
 	if len(input.Note) > 500 {
 		return input, errors.New("备注过长")
 	}
@@ -1759,8 +1803,9 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 		defer tx.Rollback()
 		var maxNodeOrder int
 		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM edge_nodes`).Scan(&maxNodeOrder)
-		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, note, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.Note, maxNodeOrder+1)
+		maxBalance := normalizeMaxBalanceStreams(input.MaxBalanceStreams)
+		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, max_balance_streams, note, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, maxBalance, input.Note, maxNodeOrder+1)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
@@ -1966,8 +2011,8 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			resetPeriod, _ := shareResetPeriod(time.Now().In(a.db.shareLocation()), input.ResetDay)
-			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, auto_https=?, cf_record_id=?, cf_record_type=?, cf_record_ip=?, cf_dns_status=?, enabled=?, traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), nextRecID, nextRecType, nextRecIP, nextDNSStatus, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.Note, id); err != nil {
+			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, auto_https=?, cf_record_id=?, cf_record_type=?, cf_record_ip=?, cf_dns_status=?, enabled=?, traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, max_balance_streams=CASE WHEN ? > 0 THEN ? ELSE max_balance_streams END, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), nextRecID, nextRecType, nextRecIP, nextDNSStatus, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.MaxBalanceStreams, input.MaxBalanceStreams, input.Note, id); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存失败")
 				return
 			}
@@ -2114,15 +2159,17 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 }
 
 type ispRouteNodeView struct {
-	NodeID      int64                `json:"node_id"`
-	Name        string               `json:"name"`
-	IsMaster    bool                 `json:"is_master"`
-	Enabled     bool                 `json:"enabled"`
-	Online      bool                 `json:"online"`
-	Status      string               `json:"status"`
-	Active      bool                 `json:"active"`
-	PublicURL   string               `json:"public_url,omitempty"`
-	SpeedMetric *edgeNodeSpeedMetric `json:"speed_metric,omitempty"`
+	NodeID            int64                `json:"node_id"`
+	Name              string               `json:"name"`
+	IsMaster          bool                 `json:"is_master"`
+	Enabled           bool                 `json:"enabled"`
+	Online            bool                 `json:"online"`
+	Status            string               `json:"status"`
+	Active            bool                 `json:"active"`
+	MaxBalanceStreams int                  `json:"max_balance_streams"`
+	ActiveSessions    int                  `json:"active_sessions"`
+	PublicURL         string               `json:"public_url,omitempty"`
+	SpeedMetric       *edgeNodeSpeedMetric `json:"speed_metric,omitempty"`
 }
 
 type ispRouteGroupView struct {
@@ -2152,6 +2199,10 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 	if a.pm == nil || a.pm.edges == nil {
 		return result
 	}
+	var watchingCounts map[int64]int
+	if a.pm.shares != nil {
+		watchingCounts = a.pm.shares.activeWatchingCountsByNode(now, "")
+	}
 	a.pm.edges.mu.RLock()
 	defer a.pm.edges.mu.RUnlock()
 	for _, group := range allISPGroups {
@@ -2176,7 +2227,13 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			switch strategy {
 			case ispStrategyBalance:
 				for _, rule := range rules {
-					if !rule.Enabled || rule.NodeID <= 0 {
+					if !rule.Enabled {
+						continue
+					}
+					if rule.NodeID == 0 {
+						if !a.pm.edges.masterQuotaExceededLocked() {
+							activePool[0] = true
+						}
 						continue
 					}
 					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
@@ -2184,21 +2241,6 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 					}
 				}
 				if len(activePool) == 0 {
-					activePool[0] = true
-				}
-			case ispStrategyAuto:
-				var cands []*edgeNodeLiveState
-				for _, rule := range rules {
-					if !rule.Enabled || rule.NodeID <= 0 {
-						continue
-					}
-					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
-						cands = append(cands, node)
-					}
-				}
-				if chosen := a.pm.edges.pickAutoEdgeCandidateLocked(group, cands, 0, now); chosen != nil {
-					activePool[chosen.id] = true
-				} else {
 					activePool[0] = true
 				}
 			default:
@@ -2229,17 +2271,20 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 
 		masterName := a.pm.edges.masterDisplayNameLocked()
 		masterStatus := a.pm.edges.master.status()
+		masterCap := normalizeMaxBalanceStreams(a.pm.edges.master.maxBalanceStreams)
 		for _, rule := range rules {
 			if rule.NodeID == 0 {
 				nodes = append(nodes, ispRouteNodeView{
-					NodeID:      0,
-					Name:        masterName,
-					IsMaster:    true,
-					Enabled:     rule.Enabled,
-					Online:      true,
-					Status:      masterStatus,
-					Active:      activePool[0],
-					SpeedMetric: metricPtrFor(0),
+					NodeID:            0,
+					Name:              masterName,
+					IsMaster:          true,
+					Enabled:           rule.Enabled,
+					Online:            true,
+					Status:            masterStatus,
+					Active:            activePool[0],
+					MaxBalanceStreams: masterCap,
+					ActiveSessions:    watchingCounts[0],
+					SpeedMetric:       metricPtrFor(0),
 				})
 				continue
 			}
@@ -2248,14 +2293,16 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 				continue
 			}
 			nodes = append(nodes, ispRouteNodeView{
-				NodeID:      node.id,
-				Name:        node.name,
-				Enabled:     rule.Enabled,
-				Online:      node.isOnline(now),
-				Status:      node.statusAt(now),
-				Active:      activePool[node.id],
-				PublicURL:   node.publicURL(),
-				SpeedMetric: metricPtrFor(node.id),
+				NodeID:            node.id,
+				Name:              node.name,
+				Enabled:           rule.Enabled,
+				Online:            node.isOnline(now),
+				Status:            node.statusAt(now),
+				Active:            activePool[node.id],
+				MaxBalanceStreams: normalizeMaxBalanceStreams(node.maxBalanceStreams),
+				ActiveSessions:    watchingCounts[node.id],
+				PublicURL:         node.publicURL(),
+				SpeedMetric:       metricPtrFor(node.id),
 			})
 		}
 		result = append(result, ispRouteGroupView{
@@ -2282,8 +2329,9 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			Strategy         *string `json:"strategy"`
 			BlockConnect     *bool   `json:"block_connect"`
 			Nodes            []struct {
-				NodeID  int64 `json:"node_id"`
-				Enabled bool  `json:"enabled"`
+				NodeID            int64 `json:"node_id"`
+				Enabled           bool  `json:"enabled"`
+				MaxBalanceStreams *int  `json:"max_balance_streams,omitempty"`
 			} `json:"nodes"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
@@ -2350,6 +2398,24 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			seen[item.NodeID] = true
+			if item.MaxBalanceStreams != nil {
+				capVal := *item.MaxBalanceStreams
+				if capVal < minNodeMaxBalanceStreams || capVal > maxNodeMaxBalanceStreams {
+					a.jsonErr(w, http.StatusBadRequest, "负载均衡上限应为 1–99 路")
+					return
+				}
+				if item.NodeID == 0 {
+					if _, err := tx.Exec(`UPDATE master_node_settings SET max_balance_streams=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`, capVal); err != nil {
+						a.jsonErr(w, http.StatusInternalServerError, "保存主机负载上限失败")
+						return
+					}
+				} else {
+					if _, err := tx.Exec(`UPDATE edge_nodes SET max_balance_streams=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, capVal, item.NodeID); err != nil {
+						a.jsonErr(w, http.StatusInternalServerError, "保存节点负载上限失败")
+						return
+					}
+				}
+			}
 			if _, err := tx.Exec(`INSERT INTO isp_route_rules(isp_group, node_id, sort_order, enabled) VALUES(?,?,?,?) ON CONFLICT(isp_group, node_id) DO UPDATE SET sort_order=excluded.sort_order, enabled=excluded.enabled`,
 				req.Group, item.NodeID, idx+1, sqliteBool(item.Enabled)); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
@@ -2634,7 +2700,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		// Credit share user traffic and refresh draining playback timestamp.
 		if a.pm.shares != nil && report.ShareUserID > 0 {
-			a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, nodeName, now)
+			a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, node.id, nodeName, now)
 		}
 	}
 	if nodeBytesDelta > 0 {
@@ -2796,7 +2862,7 @@ func (pm *ProxyManager) recordExternalSiteTraffic(siteID, bytesIn, bytesOut, req
 
 // recordExternalTraffic credits bytes reported by an edge node to a share user
 // and keeps active-playback tracking fresh for graceful site switching.
-func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string, billed int64, playing bool, nodeName string, now time.Time) {
+func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string, billed int64, playing bool, nodeID int64, nodeName string, now time.Time) {
 	if rt == nil {
 		return
 	}
@@ -2811,6 +2877,10 @@ func (rt *shareUserRuntime) recordExternalTraffic(userID int64, tokenHash string
 			rt.activity[tokenHash] = act
 		}
 		act.lastPlaybackAt = now
+		if nodeID > 0 {
+			act.lastNodeID = nodeID
+			act.hasNode = true
+		}
 		if strings.TrimSpace(nodeName) != "" {
 			act.lastNodeName = strings.TrimSpace(nodeName)
 		}

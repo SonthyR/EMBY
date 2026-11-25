@@ -171,6 +171,7 @@ export interface EdgeNode {
   traffic_used: number
   traffic_reset_day: number
   next_reset_at?: string
+  max_balance_streams?: number
   note: string
   agent_version: string
   master_version?: string
@@ -199,6 +200,7 @@ export interface MasterNodeInput {
   name: string
   traffic_quota?: number
   traffic_reset_day?: number
+  max_balance_streams?: number
   note?: string
 }
 
@@ -213,6 +215,7 @@ export interface EdgeNodeInput {
   enabled?: boolean
   traffic_quota?: number
   traffic_reset_day?: number
+  max_balance_streams?: number
   note?: string
 }
 
@@ -245,7 +248,7 @@ export interface EdgeAutoHTTPSInput {
   cf_api_token?: string
 }
 
-export type ISPRouteStrategy = 'priority' | 'auto' | 'balance'
+export type ISPRouteStrategy = 'priority' | 'balance'
 
 export interface ISPRouteNode {
   node_id: number
@@ -255,6 +258,8 @@ export interface ISPRouteNode {
   online: boolean
   status: EdgeNodeStatus | string
   active: boolean
+  max_balance_streams: number
+  active_sessions: number
   public_url?: string
   speed_metric?: EdgeNodeSpeedMetric
 }
