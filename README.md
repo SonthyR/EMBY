@@ -81,7 +81,7 @@ go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 
 ## 版本
 
-最新发布：`v1.4.8` · [更新记录](CHANGELOG.md)
+最新发布：`v1.4.9` · [更新记录](CHANGELOG.md)
 
 ## 许可与致谢
 

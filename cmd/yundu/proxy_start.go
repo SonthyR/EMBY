@@ -155,6 +155,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	inst.transport = proxyTransport
 	egressTransport := http.RoundTripper(&edgeEgressTransport{base: proxyTransport})
 	inst.shareLogout = newShareLogoutFunc(egressTransport, target, policy, configuredHeaders)
+	inst.shareLogin = newShareLoginFunc(egressTransport, target, policy, configuredHeaders)
 	baseTransport := egressTransport
 	if pingCacheState != nil {
 		baseTransport = &pingCacheTransport{base: baseTransport, cache: pingCacheState}
@@ -416,6 +417,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		var edgeFullResolved bool
 		var edgeFullDecision edgeRouteDecision
 		if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+			if shareSessionHash != "" && pm.shares != nil {
+				if handoffStatus, handoffMsg := pm.shares.maybeHandoffEdgeFull(r.Context(), inst, r, shareSessionHash, requestLogEntry.ClientIP, sharePreWatchingFromContext(r.Context())); handoffStatus != 0 {
+					writeShareJSONError(w, handoffStatus, handoffMsg)
+					return
+				}
+			}
 			var sessionEgressNodeID int64
 			if shareSessionHash != "" && pm.shares != nil {
 				sessionEgressNodeID, _ = pm.shares.sessionEgressNodeID(shareSessionHash)
@@ -438,6 +445,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					PublicURL: edgeFullDecision.PublicURL,
 					Token:     edgeFullDecision.Token,
 				}))
+			}
+		}
+		if shareSessionHash != "" && pm.shares != nil {
+			pm.shares.applyUpstreamToken(r, shareSessionHash)
+			if isShareClientLogoutRequest(r) {
+				defer pm.shares.dropLocalSession(shareSessionHash)
 			}
 		}
 		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash, edgeFullResolved, edgeFullDecision))

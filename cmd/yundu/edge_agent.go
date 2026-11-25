@@ -682,6 +682,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	req.Header.Set("X-Yundu-Node-ID", strconv.FormatInt(a.cfg.NodeID, 10))
 	req.Header.Set("X-Yundu-Node-Token", a.cfg.Token)
 	req.Header.Set("X-Yundu-Direct-Popup", "1")
+	req.Header.Set("X-Yundu-Egress-Capable", "1")
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
 
 	resp, err := a.masterClient.Do(req)

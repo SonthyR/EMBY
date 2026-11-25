@@ -391,8 +391,10 @@ func TestEdgeFullSingleIPFullChainLifecycle(t *testing.T) {
 		t.Fatalf("session egress_node_id = (%d, %v), want (%d, true)", gotNode, ok, edge1ID)
 	}
 
-	// Step 2: Change CT ISP priority to Edge-2 first! Because Alice's session is already
-	// locked to Edge-1, subsequent API + genuine 404 + video 307 + WebSocket MUST stay on Edge-1!
+	// Step 2: Simulate active playback on Edge-1 and change CT ISP priority to Edge-2 first!
+	// Because Alice's session is actively watching on Edge-1, subsequent API + genuine 404 +
+	// video 307 + WebSocket MUST stay pinned on Edge-1 without interrupting playback!
+	pm.shares.markEdgePlayback(shareTokenHash("tok-strict-1"), "Edge-1")
 	setCTOrder(edge2ID, edge1ID)
 
 	// 2a. Metadata API -> Edge-1
@@ -485,7 +487,17 @@ func TestEdgeFullSingleIPFullChainLifecycle(t *testing.T) {
 		t.Fatalf("expected >=5 upstream hits via edge-1, got %d", hitsBeforeOffline)
 	}
 
-	// Step 4: Fail-closed when Edge-1 goes offline -> MUST return 503 with 0 upstream hits!
+	// Step 4: Fail-closed on a pinned site when Edge-1 goes offline -> MUST return 503 with 0 upstream hits!
+	site.EdgePinnedNodeID = edge1ID
+	if err := db.UpdateSiteRecord(*site); err != nil {
+		t.Fatalf("UpdateSiteRecord pinned: %v", err)
+	}
+	if err := pm.StartSite(*site); err != nil {
+		t.Fatalf("restart pinned site: %v", err)
+	}
+	siteHandler, _ = pm.SiteHandler(site.ID)
+	masterSrv.Config.Handler = siteHandler
+
 	edgeRT.mu.Lock()
 	edgeRT.nodes[edge1ID].lastSeen = time.Now().Add(-5 * time.Minute)
 	edgeRT.mu.Unlock()

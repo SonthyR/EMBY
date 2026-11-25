@@ -443,6 +443,7 @@ type edgeNodeLiveState struct {
 	alertQuota100Period string
 	supportsSpeedtest   bool
 	supportsDirectPopup bool
+	supportsEgress      bool
 
 	pending           atomic.Int64
 	persistedTotalIn  int64
@@ -537,6 +538,40 @@ func (n *edgeNodeLiveState) routableAt(now time.Time) bool {
 		return false
 	}
 	return n.publicURL() != ""
+}
+
+func agentVersionSupportsEgress(version string) bool {
+	v := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(version), "v"))
+	if v == "" {
+		return false
+	}
+	if cut, _, ok := strings.Cut(v, "-"); ok {
+		v = cut
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	patch, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return false
+	}
+	if major != 1 {
+		return major > 1
+	}
+	if minor != 4 {
+		return minor > 4
+	}
+	return patch >= 8
+}
+
+func (n *edgeNodeLiveState) supportsEgressControl() bool {
+	if n == nil {
+		return false
+	}
+	return n.supportsEgress || agentVersionSupportsEgress(n.agentVersion)
 }
 
 type ispRouteRule struct {
@@ -987,6 +1022,183 @@ func (rt *edgeNodeRuntime) nodeNameByID(nodeID int64) string {
 		return node.name
 	}
 	return ""
+}
+
+func (rt *edgeNodeRuntime) lookupISPGroup(clientIP string) string {
+	if rt == nil || rt.ip2region == nil || strings.TrimSpace(clientIP) == "" {
+		return ispGroupOther
+	}
+	res := rt.ip2region.Lookup(clientIP)
+	if validISPGroup(res.ISPGroup) {
+		return res.ISPGroup
+	}
+	return ispGroupOther
+}
+
+func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool, now time.Time) (edgeRouteDecision, int64) {
+	decision := edgeRouteDecision{
+		ISPGroup: group,
+		ISPLabel: ispGroupLabel(group),
+		NodeID:   0,
+		NodeName: "主机",
+	}
+	rules := rt.routes[group]
+	strategy := rt.strategyForGroupLocked(group)
+	if strategy == ispStrategyAuto || strategy == ispStrategyBalance {
+		var candidates []*edgeNodeLiveState
+		for _, rule := range rules {
+			if !rule.Enabled || rule.NodeID <= 0 {
+				continue
+			}
+			node := rt.nodes[rule.NodeID]
+			if node != nil && node.routableAt(now) && node.supportsEgressControl() {
+				candidates = append(candidates, node)
+			}
+		}
+		if len(candidates) > 0 {
+			var seq uint64
+			if advanceRR {
+				if ctr := rt.rrCounters[group]; ctr != nil {
+					seq = ctr.Add(1) - 1
+				}
+			}
+			n := uint64(len(candidates))
+			var chosen *edgeNodeLiveState
+			if strategy == ispStrategyBalance {
+				bestStreams := -1
+				for i := 0; i < len(candidates); i++ {
+					cand := candidates[(seq+uint64(i))%n]
+					if chosen == nil || cand.activeStreams < bestStreams {
+						chosen = cand
+						bestStreams = cand.activeStreams
+					}
+				}
+			} else {
+				chosen = rt.pickAutoEdgeCandidateLocked(group, candidates, seq, now)
+			}
+			if chosen != nil {
+				decision.NodeID = chosen.id
+				decision.NodeName = chosen.name
+				decision.PublicURL = chosen.publicURL()
+				decision.Token = chosen.tokenPlain
+				return decision, chosen.id
+			}
+		}
+		return decision, -1
+	}
+
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		if rule.NodeID == 0 {
+			return decision, -1
+		}
+		node := rt.nodes[rule.NodeID]
+		if node != nil && node.routableAt(now) && node.supportsEgressControl() {
+			decision.NodeID = node.id
+			decision.NodeName = node.name
+			decision.PublicURL = node.publicURL()
+			decision.Token = node.tokenPlain
+			return decision, node.id
+		}
+	}
+	return decision, -1
+}
+
+// selectEgressDecision picks the best online egress-capable node (or master = -1)
+// for a client IP in edge_full mode.
+func (rt *edgeNodeRuntime) selectEgressDecision(clientIP string, advanceRR bool) (edgeRouteDecision, int64) {
+	group := rt.lookupISPGroup(clientIP)
+	if rt == nil {
+		return edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: "主机"}, -1
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.selectEgressTargetLocked(group, advanceRR, now)
+}
+
+type edgeHandoffEval struct {
+	clientISPGroup  string
+	strategy        string
+	currentRoutable bool
+	currentAllowed  bool
+	targetDecision  edgeRouteDecision
+	targetLockedID  int64
+	shouldHandoff   bool
+	reason          string
+}
+
+// evaluateEdgeFullHandoff determines whether an idle edge_full session should
+// seamlessly hand off from currentNodeID (-1=master, >0=edge) to a better node
+// for clientIP while respecting balance/auto stability and egress capability.
+func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeID int64, currentISPGroup string) edgeHandoffEval {
+	group := rt.lookupISPGroup(clientIP)
+	eval := edgeHandoffEval{
+		clientISPGroup: group,
+		targetDecision: edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: "主机"},
+		targetLockedID: -1,
+	}
+	if rt == nil {
+		eval.currentRoutable = currentNodeID <= 0
+		eval.currentAllowed = true
+		return eval
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	eval.strategy = rt.strategyForGroupLocked(group)
+	if currentNodeID < 0 {
+		eval.currentRoutable = true
+	} else if currentNodeID > 0 {
+		node := rt.nodes[currentNodeID]
+		eval.currentRoutable = node != nil && node.routableAt(now) && node.supportsEgressControl()
+	}
+
+	ruleNodeID := currentNodeID
+	if ruleNodeID < 0 {
+		ruleNodeID = 0
+	}
+	for _, rule := range rt.routes[group] {
+		if rule.NodeID == ruleNodeID && rule.Enabled {
+			eval.currentAllowed = true
+			break
+		}
+	}
+
+	// Pick best target without advancing RR unless we actually hand off; for
+	// balance/auto on a brand-new ISP we still advance when picking a fresh node.
+	ispChanged := currentISPGroup != "" && group != currentISPGroup
+	eval.targetDecision, eval.targetLockedID = rt.selectEgressTargetLocked(group, ispChanged || !eval.currentRoutable, now)
+
+	if currentNodeID == 0 || eval.targetLockedID == currentNodeID {
+		return eval
+	}
+	if !eval.currentRoutable {
+		eval.shouldHandoff = true
+		eval.reason = "current_node_unavailable"
+		return eval
+	}
+	if !eval.currentAllowed {
+		eval.shouldHandoff = true
+		eval.reason = "node_not_allowed_in_isp"
+		return eval
+	}
+	if ispChanged {
+		eval.shouldHandoff = true
+		eval.reason = "isp_changed"
+		return eval
+	}
+	if eval.strategy == ispStrategyPriority {
+		eval.shouldHandoff = true
+		eval.reason = "higher_priority_node"
+		return eval
+	}
+	// In balance/auto strategy within the same ISP group, stay pinned to the
+	// current routable & enabled node to avoid thrashing on every request.
+	return eval
 }
 
 func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bool) edgeRouteDecision {
@@ -2145,6 +2357,9 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		node.supportsSpeedtest = true
 	}
 	node.supportsDirectPopup = req.SupportsDirectPopup || strings.TrimSpace(r.Header.Get("X-Yundu-Direct-Popup")) == "1"
+	if strings.TrimSpace(r.Header.Get("X-Yundu-Egress-Capable")) == "1" || agentVersionSupportsEgress(req.Version) {
+		node.supportsEgress = true
+	}
 	if detectedIP != "" {
 		node.detectedIP = detectedIP
 	}

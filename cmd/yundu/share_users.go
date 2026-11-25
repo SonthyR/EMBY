@@ -103,6 +103,8 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
 		{"share_user_sessions", "site_account_id", "ALTER TABLE share_user_sessions ADD COLUMN site_account_id INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "egress_node_id", "ALTER TABLE share_user_sessions ADD COLUMN egress_node_id INTEGER NOT NULL DEFAULT 0"},
+		{"share_user_sessions", "upstream_token_ciphertext", "ALTER TABLE share_user_sessions ADD COLUMN upstream_token_ciphertext TEXT NOT NULL DEFAULT ''"},
+		{"share_user_sessions", "upstream_user_id", "ALTER TABLE share_user_sessions ADD COLUMN upstream_user_id TEXT NOT NULL DEFAULT ''"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+column.table+"') WHERE name=?", column.name).Scan(&exists); err != nil {
@@ -190,9 +192,19 @@ func (a *shareSessionActivity) isWatching(now time.Time) bool {
 }
 
 type shareSessionEntry struct {
-	userID       int64
-	siteID       int64
-	egressNodeID int64
+	userID        int64
+	siteID        int64
+	siteAccountID int64
+	egressNodeID  int64
+	clientToken   string
+	upstreamToken string
+	upstreamUID   string
+	deviceID      string
+	deviceName    string
+	clientName    string
+	clientIP      string
+	ispGroup      string
+	lastHandoffAt time.Time
 }
 
 type shareUserState struct {
@@ -231,12 +243,16 @@ type shareUserRuntime struct {
 	byRoute    map[string]int64 // normalized route prefix (e.g. "/ws") -> user ID
 	sessions   map[string]shareSessionEntry
 	revoked    map[string]int64 // token hash -> site ID
-	lastSeen   map[string]time.Time
-	activity   map[string]*shareSessionActivity
-	drainTimer *time.Timer
-	failures   map[string]*shareLoginFailure
-	revoking   map[int64]bool
-	flushMu    sync.Mutex
+	lastSeen      map[string]time.Time
+	dirtyClientIP map[string]string
+	activity      map[string]*shareSessionActivity
+	drainTimer    *time.Timer
+	failures      map[string]*shareLoginFailure
+	revoking      map[int64]bool
+	flushMu       sync.Mutex
+
+	handoffMu    sync.Mutex
+	handoffLocks map[string]*sync.Mutex
 
 	capMu        sync.Mutex
 	capabilities map[string]shareCapabilityOwner
@@ -252,11 +268,13 @@ func newShareUserRuntime(db *DB, pm *ProxyManager) *shareUserRuntime {
 		byName:   make(map[string]int64),
 		byRoute:  make(map[string]int64),
 		sessions: make(map[string]shareSessionEntry),
-		revoked:  make(map[string]int64),
-		lastSeen: make(map[string]time.Time),
-		activity: make(map[string]*shareSessionActivity),
-		failures: make(map[string]*shareLoginFailure),
-		revoking: make(map[int64]bool),
+		revoked:       make(map[string]int64),
+		lastSeen:      make(map[string]time.Time),
+		dirtyClientIP: make(map[string]string),
+		activity:      make(map[string]*shareSessionActivity),
+		failures:      make(map[string]*shareLoginFailure),
+		revoking:      make(map[int64]bool),
+		handoffLocks:  make(map[string]*sync.Mutex),
 	}
 	if db != nil {
 		if err := rt.reload(); err != nil {
@@ -350,17 +368,31 @@ func (rt *shareUserRuntime) reload() error {
 	}
 	siteRows.Close()
 
-	sessionRows, err := rt.db.db.Query(`SELECT token_hash, share_user_id, site_id, egress_node_id FROM share_user_sessions`)
+	sessionRows, err := rt.db.db.Query(`SELECT token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, upstream_token_ciphertext, upstream_user_id, device_id, device_name, client, client_ip FROM share_user_sessions`)
 	if err != nil {
 		return err
 	}
 	sessions := make(map[string]shareSessionEntry)
 	for sessionRows.Next() {
-		var hash string
+		var hash, tokenCipher, upTokenCipher string
 		var entry shareSessionEntry
-		if err := sessionRows.Scan(&hash, &entry.userID, &entry.siteID, &entry.egressNodeID); err != nil {
+		if err := sessionRows.Scan(&hash, &entry.userID, &entry.siteID, &entry.siteAccountID, &entry.egressNodeID, &tokenCipher, &upTokenCipher, &entry.upstreamUID, &entry.deviceID, &entry.deviceName, &entry.clientName, &entry.clientIP); err != nil {
 			sessionRows.Close()
 			return err
+		}
+		if tokenCipher != "" {
+			if plain, decErr := decryptSiteAccountSecret(tokenCipher); decErr == nil {
+				entry.clientToken = plain
+				entry.upstreamToken = plain
+			}
+		}
+		if upTokenCipher != "" {
+			if plain, decErr := decryptSiteAccountSecret(upTokenCipher); decErr == nil && plain != "" {
+				entry.upstreamToken = plain
+			}
+		}
+		if rt.pm != nil && rt.pm.edges != nil && entry.clientIP != "" {
+			entry.ispGroup = rt.pm.edges.lookupISPGroup(entry.clientIP)
 		}
 		sessions[hash] = entry
 	}
@@ -439,6 +471,21 @@ func (rt *shareUserRuntime) reload() error {
 	}
 	rt.byName = byName
 	rt.byRoute = byRoute
+	prevSessions := rt.sessions
+	for hash, entry := range sessions {
+		if prev, exists := prevSessions[hash]; exists {
+			if !prev.lastHandoffAt.IsZero() {
+				entry.lastHandoffAt = prev.lastHandoffAt
+			}
+			if prev.ispGroup != "" && entry.ispGroup == "" {
+				entry.ispGroup = prev.ispGroup
+			}
+			if pendingIP, dirty := rt.dirtyClientIP[hash]; dirty && pendingIP != "" {
+				entry.clientIP = pendingIP
+			}
+			sessions[hash] = entry
+		}
+	}
 	rt.sessions = sessions
 	for hash := range rt.lastSeen {
 		if _, ok := sessions[hash]; !ok {
@@ -1076,12 +1123,13 @@ func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
 		return nil
 	}
 	var session shareStoredSession
-	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
-		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, upstream_token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
+		Scan(&session.TokenHash, &session.ciphertext, &session.upstreamCiphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		rt.mu.Lock()
 		delete(rt.sessions, tokenHash)
 		delete(rt.lastSeen, tokenHash)
+		delete(rt.dirtyClientIP, tokenHash)
 		delete(rt.activity, tokenHash)
 		rt.mu.Unlock()
 		return nil
@@ -1188,6 +1236,8 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 			}
 		}
 		last := rt.lastSeen[hash]
+		wasWatching := act != nil && act.isWatching(now)
+		prevClientIP := entry.clientIP
 		rt.mu.RUnlock()
 		if reason != "" {
 			if state != nil {
@@ -1200,11 +1250,23 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 			writeShareJSONError(w, http.StatusUnauthorized, shareBlockMessage(reason))
 			return r, nil, nil, "", noop, true
 		}
-		if now.Sub(last) >= shareSessionTouchInterval {
+		needTouch := now.Sub(last) >= shareSessionTouchInterval
+		needIPUpdate := clientIP != "" && clientIP != prevClientIP
+		if needTouch || needIPUpdate {
 			rt.mu.Lock()
-			rt.lastSeen[hash] = now
+			if needTouch {
+				rt.lastSeen[hash] = now
+			}
+			if needIPUpdate {
+				if cur, exists := rt.sessions[hash]; exists {
+					cur.clientIP = clientIP
+					rt.sessions[hash] = cur
+				}
+				rt.dirtyClientIP[hash] = clientIP
+			}
 			rt.mu.Unlock()
 		}
+		r = r.WithContext(withSharePreWatching(r.Context(), wasWatching))
 		finish := rt.beginRequestActivity(hash, r)
 		return r, nil, state, hash, finish, false
 	}
@@ -1563,9 +1625,12 @@ func (c *shareLoginCapture) finish(pending *shareLoginPending) {
 	if status == http.StatusOK && pending != nil {
 		var payload struct {
 			AccessToken string `json:"AccessToken"`
+			User        struct {
+				ID string `json:"Id"`
+			} `json:"User"`
 		}
 		if err := json.Unmarshal(c.buffer.Bytes(), &payload); err == nil && strings.TrimSpace(payload.AccessToken) != "" {
-			if err := pending.rt.registerSession(pending, payload.AccessToken); err != nil {
+			if err := pending.rt.registerSession(pending, payload.AccessToken, strings.TrimSpace(payload.User.ID)); err != nil {
 				log.Printf("share login: record session: %v", err)
 			}
 		}
@@ -1575,24 +1640,46 @@ func (c *shareLoginCapture) finish(pending *shareLoginPending) {
 	_, _ = c.target.Write(c.buffer.Bytes()) // #nosec G705 -- relays the upstream Emby login response unchanged, with its own headers and content type.
 }
 
-func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token string) error {
+func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token string, upstreamUIDs ...string) error {
+	upstreamUID := ""
+	if len(upstreamUIDs) > 0 {
+		upstreamUID = strings.TrimSpace(upstreamUIDs[0])
+	}
 	ciphertext, err := encryptSiteAccountSecret(token)
 	if err != nil {
 		return err
 	}
 	hash := shareTokenHash(token)
 	accountID := pending.currentAccountID()
-	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, egress_node_id=excluded.egress_node_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
-		hash, pending.user.id, pending.siteID, accountID, pending.egressNodeID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
+	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, upstream_token_ciphertext, upstream_user_id, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, egress_node_id=excluded.egress_node_id, token_ciphertext=excluded.token_ciphertext, upstream_token_ciphertext=excluded.upstream_token_ciphertext, upstream_user_id=excluded.upstream_user_id, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
+		hash, pending.user.id, pending.siteID, accountID, pending.egressNodeID, ciphertext, "", upstreamUID, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
 		return err
 	}
 	// Upstreams may hand the same token back to a device that signs in again.
 	if _, err := rt.db.db.Exec(`DELETE FROM share_revoked_tokens WHERE token_hash=?`, hash); err != nil {
 		return err
 	}
+	ispGroup := ""
+	if rt.pm != nil && rt.pm.edges != nil && pending.clientIP != "" {
+		ispGroup = rt.pm.edges.lookupISPGroup(pending.clientIP)
+	}
 	rt.mu.Lock()
 	delete(rt.revoked, hash)
-	rt.sessions[hash] = shareSessionEntry{userID: pending.user.id, siteID: pending.siteID, egressNodeID: pending.egressNodeID}
+	delete(rt.dirtyClientIP, hash)
+	rt.sessions[hash] = shareSessionEntry{
+		userID:        pending.user.id,
+		siteID:        pending.siteID,
+		siteAccountID: accountID,
+		egressNodeID:  pending.egressNodeID,
+		clientToken:   token,
+		upstreamToken: token,
+		upstreamUID:   upstreamUID,
+		deviceID:      pending.deviceID,
+		deviceName:    pending.device,
+		clientName:    pending.client,
+		clientIP:      pending.clientIP,
+		ispGroup:      ispGroup,
+	}
 	rt.lastSeen[hash] = time.Now()
 	if act := rt.activity[hash]; act != nil {
 		act.draining = false
@@ -1703,11 +1790,12 @@ func (rt *shareUserRuntime) deviceCount(userID int64) int {
 // Revocation
 
 type shareStoredSession struct {
-	TokenHash    string `json:"-"`
-	SessionID    string `json:"session_id,omitempty"`
-	ciphertext   string
-	egressNodeID int64
-	lastSeen     time.Time
+	TokenHash          string `json:"-"`
+	SessionID          string `json:"session_id,omitempty"`
+	ciphertext         string
+	upstreamCiphertext string
+	egressNodeID       int64
+	lastSeen           time.Time
 	SiteID       int64  `json:"site_id"`
 	SiteName     string `json:"site_name"`
 	DeviceID     string `json:"-"`
@@ -1749,7 +1837,7 @@ func (rt *shareUserRuntime) lookupSessionRegion(clientIP string) string {
 }
 
 func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, error) {
-	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_id, s.device_name, s.client, s.client_ip, s.egress_node_id, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
+	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.upstream_token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_id, s.device_name, s.client, s.client_ip, s.egress_node_id, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1757,11 +1845,10 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	result := make([]shareStoredSession, 0)
 	for rows.Next() {
 		var item shareStoredSession
-		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.egressNodeID, &item.CreatedAt, &item.LastSeenAt); err != nil {
+		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.upstreamCiphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.egressNodeID, &item.CreatedAt, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
 		item.SessionID = item.TokenHash
-		item.ClientRegion = rt.lookupSessionRegion(item.ClientIP)
 		if parsed, err := time.Parse("2006-01-02 15:04:05", item.LastSeenAt); err == nil {
 			item.lastSeen = parsed
 		}
@@ -1773,6 +1860,14 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	now := time.Now()
 	rt.mu.RLock()
 	for i := range result {
+		if entry, ok := rt.sessions[result[i].TokenHash]; ok {
+			if entry.clientIP != "" {
+				result[i].ClientIP = entry.clientIP
+			}
+			if entry.egressNodeID != 0 {
+				result[i].egressNodeID = entry.egressNodeID
+			}
+		}
 		if act := rt.activity[result[i].TokenHash]; act != nil {
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
@@ -1784,10 +1879,13 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 		}
 	}
 	rt.mu.RUnlock()
-	if rt.pm != nil && rt.pm.edges != nil {
-		for i := range result {
-			if result[i].NodeName == "" && result[i].egressNodeID > 0 {
+	for i := range result {
+		result[i].ClientRegion = rt.lookupSessionRegion(result[i].ClientIP)
+		if result[i].NodeName == "" {
+			if result[i].egressNodeID > 0 && rt.pm != nil && rt.pm.edges != nil {
 				result[i].NodeName = rt.pm.edges.nodeNameByID(result[i].egressNodeID)
+			} else if result[i].egressNodeID < 0 {
+				result[i].NodeName = "主机"
 			}
 		}
 	}
@@ -1847,6 +1945,14 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 	now := time.Now()
 	rt.mu.RLock()
 	for i := range result {
+		if entry, ok := rt.sessions[result[i].SessionID]; ok {
+			if entry.clientIP != "" {
+				result[i].ClientIP = entry.clientIP
+			}
+			if entry.egressNodeID != 0 {
+				egressNodes[i] = entry.egressNodeID
+			}
+		}
 		if act := rt.activity[result[i].SessionID]; act != nil {
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
@@ -1858,10 +1964,13 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 		}
 	}
 	rt.mu.RUnlock()
-	if rt.pm != nil && rt.pm.edges != nil {
-		for i := range result {
-			if result[i].NodeName == "" && egressNodes[i] > 0 {
+	for i := range result {
+		result[i].ClientRegion = rt.lookupSessionRegion(result[i].ClientIP)
+		if result[i].NodeName == "" {
+			if egressNodes[i] > 0 && rt.pm != nil && rt.pm.edges != nil {
 				result[i].NodeName = rt.pm.edges.nodeNameByID(egressNodes[i])
+			} else if egressNodes[i] < 0 {
+				result[i].NodeName = "主机"
 			}
 		}
 	}
@@ -1887,8 +1996,8 @@ func (rt *shareUserRuntime) revokeUserSession(userID int64, sessionID string) (b
 		return false, nil
 	}
 	var session shareStoredSession
-	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE share_user_id=? AND token_hash=?`, userID, sessionID).
-		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, upstream_token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE share_user_id=? AND token_hash=?`, userID, sessionID).
+		Scan(&session.TokenHash, &session.ciphertext, &session.upstreamCiphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1912,10 +2021,18 @@ func (rt *shareUserRuntime) revokeOne(session shareStoredSession) error {
 	rt.mu.Lock()
 	delete(rt.sessions, session.TokenHash)
 	delete(rt.lastSeen, session.TokenHash)
+	delete(rt.dirtyClientIP, session.TokenHash)
 	delete(rt.activity, session.TokenHash)
 	rt.revoked[session.TokenHash] = session.SiteID
 	rt.mu.Unlock()
-	if token, err := decryptSiteAccountSecret(session.ciphertext); err == nil && token != "" {
+	rt.handoffMu.Lock()
+	delete(rt.handoffLocks, session.TokenHash)
+	rt.handoffMu.Unlock()
+	activeCipher := session.upstreamCiphertext
+	if activeCipher == "" {
+		activeCipher = session.ciphertext
+	}
+	if token, err := decryptSiteAccountSecret(activeCipher); err == nil && token != "" {
 		rt.logoutUpstream(session.SiteID, token, session.egressNodeID)
 	}
 	return nil
@@ -2057,7 +2174,7 @@ func (rt *shareUserRuntime) flush() {
 	}
 	rt.flushMu.Lock()
 	defer rt.flushMu.Unlock()
-	rt.mu.RLock()
+	rt.mu.Lock()
 	states := make([]*shareUserState, 0, len(rt.users))
 	for _, state := range rt.users {
 		states = append(states, state)
@@ -2066,7 +2183,12 @@ func (rt *shareUserRuntime) flush() {
 	for hash, at := range rt.lastSeen {
 		touched[hash] = at
 	}
-	rt.mu.RUnlock()
+	dirtyIPs := make(map[string]string, len(rt.dirtyClientIP))
+	for hash, ip := range rt.dirtyClientIP {
+		dirtyIPs[hash] = ip
+	}
+	rt.dirtyClientIP = make(map[string]string)
+	rt.mu.Unlock()
 
 	for _, state := range states {
 		delta := state.pending.Swap(0)
@@ -2084,6 +2206,9 @@ func (rt *shareUserRuntime) flush() {
 	}
 	for hash, at := range touched {
 		_, _ = rt.db.db.Exec(`UPDATE share_user_sessions SET last_seen_at=? WHERE token_hash=?`, at.UTC().Format("2006-01-02 15:04:05"), hash)
+	}
+	for hash, ip := range dirtyIPs {
+		_, _ = rt.db.db.Exec(`UPDATE share_user_sessions SET client_ip=? WHERE token_hash=?`, ip, hash)
 	}
 	rt.applyMonthlyResets(time.Now().In(rt.db.shareLocation()))
 	cutoff := time.Now().Add(-shareRevokedTokenRetention).UTC().Format("2006-01-02 15:04:05")
@@ -2241,6 +2366,13 @@ func reencryptShareSecrets(tx *sql.Tx, oldKey, newKey []byte) error {
 	}
 	if err := migrate("SELECT token_hash, token_ciphertext FROM share_user_sessions", "UPDATE share_user_sessions SET token_ciphertext=? WHERE token_hash=?"); err != nil {
 		return err
+	}
+	if hasUpToken, err := backupSQLiteColumnExists(tx, "share_user_sessions", "upstream_token_ciphertext"); err != nil {
+		return err
+	} else if hasUpToken {
+		if err := migrate("SELECT token_hash, upstream_token_ciphertext FROM share_user_sessions", "UPDATE share_user_sessions SET upstream_token_ciphertext=? WHERE token_hash=?"); err != nil {
+			return err
+		}
 	}
 	_, err = tx.Exec("DELETE FROM share_user_sessions WHERE token_ciphertext=''")
 	return err

@@ -104,11 +104,8 @@ func resolveEdgeFullDecision(pm *ProxyManager, site Site, clientIP string, sessi
 	if pm == nil || pm.edges == nil {
 		return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
 	}
-	decision := pm.edges.selectNodeForIPInternal(clientIP, advanceRR)
-	if decision.NodeID > 0 {
-		return decision, decision.NodeID, nil
-	}
-	return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+	decision, lockedID := pm.edges.selectEgressDecision(clientIP, advanceRR)
+	return decision, lockedID, nil
 }
 
 type edgeEgressTransport struct {

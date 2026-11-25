@@ -64,6 +64,7 @@ type ProxyInstance struct {
 	pingCache            *pingCache
 	imageCache           *imageCacheSite
 	shareLogout          func(context.Context, string) error
+	shareLogin           func(context.Context, string, string, string, string, string) (string, string, int, error)
 }
 
 type ProxyManager struct {
