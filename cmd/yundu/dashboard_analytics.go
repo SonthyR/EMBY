@@ -131,9 +131,16 @@ func (a *App) handleDashboardAnalytics(w http.ResponseWriter, r *http.Request) {
 	// billingMode as site traffic so quota resets or billing mode toggles stay consistent.
 	var edgeTotalTraffic int64
 	var activeEdgeNodes, totalEdgeNodes int
+	masterName := defaultMasterNodeName
+	masterStatus := "online"
+	var masterBps, masterQuota int64
 	edgeItems := make([]analyticsNodeTrafficItem, 0)
 	if a.pm.edges != nil {
 		a.pm.edges.mu.RLock()
+		masterName = a.pm.edges.masterDisplayNameLocked()
+		masterStatus = a.pm.edges.master.status()
+		masterBps = max(int64(0), a.pm.edges.master.currentBps)
+		masterQuota = a.pm.edges.master.quota
 		totalEdgeNodes = len(a.pm.edges.nodes)
 		for _, n := range a.pm.edges.nodes {
 			if n == nil {
@@ -180,12 +187,14 @@ func (a *App) handleDashboardAnalytics(w http.ResponseWriter, r *http.Request) {
 	nodeBreakdown := make([]analyticsNodeTrafficItem, 0, len(edgeItems)+1)
 	nodeBreakdown = append(nodeBreakdown, analyticsNodeTrafficItem{
 		NodeID:        0,
-		Name:          "主机",
+		Name:          masterName,
 		IsMaster:      true,
 		Online:        true,
-		Status:        "online",
+		Status:        masterStatus,
 		ActiveStreams: masterStreams,
+		CurrentBps:    masterBps,
 		TrafficUsed:   masterTraffic,
+		TrafficQuota:  masterQuota,
 		SharePercent:  roundPercent(masterTraffic, nodeDenominator),
 	})
 	nodeBreakdown = append(nodeBreakdown, edgeItems...)

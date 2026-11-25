@@ -9,11 +9,12 @@ import UiDialog from '@/components/ui/UiDialog.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
-import { edgeApi, type EdgeNode, type EdgeNodeInput, type EdgeNodeStatus } from '@/api'
+import { edgeApi, masterNodeApi, type EdgeNode, type EdgeNodeInput, type EdgeNodeStatus, type MasterNodeInput } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { GB, copyText, formatBytes, relativeTime } from '@/utils/format'
 
+const masterNode = ref<EdgeNode | null>(null)
 const nodes = ref<EdgeNode[]>([])
 const loading = ref(true)
 const loadError = ref('')
@@ -24,6 +25,17 @@ const formOpen = ref(false)
 const editing = ref<EdgeNode | null>(null)
 const saving = ref(false)
 const showAdvanced = ref(false)
+
+const masterFormOpen = ref(false)
+const savingMaster = ref(false)
+const probingMaster = ref(false)
+const masterForm = reactive({
+  name: '',
+  quota_gb: '',
+  traffic_reset_day: 0,
+  note: '',
+})
+const masterErrors = reactive<Record<string, string>>({})
 
 const form = reactive({
   name: '',
@@ -97,6 +109,7 @@ function supportsRemoteUpgrade(version: string | undefined): boolean {
 }
 
 function upgradeStatusInfo(node: EdgeNode): { text: string; tone: string } | null {
+  if (node.is_master) return null
   const raw = (node.upgrade_status || '').trim()
   if (!raw) {
     if (node.online && node.upgrade_available && !supportsRemoteUpgrade(node.agent_version)) {
@@ -122,7 +135,7 @@ function isUpgradeBusy(node: EdgeNode): boolean {
 }
 
 function isNodeUpgradeable(node: EdgeNode): boolean {
-  return !!(node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node))
+  return !node.is_master && !!(node.online && node.upgrade_available && supportsRemoteUpgrade(node.agent_version) && !isUpgradeBusy(node))
 }
 
 const upgradeableNodes = computed(() => nodes.value.filter(isNodeUpgradeable))
@@ -191,10 +204,13 @@ async function upgradeAllNodes() {
 async function load(silent = false) {
   if (!silent) loading.value = true
   try {
-    nodes.value = await edgeApi.list()
+    const masterPromise = masterNodeApi?.get ? masterNodeApi.get().catch(() => null) : Promise.resolve(null)
+    const [edgeList, master] = await Promise.all([edgeApi.list(), masterPromise])
+    nodes.value = edgeList
+    masterNode.value = master
     loadError.value = ''
   } catch (error) {
-    loadError.value = errorMessage(error, '读取从机列表失败')
+    loadError.value = errorMessage(error, '读取节点列表失败')
   } finally {
     loading.value = false
   }
@@ -203,33 +219,114 @@ async function load(silent = false) {
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   load()
-  timer = setInterval(() => document.visibilityState === 'visible' && !formOpen.value && load(true), 8000)
+  timer = setInterval(() => document.visibilityState === 'visible' && !formOpen.value && !masterFormOpen.value && load(true), 8000)
 })
 onBeforeUnmount(() => clearInterval(timer))
 
+const allNodes = computed<EdgeNode[]>(() => (masterNode.value ? [masterNode.value, ...nodes.value] : [...nodes.value]))
+
 const counts = computed(() => {
-  const result: Record<string, number> = { all: nodes.value.length, online: 0, waiting: 0, offline: 0, quota: 0, disabled: 0 }
-  for (const node of nodes.value) {
+  const result: Record<string, number> = { all: allNodes.value.length, online: 0, waiting: 0, offline: 0, quota: 0, disabled: 0 }
+  for (const node of allNodes.value) {
     result[node.status] = (result[node.status] || 0) + 1
   }
   return result
 })
 
-const totalStreams = computed(() => nodes.value.reduce((sum, n) => sum + (n.active_streams || 0), 0))
-const totalBps = computed(() => nodes.value.reduce((sum, n) => sum + (n.current_bps || 0), 0))
+const totalStreams = computed(() => allNodes.value.reduce((sum, n) => sum + (n.active_streams || 0), 0))
+const totalBps = computed(() => allNodes.value.reduce((sum, n) => sum + (n.current_bps || 0), 0))
 
 const visible = computed(() => {
   const q = query.value.trim().toLowerCase()
-  return nodes.value.filter(node => {
+  return allNodes.value.filter(node => {
     if (filter.value !== 'all' && node.status !== filter.value) return false
     if (!q) return true
-    return [node.name, node.public_url, node.public_host, node.public_ip, node.detected_ip, node.note]
+    return [node.name, node.is_master ? '主机 master 本机运行' : '', node.public_url, node.public_host, node.public_ip, node.detected_ip, node.note]
       .some(v => (v || '').toLowerCase().includes(q))
   })
 })
 
+const showAddEdgeHintCard = computed(() => !!masterNode.value && nodes.value.length === 0 && filter.value === 'all' && !query.value.trim())
+
 function clearErrors() {
   for (const key of Object.keys(errors)) delete errors[key]
+}
+
+function clearMasterErrors() {
+  for (const key of Object.keys(masterErrors)) delete masterErrors[key]
+}
+
+function openMasterEdit() {
+  const m = masterNode.value
+  if (!m) return
+  clearMasterErrors()
+  Object.assign(masterForm, {
+    name: m.name || '主机',
+    quota_gb: m.traffic_quota > 0 ? String(Math.round((m.traffic_quota / GB) * 100) / 100) : '',
+    traffic_reset_day: m.traffic_reset_day || 0,
+    note: m.note || '',
+  })
+  masterFormOpen.value = true
+}
+
+async function saveMasterForm() {
+  clearMasterErrors()
+  const name = masterForm.name.trim()
+  if (!name) masterErrors.name = '请填写主机名称'
+
+  const rawQuota = String(masterForm.quota_gb).trim()
+  let quotaGB = 0
+  if (rawQuota !== '') {
+    quotaGB = Number(rawQuota)
+    if (!Number.isFinite(quotaGB) || quotaGB < 0) {
+      masterErrors.quota_gb = '请输入有效的数字'
+    }
+  }
+
+  if (Object.keys(masterErrors).length) return
+
+  const quotaBytes = quotaGB > 0 ? Math.round(quotaGB * GB) : 0
+  const payload: MasterNodeInput = {
+    name,
+    traffic_quota: quotaBytes,
+    traffic_reset_day: quotaBytes > 0 ? Number(masterForm.traffic_reset_day) || 0 : 0,
+    note: masterForm.note.trim(),
+  }
+
+  savingMaster.value = true
+  try {
+    masterNode.value = await masterNodeApi.update(payload)
+    masterFormOpen.value = false
+    toast.success('主机配置已保存')
+  } catch (error) {
+    toast.error(errorMessage(error, '保存主机配置失败'))
+  } finally {
+    savingMaster.value = false
+  }
+}
+
+async function probeMaster() {
+  if (probingMaster.value) return
+  probingMaster.value = true
+  try {
+    masterNode.value = await masterNodeApi.probe()
+    toast.success('主机回源延迟已刷新')
+  } catch (error) {
+    toast.error(errorMessage(error, '刷新延迟失败'))
+  } finally {
+    probingMaster.value = false
+  }
+}
+
+async function resetMasterTraffic() {
+  const name = masterNode.value?.name || '主机'
+  if (!(await confirm({ title: `清零「${name}」流量？`, message: '将重置主机的本期已用流量统计为 0，不影响各站点累计账本。', confirmText: '清零' }))) return
+  try {
+    masterNode.value = await masterNodeApi.resetTraffic()
+    toast.success('主机流量已清零')
+  } catch (error) {
+    toast.error(errorMessage(error, '清零失败'))
+  }
 }
 
 function openCreate() {
@@ -252,6 +349,10 @@ function openCreate() {
 }
 
 function openEdit(node: EdgeNode) {
+  if (node.is_master) {
+    openMasterEdit()
+    return
+  }
   editing.value = node
   clearErrors()
   showAdvanced.value = !!(
@@ -388,6 +489,10 @@ async function toggleEnabled(node: EdgeNode) {
 }
 
 async function resetTraffic(node: EdgeNode) {
+  if (node.is_master) {
+    await resetMasterTraffic()
+    return
+  }
   if (!(await confirm({ title: `清零「${node.name}」流量？`, message: '将重置该从机的本期已用流量统计为 0。', confirmText: '清零' }))) return
   try {
     await edgeApi.resetTraffic(node.id)
@@ -458,7 +563,7 @@ function speedPillTone(mbps: number): string {
 
 <template>
   <div>
-    <PageHeader title="从机" description="添加普通 VPS 或 NAT 小鸡作为轻量媒体中转节点，视频播放自动就近卸载，登录与海报仍由主机接管。">
+    <PageHeader title="节点" description="统一查看主机与各从机节点的在线状态、回源延迟、三网回程测速与实时流量；添加从机后，视频播放自动就近卸载。">
       <UiButton
         v-if="upgradeableNodes.length"
         variant="accent"
@@ -473,7 +578,13 @@ function speedPillTone(mbps: number): string {
     </PageHeader>
 
     <dl class="kpi-grid">
-      <div class="kpi-card"><dt>从机总数</dt><dd class="num">{{ counts.all }}</dd></div>
+      <div class="kpi-card">
+        <dt>节点总数</dt>
+        <dd class="num">
+          {{ counts.all }}
+          <span v-if="masterNode" class="kpi-sub">1 主 · {{ nodes.length }} 从</span>
+        </dd>
+      </div>
       <div class="kpi-card"><dt><span class="dot good" />在线节点</dt><dd class="num">{{ counts.online }}</dd></div>
       <div class="kpi-card"><dt>当前播放流</dt><dd class="num">{{ totalStreams }}</dd></div>
       <div class="kpi-card"><dt>实时转发带宽</dt><dd class="num">{{ formatBps(totalBps) }}</dd></div>
@@ -487,7 +598,7 @@ function speedPillTone(mbps: number): string {
       </nav>
       <label class="search">
         <Search />
-        <input v-model="query" data-page-search type="search" placeholder="搜索从机名称或地址…" aria-label="搜索从机" />
+        <input v-model="query" data-page-search type="search" placeholder="搜索节点名称或地址…" aria-label="搜索节点" />
       </label>
     </div>
 
@@ -498,36 +609,50 @@ function speedPillTone(mbps: number): string {
       <p>{{ loadError }}</p>
       <UiButton @click="load()">重试</UiButton>
     </div>
-    <div v-else-if="!nodes.length" class="empty">
-      <h2>还没有从机节点</h2>
+    <div v-else-if="!allNodes.length" class="empty">
+      <h2>还没有节点</h2>
       <p>只需填写「名称」和「对外端口」，复制一条命令到任意 Linux VPS 或 NAT 机器即可一键接入，内存仅占约 15–25 MB。</p>
       <UiButton variant="primary" @click="openCreate"><Plus />添加第一个从机</UiButton>
     </div>
     <div v-else-if="!visible.length" class="empty">
-      <p>没有匹配的从机节点。</p>
+      <p>没有匹配的节点。</p>
     </div>
     <div v-else class="list">
-      <article v-for="node in visible" :key="node.id" class="card" :class="{ muted: !node.enabled }">
+      <article
+        v-for="node in visible"
+        :key="node.is_master ? 'master' : node.id"
+        class="card"
+        :class="{ muted: !node.enabled, master: node.is_master }"
+      >
         <div class="card-main">
           <div class="title-row">
             <span class="status-pill" :class="STATUS_TONE[node.status]">
               <span class="dot" />{{ STATUS_LABEL[node.status] }}
             </span>
             <h3>{{ node.name }}</h3>
+            <span v-if="node.is_master" class="tag master-tag">主机</span>
             <span v-if="node.agent_version" class="tag">{{ node.agent_version }}</span>
-            <span v-if="node.public_host && node.tls_active" class="tag good">HTTPS 自动证书</span>
-            <span v-else-if="node.public_host && node.tls_mode === 'external'" class="tag">外部 HTTPS</span>
-            <span v-if="node.listen_port && node.listen_port !== node.public_port" class="tag">
+            <span v-if="!node.is_master && node.public_host && node.tls_active" class="tag good">HTTPS 自动证书</span>
+            <span v-else-if="!node.is_master && node.public_host && node.tls_mode === 'external'" class="tag">外部 HTTPS</span>
+            <span v-if="!node.is_master && node.listen_port && node.listen_port !== node.public_port" class="tag">
               NAT {{ node.listen_port }} → {{ node.public_port }}
             </span>
           </div>
 
           <div class="addr-row">
-            <span v-if="node.public_url" class="mono">{{ node.public_url }}</span>
-            <span v-else class="faint">等待从机首次心跳自动上报公网 IP（端口 {{ node.public_port }}）</span>
-            <span v-if="node.last_seen_at" class="faint sep">最近心跳 {{ relativeTime(node.last_seen_at) }}</span>
-            <span v-if="node.online && node.memory_bytes" class="faint sep">内存 {{ formatBytes(node.memory_bytes) }}</span>
-            <span v-if="node.online && node.uptime_sec" class="faint sep">运行 {{ formatUptime(node.uptime_sec) }}</span>
+            <template v-if="node.is_master">
+              <span v-if="node.public_url" class="mono">{{ node.public_url }}</span>
+              <span class="faint" :class="{ sep: !!node.public_url }">本机运行</span>
+              <span v-if="node.memory_bytes" class="faint sep">内存 {{ formatBytes(node.memory_bytes) }}</span>
+              <span v-if="node.uptime_sec" class="faint sep">运行 {{ formatUptime(node.uptime_sec) }}</span>
+            </template>
+            <template v-else>
+              <span v-if="node.public_url" class="mono">{{ node.public_url }}</span>
+              <span v-else class="faint">等待从机首次心跳自动上报公网 IP（端口 {{ node.public_port }}）</span>
+              <span v-if="node.last_seen_at" class="faint sep">最近心跳 {{ relativeTime(node.last_seen_at) }}</span>
+              <span v-if="node.online && node.memory_bytes" class="faint sep">内存 {{ formatBytes(node.memory_bytes) }}</span>
+              <span v-if="node.online && node.uptime_sec" class="faint sep">运行 {{ formatUptime(node.uptime_sec) }}</span>
+            </template>
           </div>
 
           <div v-if="node.online && node.upstream_latencies?.length" class="latency-row">
@@ -572,38 +697,113 @@ function speedPillTone(mbps: number): string {
         </div>
 
         <div class="card-actions">
-          <UiButton
-            v-if="isNodeUpgradeable(node)"
-            size="sm"
-            variant="primary"
-            :loading="upgradingId === node.id"
-            :disabled="upgradingAll"
-            @click="upgradeNode(node)"
-          >
-            <ArrowUpCircle />升级 {{ node.master_version }}
-          </UiButton>
-          <UiButton size="sm" :disabled="!node.online" :title="node.online ? '三网单线程测速' : '从机离线'" @click="openSpeedtest(node.id)">
-            <Activity />测速
-          </UiButton>
-          <UiButton size="sm" :variant="isNodeUpgradeable(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
-            <Terminal />安装命令
-          </UiButton>
-          <UiButton size="sm" @click="openEdit(node)"><Pencil />编辑</UiButton>
-          <UiButton size="sm" variant="ghost" :title="node.enabled ? '停用节点' : '启用节点'" @click="toggleEnabled(node)">
-            <Power />
-          </UiButton>
-          <UiButton size="sm" variant="ghost" title="清零本期流量" @click="resetTraffic(node)">
-            <RotateCcw />
-          </UiButton>
-          <UiButton size="sm" variant="ghost" title="重置通信密钥" @click="resetToken(node)">
-            <RefreshCw />
-          </UiButton>
-          <UiButton size="sm" variant="ghost" title="删除从机" @click="removeNode(node)">
-            <Trash2 />
-          </UiButton>
+          <template v-if="node.is_master">
+            <UiButton size="sm" title="主机三网单线程测速" @click="openSpeedtest(0)">
+              <Activity />测速
+            </UiButton>
+            <UiButton size="sm" :loading="probingMaster" title="立即探测主机到各站点的回源延迟" @click="probeMaster">
+              <RefreshCw />刷新延迟
+            </UiButton>
+            <UiButton size="sm" @click="openMasterEdit"><Pencil />编辑</UiButton>
+            <UiButton size="sm" variant="ghost" title="清零本期流量" @click="resetMasterTraffic">
+              <RotateCcw />
+            </UiButton>
+          </template>
+          <template v-else>
+            <UiButton
+              v-if="isNodeUpgradeable(node)"
+              size="sm"
+              variant="primary"
+              :loading="upgradingId === node.id"
+              :disabled="upgradingAll"
+              @click="upgradeNode(node)"
+            >
+              <ArrowUpCircle />升级 {{ node.master_version }}
+            </UiButton>
+            <UiButton size="sm" :disabled="!node.online" :title="node.online ? '三网单线程测速' : '从机离线'" @click="openSpeedtest(node.id)">
+              <Activity />测速
+            </UiButton>
+            <UiButton size="sm" :variant="isNodeUpgradeable(node) ? 'secondary' : 'primary'" @click="showInstallCommand(node)">
+              <Terminal />安装命令
+            </UiButton>
+            <UiButton size="sm" @click="openEdit(node)"><Pencil />编辑</UiButton>
+            <UiButton size="sm" variant="ghost" :title="node.enabled ? '停用节点' : '启用节点'" @click="toggleEnabled(node)">
+              <Power />
+            </UiButton>
+            <UiButton size="sm" variant="ghost" title="清零本期流量" @click="resetTraffic(node)">
+              <RotateCcw />
+            </UiButton>
+            <UiButton size="sm" variant="ghost" title="重置通信密钥" @click="resetToken(node)">
+              <RefreshCw />
+            </UiButton>
+            <UiButton size="sm" variant="ghost" title="删除从机" @click="removeNode(node)">
+              <Trash2 />
+            </UiButton>
+          </template>
         </div>
       </article>
+
+      <article v-if="showAddEdgeHintCard" class="card add-hint">
+        <h3>添加从机节点</h3>
+        <p class="faint">
+          当前仅主机在提供服务。添加普通 VPS 或 NAT 小鸡作为轻量中转节点（约 15–25 MB 内存），视频播放可按三网运营商自动就近卸载。
+        </p>
+        <UiButton variant="primary" @click="openCreate"><Plus />添加第一个从机</UiButton>
+      </article>
     </div>
+
+    <UiDrawer
+      :open="masterFormOpen"
+      title="编辑主机"
+      :subtitle="masterNode?.name || '主机'"
+      :width="480"
+      :dismissible="!savingMaster"
+      @close="masterFormOpen = false"
+    >
+      <form class="form" novalidate @submit.prevent="saveMasterForm">
+        <fieldset>
+          <legend>基础信息</legend>
+          <UiField
+            label="节点名称"
+            for="mn-name"
+            :error="masterErrors.name"
+            help="修改后将同步显示在节点、线路、测速、仪表盘与分享账号页面。"
+          >
+            <input id="mn-name" v-model="masterForm.name" class="input" maxlength="64" autofocus placeholder="例如：美国主机、香港主机" />
+          </UiField>
+        </fieldset>
+
+        <fieldset>
+          <legend>流量统计与告警</legend>
+          <div class="grid">
+            <UiField
+              label="流量额度"
+              for="mn-quota"
+              :error="masterErrors.quota_gb"
+              help="GB，超额触发告警并优先分流至在线从机；面板不受限制。"
+            >
+              <input id="mn-quota" v-model="masterForm.quota_gb" class="input num" type="number" min="0" step="1" inputmode="decimal" placeholder="不限" />
+            </UiField>
+            <UiField label="每月重置" for="mn-reset" help="到这天清零主机本期流量">
+              <select id="mn-reset" v-model.number="masterForm.traffic_reset_day" class="select">
+                <option :value="0">不重置</option>
+                <option v-for="day in 28" :key="day" :value="day">每月 {{ day }} 日</option>
+              </select>
+            </UiField>
+          </div>
+
+          <UiField label="备注" for="mn-note">
+            <input id="mn-note" v-model="masterForm.note" class="input" maxlength="200" placeholder="可选，例如机房位置、带宽规格" />
+          </UiField>
+        </fieldset>
+
+        <button type="submit" hidden />
+      </form>
+      <template #footer>
+        <UiButton :disabled="savingMaster" @click="masterFormOpen = false">取消</UiButton>
+        <UiButton variant="primary" :loading="savingMaster" @click="saveMasterForm">保存更改</UiButton>
+      </template>
+    </UiDrawer>
 
     <UiDrawer
       :open="formOpen"
@@ -730,7 +930,8 @@ function speedPillTone(mbps: number): string {
 .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 0 0 18px; }
 .kpi-card { padding: 16px 20px; border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); display: flex; flex-direction: column; gap: 6px; }
 .kpi-card dt { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; color: var(--text-2); }
-.kpi-card dd { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.025em; }
+.kpi-card dd { margin: 0; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 24px; font-weight: 700; letter-spacing: -0.025em; }
+.kpi-sub { font-size: 12px; font-weight: 500; color: var(--text-3); letter-spacing: 0; }
 .toolbar-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; padding: 10px 14px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-card); }
 .seg { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
 .seg::-webkit-scrollbar { display: none; }
@@ -746,6 +947,11 @@ function speedPillTone(mbps: number): string {
 .list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .card { display: flex; flex-direction: column; gap: 14px; padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-card); transition: border-color var(--dur) var(--ease); }
 .card:hover { border-color: var(--border-strong); }
+.card.master { border-color: color-mix(in srgb, var(--accent) 32%, var(--border)); }
+.card.master:hover { border-color: color-mix(in srgb, var(--accent) 52%, var(--border)); }
+.card.add-hint { justify-content: center; align-items: flex-start; border-style: dashed; background: var(--surface-2); box-shadow: none; }
+.card.add-hint h3 { margin: 0; font-size: 15.5px; font-weight: 700; }
+.card.add-hint p { margin: 0; font-size: 13px; line-height: 1.6; max-width: 420px; }
 .card.muted { opacity: 0.68; }
 .card.skeleton { height: 180px; }
 .card.skeleton span { display: block; width: 45%; height: 14px; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
@@ -760,6 +966,7 @@ function speedPillTone(mbps: number): string {
 .status-pill.muted { color: var(--text-3); }
 .tag { display: inline-flex; align-items: center; height: 21px; padding: 0 8px; border-radius: 999px; font-size: 11px; background: var(--surface-2); color: var(--text-2); font-family: var(--mono); }
 .tag.good { color: var(--good); background: var(--good-soft); font-family: inherit; font-weight: 600; }
+.tag.master-tag { color: var(--accent); background: var(--accent-soft); font-family: inherit; font-weight: 600; }
 .addr-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; flex-wrap: wrap; }
 .mono { font-family: var(--mono); color: var(--text-2); word-break: break-all; }
 .faint { color: var(--text-3); }

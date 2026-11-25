@@ -113,8 +113,12 @@ func (m *requestTrafficMeter) add(bytesIn, bytesOut int64, at time.Time) {
 	if m.finished {
 		return
 	}
+	billed := m.inst.billableBytes(bytesIn, bytesOut)
 	if m.share != nil {
-		m.share.pending.Add(m.inst.billableBytes(bytesIn, bytesOut))
+		m.share.pending.Add(billed)
+	}
+	if m.inst != nil && m.inst.quota != nil && m.inst.quota.pm != nil && m.inst.quota.pm.edges != nil {
+		m.inst.quota.pm.edges.recordMasterTraffic(billed, bytesOut)
 	}
 	if !m.streaming && minute == m.startedMinute {
 		m.inst.bytesIn.Add(bytesIn)

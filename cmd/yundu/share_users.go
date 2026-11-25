@@ -906,6 +906,7 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 	if !isStart && !isProgress && !isStopped && !isMedia {
 		return func() {}
 	}
+	masterName := rt.masterNodeName()
 	now := time.Now()
 	rt.mu.Lock()
 	act := rt.activity[tokenHash]
@@ -921,7 +922,7 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 		act.activeStreams++
 		act.lastPlaybackAt = now
 		if act.lastNodeName == "" {
-			act.lastNodeName = "主机"
+			act.lastNodeName = masterName
 		}
 	}
 	rt.mu.Unlock()
@@ -1857,6 +1858,7 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	masterName := rt.masterNodeName()
 	now := time.Now()
 	rt.mu.RLock()
 	for i := range result {
@@ -1872,9 +1874,13 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
 			if act.lastNodeName != "" {
-				result[i].NodeName = act.lastNodeName
+				if act.lastNodeName == defaultMasterNodeName {
+					result[i].NodeName = masterName
+				} else {
+					result[i].NodeName = act.lastNodeName
+				}
 			} else if result[i].Playing {
-				result[i].NodeName = "主机"
+				result[i].NodeName = masterName
 			}
 		}
 	}
@@ -1885,11 +1891,18 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 			if result[i].egressNodeID > 0 && rt.pm != nil && rt.pm.edges != nil {
 				result[i].NodeName = rt.pm.edges.nodeNameByID(result[i].egressNodeID)
 			} else if result[i].egressNodeID < 0 {
-				result[i].NodeName = "主机"
+				result[i].NodeName = masterName
 			}
 		}
 	}
 	return result, nil
+}
+
+func (rt *shareUserRuntime) masterNodeName() string {
+	if rt != nil && rt.pm != nil && rt.pm.edges != nil {
+		return rt.pm.edges.masterDisplayName()
+	}
+	return defaultMasterNodeName
 }
 
 func (rt *shareUserRuntime) analyticsSessionSummary() (onlineCount, masterPlaying, totalPlaying int, playingByUser map[int64]int) {
@@ -1898,6 +1911,7 @@ func (rt *shareUserRuntime) analyticsSessionSummary() (onlineCount, masterPlayin
 		return 0, 0, 0, playingByUser
 	}
 	_ = rt.db.db.QueryRow(`SELECT COUNT(*) FROM share_user_sessions`).Scan(&onlineCount)
+	masterName := rt.masterNodeName()
 	now := time.Now()
 	rt.mu.RLock()
 	for tokenHash, act := range rt.activity {
@@ -1906,7 +1920,7 @@ func (rt *shareUserRuntime) analyticsSessionSummary() (onlineCount, masterPlayin
 			if entry, ok := rt.sessions[tokenHash]; ok && entry.userID > 0 {
 				playingByUser[entry.userID]++
 			}
-			if act.lastNodeName == "" || act.lastNodeName == "主机" {
+			if act.lastNodeName == "" || act.lastNodeName == defaultMasterNodeName || act.lastNodeName == masterName {
 				masterPlaying++
 			}
 		}
@@ -1942,6 +1956,7 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	masterName := rt.masterNodeName()
 	now := time.Now()
 	rt.mu.RLock()
 	for i := range result {
@@ -1957,9 +1972,13 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
 			if act.lastNodeName != "" {
-				result[i].NodeName = act.lastNodeName
+				if act.lastNodeName == defaultMasterNodeName {
+					result[i].NodeName = masterName
+				} else {
+					result[i].NodeName = act.lastNodeName
+				}
 			} else if result[i].Playing {
-				result[i].NodeName = "主机"
+				result[i].NodeName = masterName
 			}
 		}
 	}
@@ -1970,7 +1989,7 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 			if egressNodes[i] > 0 && rt.pm != nil && rt.pm.edges != nil {
 				result[i].NodeName = rt.pm.edges.nodeNameByID(egressNodes[i])
 			} else if egressNodes[i] < 0 {
-				result[i].NodeName = "主机"
+				result[i].NodeName = masterName
 			}
 		}
 	}

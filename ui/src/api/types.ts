@@ -185,10 +185,18 @@ export interface EdgeNode {
   speed_metrics?: EdgeNodeSpeedMetric[]
   public_url: string
   status: EdgeNodeStatus
+  is_master?: boolean
   install_command?: string
   uninstall_command?: string
   created_at: string
   updated_at: string
+}
+
+export interface MasterNodeInput {
+  name: string
+  traffic_quota?: number
+  traffic_reset_day?: number
+  note?: string
 }
 
 export interface EdgeNodeInput {

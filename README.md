@@ -45,7 +45,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.
 
 ### 安装从机（轻量媒体中转节点）
 
-在主机面板进入 **从机 → 添加从机**，填写名称和对外端口后直接复制生成的一键命令到目标 VPS / NAT 机器执行即可，命令格式如下：
+在主机面板进入 **节点 → 添加从机**，填写名称和对外端口后直接复制生成的一键命令到目标 VPS / NAT 机器执行即可，命令格式如下：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent \
@@ -81,7 +81,7 @@ go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 
 ## 版本
 
-最新发布：`v1.4.9` · [更新记录](CHANGELOG.md)
+最新发布：`v1.5.0` · [更新记录](CHANGELOG.md)
 
 ## 许可与致谢
 

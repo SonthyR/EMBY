@@ -5,6 +5,7 @@ import type {
   DashboardAnalyticsResponse,
   EdgeNode,
   EdgeNodeInput,
+  MasterNodeInput,
   IP2RegionDBStatus,
   IP2RegionLookupResult,
   IP2RegionStatus,
@@ -292,6 +293,13 @@ export const edgeApi = {
   resetToken: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-token`),
   resetTraffic: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-traffic`),
   upgrade: (nodeId: number, version = '') => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/upgrade`, version ? { version } : {}),
+}
+
+export const masterNodeApi = {
+  get: () => api.get<EdgeNode>('/api/master-node'),
+  update: (input: MasterNodeInput) => api.put<EdgeNode>('/api/master-node', input),
+  resetTraffic: () => api.post<EdgeNode>('/api/master-node/reset-traffic'),
+  probe: () => api.post<EdgeNode>('/api/master-node/probe'),
 }
 
 export const ispRoutesApi = {

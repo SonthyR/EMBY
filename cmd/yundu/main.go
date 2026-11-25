@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.4.9"
+var appVersion = "v1.5.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -213,6 +213,7 @@ func main() {
 	}()
 	go runTelegramReportScheduler(ctx, db)
 	go runEdgeNodeAlertMonitor(ctx, db, pm.edges)
+	go runMasterNodeMonitor(ctx, pm.edges)
 	go runShareAlertMonitor(ctx, db, pm.shares)
 
 	if panelHost != "" {
@@ -288,6 +289,8 @@ func main() {
 	mux.HandleFunc("/api/client-filter", cors(app.authMiddleware(app.handleClientFilter)))
 	mux.HandleFunc("/api/share-alerts", cors(app.authMiddleware(app.handleShareAlerts)))
 	mux.HandleFunc("/api/redeem/register", cors(app.csrfMiddleware(app.handleRedeemRegister)))
+	mux.HandleFunc("/api/master-node", cors(app.authMiddleware(app.handleMasterNode)))
+	mux.HandleFunc("/api/master-node/", cors(app.authMiddleware(app.handleMasterNodeAction)))
 	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))

@@ -2436,15 +2436,21 @@ func (a *App) handleSpeedtestTargets(w http.ResponseWriter, r *http.Request) {
 
 	nodes := make([]nodeSummary, 0)
 	var masterMetrics []edgeNodeSpeedMetric
+	masterName := defaultMasterNodeName
+	masterStatus := "online"
 	if a.pm != nil && a.pm.edges != nil {
 		masterMetrics = a.pm.edges.nodeSpeedMetricsCopy(0)
+		a.pm.edges.mu.RLock()
+		masterName = a.pm.edges.masterDisplayNameLocked()
+		masterStatus = a.pm.edges.master.status()
+		a.pm.edges.mu.RUnlock()
 	}
 	nodes = append(nodes, nodeSummary{
 		ID:           0,
-		Name:         "主机",
+		Name:         masterName,
 		IsMaster:     true,
 		Online:       true,
-		Status:       "online",
+		Status:       masterStatus,
 		SpeedMetrics: masterMetrics,
 	})
 
@@ -2719,7 +2725,10 @@ func (a *App) handleSpeedtestStart(w http.ResponseWriter, r *http.Request) {
 		mode = "builtin"
 	}
 
-	nodeName := "主机"
+	nodeName := defaultMasterNodeName
+	if req.NodeID == 0 && a.pm != nil && a.pm.edges != nil {
+		nodeName = a.pm.edges.masterDisplayName()
+	}
 	if req.NodeID > 0 {
 		if a.pm == nil || a.pm.edges == nil {
 			a.jsonErr(w, http.StatusServiceUnavailable, "从机运行时未初始化")
@@ -2873,9 +2882,13 @@ func (a *App) handleSpeedtestDirectTargets(w http.ResponseWriter, r *http.Reques
 
 	list := make([]directTarget, 0)
 	if !hasNodeFilter || nodeFilter == 0 {
+		masterName := defaultMasterNodeName
+		if a.pm != nil && a.pm.edges != nil {
+			masterName = a.pm.edges.masterDisplayName()
+		}
 		list = append(list, directTarget{
 			NodeID:        0,
-			Name:          "主机",
+			Name:          masterName,
 			IsMaster:      true,
 			Online:        true,
 			Scheme:        panelScheme,

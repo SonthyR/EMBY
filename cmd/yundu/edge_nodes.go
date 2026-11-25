@@ -134,7 +134,7 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect, strategy) VALUES(?, 0, 'priority')`, ispSettingNonMainlandKey); err != nil {
 		return err
 	}
-	return nil
+	return ensureMasterNodeSchema(ctx, conn)
 }
 
 // reencryptEdgeNodeSecrets moves edge node secrets to a new credential key during backup restore.
@@ -361,6 +361,7 @@ func openEdgePlaybackTicket(token, encoded string) (edgePlaybackTicket, error) {
 
 type EdgeNode struct {
 	ID                int64                 `json:"id"`
+	IsMaster          bool                  `json:"is_master,omitempty"`
 	Name              string                `json:"name"`
 	PublicPort        int                   `json:"public_port"`
 	ListenPort        int                   `json:"listen_port"`
@@ -586,6 +587,7 @@ type edgeNodeRuntime struct {
 	ip2region *ip2regionManager
 
 	mu               sync.RWMutex
+	master           masterNodeState
 	nodes            map[int64]*edgeNodeLiveState
 	routes           map[string][]ispRouteRule // isp_group -> ordered rules
 	blocked          map[string]bool           // isp_group -> block_connect enabled
@@ -708,8 +710,28 @@ func (rt *edgeNodeRuntime) reload() error {
 
 	speedMap := rt.loadSpeedMetricsFromDB()
 
+	var (
+		mName        = defaultMasterNodeName
+		mQuota       int64
+		mUsed        int64
+		mResetDay    int
+		mResetPeriod string
+		mNote        string
+	)
+	_ = rt.db.db.QueryRow(`SELECT name, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note FROM master_node_settings WHERE id=1`).
+		Scan(&mName, &mQuota, &mUsed, &mResetDay, &mResetPeriod, &mNote)
+
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	if strings.TrimSpace(mName) == "" {
+		mName = defaultMasterNodeName
+	}
+	rt.master.name = mName
+	rt.master.quota = mQuota
+	rt.master.persistedUsed = mUsed
+	rt.master.resetDay = mResetDay
+	rt.master.resetPeriod = mResetPeriod
+	rt.master.note = mNote
 	seen := make(map[int64]bool, len(list))
 	for _, item := range list {
 		seen[item.id] = true
@@ -1040,7 +1062,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool
 		ISPGroup: group,
 		ISPLabel: ispGroupLabel(group),
 		NodeID:   0,
-		NodeName: "主机",
+		NodeName: rt.masterDisplayNameLocked(),
 	}
 	rules := rt.routes[group]
 	strategy := rt.strategyForGroupLocked(group)
@@ -1092,6 +1114,11 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool
 			continue
 		}
 		if rule.NodeID == 0 {
+			// Soft-deprioritize Master when it has exceeded its traffic quota;
+			// if no online egress-capable edge node is available, fall back to Master below.
+			if rt.masterQuotaExceededLocked() {
+				continue
+			}
 			return decision, -1
 		}
 		node := rt.nodes[rule.NodeID]
@@ -1111,7 +1138,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, advanceRR bool
 func (rt *edgeNodeRuntime) selectEgressDecision(clientIP string, advanceRR bool) (edgeRouteDecision, int64) {
 	group := rt.lookupISPGroup(clientIP)
 	if rt == nil {
-		return edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: "主机"}, -1
+		return edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: defaultMasterNodeName}, -1
 	}
 	now := time.Now()
 	rt.mu.RLock()
@@ -1137,7 +1164,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 	group := rt.lookupISPGroup(clientIP)
 	eval := edgeHandoffEval{
 		clientISPGroup: group,
-		targetDecision: edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: "主机"},
+		targetDecision: edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: defaultMasterNodeName},
 		targetLockedID: -1,
 	}
 	if rt == nil {
@@ -1148,6 +1175,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 	now := time.Now()
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
+	eval.targetDecision.NodeName = rt.masterDisplayNameLocked()
 
 	eval.strategy = rt.strategyForGroupLocked(group)
 	if currentNodeID < 0 {
@@ -1206,7 +1234,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 		ISPGroup: ispGroupOther,
 		ISPLabel: ispGroupLabel(ispGroupOther),
 		NodeID:   0,
-		NodeName: "主机",
+		NodeName: defaultMasterNodeName,
 	}
 	if rt == nil {
 		return decision
@@ -1226,6 +1254,8 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 	now := time.Now()
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
+	masterName := rt.masterDisplayNameLocked()
+	decision.NodeName = masterName
 	if isPublic {
 		if rt.blockNonMainland && lookupFound && decision.NonMainlandCN {
 			decision.Blocked = true
@@ -1286,7 +1316,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 		}
 		// Master acts strictly as fallback when no enabled edge node is routable.
 		decision.NodeID = 0
-		decision.NodeName = "主机"
+		decision.NodeName = masterName
 		return decision
 	}
 
@@ -1295,8 +1325,13 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 			continue
 		}
 		if rule.NodeID == 0 {
+			// Soft-deprioritize Master when it exceeds its traffic quota; if no
+			// online edge node exists in this group, Master still serves as fallback.
+			if rt.masterQuotaExceededLocked() {
+				continue
+			}
 			decision.NodeID = 0
-			decision.NodeName = "主机"
+			decision.NodeName = masterName
 			return decision
 		}
 		node := rt.nodes[rule.NodeID]
@@ -1309,6 +1344,8 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bo
 		}
 	}
 	// Always fall back to Master if every configured edge node is unavailable.
+	decision.NodeID = 0
+	decision.NodeName = masterName
 	return decision
 }
 
@@ -1369,6 +1406,16 @@ func (rt *edgeNodeRuntime) flush() {
 				item.detectedIP, item.version, item.lastSeen.UTC().Format(time.RFC3339), item.state.id)
 		}
 	}
+	if masterDelta := rt.master.pending.Swap(0); masterDelta > 0 {
+		if _, err := rt.db.db.Exec(`UPDATE master_node_settings SET traffic_used=traffic_used+? WHERE id=1`, masterDelta); err != nil {
+			rt.master.pending.Add(masterDelta)
+			log.Printf("master node: flush traffic: %v", err)
+		} else {
+			rt.mu.Lock()
+			rt.master.persistedUsed += masterDelta
+			rt.mu.Unlock()
+		}
+	}
 	rt.applyMonthlyResets(time.Now().In(rt.db.shareLocation()))
 }
 
@@ -1406,6 +1453,20 @@ func (rt *edgeNodeRuntime) applyMonthlyResets(now time.Time) {
 		}
 		rt.mu.Unlock()
 		log.Printf("edge node %d: monthly traffic reset (%s)", item.id, item.period)
+	}
+	var mDay int
+	var mPeriod string
+	if err := rt.db.db.QueryRow(`SELECT traffic_reset_day, traffic_reset_period FROM master_node_settings WHERE id=1`).Scan(&mDay, &mPeriod); err == nil && mDay > 0 {
+		if current, _ := shareResetPeriod(now, mDay); current != "" && current != mPeriod {
+			if _, err := rt.db.db.Exec(`UPDATE master_node_settings SET traffic_used=0, traffic_reset_period=?, updated_at=CURRENT_TIMESTAMP WHERE id=1`, current); err == nil {
+				rt.mu.Lock()
+				rt.master.pending.Store(0)
+				rt.master.persistedUsed = 0
+				rt.master.resetPeriod = current
+				rt.mu.Unlock()
+				log.Printf("master node: monthly traffic reset (%s)", current)
+			}
+		}
 	}
 }
 
@@ -1919,6 +1980,9 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 						continue
 					}
 					if rule.NodeID == 0 {
+						if a.pm.edges.masterQuotaExceededLocked() {
+							continue
+						}
 						activePool[0] = true
 						assigned = true
 						break
@@ -1935,15 +1999,17 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			}
 		}
 
+		masterName := a.pm.edges.masterDisplayNameLocked()
+		masterStatus := a.pm.edges.master.status()
 		for _, rule := range rules {
 			if rule.NodeID == 0 {
 				nodes = append(nodes, ispRouteNodeView{
 					NodeID:      0,
-					Name:        "主机",
+					Name:        masterName,
 					IsMaster:    true,
 					Enabled:     rule.Enabled,
 					Online:      true,
-					Status:      "online",
+					Status:      masterStatus,
 					Active:      activePool[0],
 					SpeedMetric: metricPtrFor(0),
 				})

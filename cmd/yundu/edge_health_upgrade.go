@@ -469,6 +469,25 @@ func (rt *edgeNodeRuntime) collectAlerts(now time.Time) []string {
 			}
 		}
 	}
+	if rt.master.quota > 0 {
+		used := rt.master.totalUsed()
+		period := rt.master.resetPeriod
+		if period == "" {
+			period = "total"
+		}
+		pct := float64(used) * 100 / float64(rt.master.quota)
+		masterName := rt.masterDisplayNameLocked()
+		if used >= rt.master.quota && rt.master.alertQuota100Period != period {
+			rt.master.alertQuota100Period = period
+			rt.master.alertQuota80Period = period
+			messages = append(messages, fmt.Sprintf("🚨 云渡主机流量已耗尽（100%%）\n节点：%s\n已用：%s / %s\n状态：控制面保持正常，视频将优先分流至在线从机",
+				masterName, formatBytesForAlert(used), formatBytesForAlert(rt.master.quota)))
+		} else if pct >= 80 && rt.master.alertQuota80Period != period {
+			rt.master.alertQuota80Period = period
+			messages = append(messages, fmt.Sprintf("📊 云渡主机流量预警（%.0f%%）\n节点：%s\n已用：%s / %s",
+				pct, masterName, formatBytesForAlert(used), formatBytesForAlert(rt.master.quota)))
+		}
+	}
 	return messages
 }
 

@@ -406,7 +406,7 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	}
 
 	oldNodeID := entry.egressNodeID
-	oldNodeName := "主机"
+	oldNodeName := rt.pm.edges.masterDisplayName()
 	if oldNodeID > 0 {
 		if name := rt.pm.edges.nodeNameByID(oldNodeID); name != "" {
 			oldNodeName = name
@@ -490,7 +490,7 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	now := time.Now()
 	newNodeName := eval.targetDecision.NodeName
 	if newNodeName == "" {
-		newNodeName = "主机"
+		newNodeName = rt.pm.edges.masterDisplayName()
 	}
 	rt.mu.Lock()
 	if cur, exists := rt.sessions[tokenHash]; exists {

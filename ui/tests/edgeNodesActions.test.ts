@@ -9,10 +9,17 @@ const edgeApi = vi.hoisted(() => ({
   upgrade: vi.fn(),
 }))
 
+const masterNodeApi = vi.hoisted(() => ({
+  get: vi.fn(),
+  update: vi.fn(),
+  probe: vi.fn(),
+  resetTraffic: vi.fn(),
+}))
+
 const confirmMock = vi.hoisted(() => vi.fn())
 const copyTextMock = vi.hoisted(() => vi.fn())
 
-vi.mock('@/api', () => ({ edgeApi }))
+vi.mock('@/api', () => ({ edgeApi, masterNodeApi }))
 vi.mock('@/stores/confirm', () => ({ confirm: confirmMock }))
 vi.mock('@/utils/format', async importOriginal => {
   const actual = await importOriginal<typeof import('@/utils/format')>()
@@ -20,6 +27,42 @@ vi.mock('@/utils/format', async importOriginal => {
 })
 
 enableAutoUnmount(afterEach)
+
+function makeMasterNode(overrides: Partial<EdgeNode> = {}): EdgeNode {
+  return {
+    id: 0,
+    is_master: true,
+    name: '主机',
+    public_port: 0,
+    listen_port: 0,
+    public_host: '',
+    public_ip: '',
+    detected_ip: '',
+    tls_mode: '',
+    enabled: true,
+    traffic_quota: 0,
+    traffic_used: 512 * 1024 * 1024,
+    traffic_reset_day: 0,
+    note: '',
+    agent_version: 'v1.5.0',
+    master_version: 'v1.5.0',
+    upgrade_available: false,
+    upgrade_status: '',
+    last_seen_at: new Date().toISOString(),
+    online: true,
+    tls_active: false,
+    active_streams: 1,
+    current_bps: 12_000_000,
+    memory_bytes: 42 * 1024 * 1024,
+    uptime_sec: 3600,
+    upstream_latencies: [{ site_name: '主力站', latency_ms: 18 }],
+    public_url: 'https://panel.example.com',
+    status: 'online',
+    created_at: '',
+    updated_at: '',
+    ...overrides,
+  }
+}
 
 function makeNode(overrides: Partial<EdgeNode>): EdgeNode {
   return {
@@ -37,7 +80,7 @@ function makeNode(overrides: Partial<EdgeNode>): EdgeNode {
     traffic_reset_day: 0,
     note: '',
     agent_version: 'v1.4.5',
-    master_version: 'v1.4.7',
+    master_version: 'v1.5.0',
     upgrade_available: true,
     upgrade_status: '',
     last_seen_at: new Date().toISOString(),
@@ -60,10 +103,14 @@ beforeEach(() => {
   confirmMock.mockResolvedValue(true)
   copyTextMock.mockResolvedValue(true)
   edgeApi.upgrade.mockResolvedValue({})
+  masterNodeApi.get.mockResolvedValue(makeMasterNode())
+  masterNodeApi.probe.mockResolvedValue(makeMasterNode({ upstream_latencies: [{ site_name: '主力站', latency_ms: 12 }] }))
+  masterNodeApi.resetTraffic.mockResolvedValue(makeMasterNode({ traffic_used: 0 }))
+  masterNodeApi.update.mockResolvedValue(makeMasterNode({ name: '美国主机' }))
 })
 
-describe('EdgeNodesView 批量升级与卸载命令复制', () => {
-  it('顶部全部升级按钮仅统计并升级在线且支持远程更新的旧版从机', async () => {
+describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () => {
+  it('顶部全部升级按钮仅统计并升级在线且支持远程更新的旧版从机，不计入主机', async () => {
     const nodes = [
       makeNode({ id: 1, name: '香港 CN2', agent_version: 'v1.4.5', online: true, upgrade_available: true }),
       makeNode({ id: 2, name: '日本移动', agent_version: 'v1.4.6', online: true, upgrade_available: true }),
@@ -76,6 +123,12 @@ describe('EdgeNodesView 批量升级与卸载命令复制', () => {
     const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true } } })
     await flushPromises()
 
+    expect(wrapper.text()).toContain('1 主 · 5 从')
+    const cards = wrapper.findAll('article.card')
+    expect(cards[0].classes()).toContain('master')
+    expect(cards[0].text()).toContain('本机运行')
+    expect(cards[0].text()).not.toContain('安装命令')
+
     const batchBtn = wrapper.findAll('button').find(b => b.text().includes('全部升级'))
     expect(batchBtn).toBeTruthy()
     expect(batchBtn!.text()).toContain('全部升级（2）')
@@ -85,12 +138,53 @@ describe('EdgeNodesView 批量升级与卸载命令复制', () => {
 
     expect(confirmMock).toHaveBeenCalledTimes(1)
     expect(edgeApi.upgrade).toHaveBeenCalledTimes(2)
-    expect(edgeApi.upgrade).toHaveBeenCalledWith(1, 'v1.4.7')
-    expect(edgeApi.upgrade).toHaveBeenCalledWith(2, 'v1.4.7')
+    expect(edgeApi.upgrade).toHaveBeenCalledWith(1, 'v1.5.0')
+    expect(edgeApi.upgrade).toHaveBeenCalledWith(2, 'v1.5.0')
+  })
+
+  it('主机卡片支持刷新延迟、编辑配置与清零本期流量', async () => {
+    edgeApi.list.mockResolvedValue([])
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true } } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('1 主 · 0 从')
+    expect(wrapper.text()).toContain('主力站 18ms')
+
+    const probeBtn = wrapper.findAll('button').find(b => b.text().includes('刷新延迟'))
+    expect(probeBtn).toBeTruthy()
+    await probeBtn!.trigger('click')
+    await flushPromises()
+    expect(masterNodeApi.probe).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).toContain('主力站 12ms')
+
+    const resetBtn = wrapper.find('article.card.master button[title="清零本期流量"]')
+    expect(resetBtn.exists()).toBe(true)
+    await resetBtn.trigger('click')
+    await flushPromises()
+    expect(masterNodeApi.resetTraffic).toHaveBeenCalledTimes(1)
+
+    const editBtn = wrapper.findAll('article.card.master button').find(b => b.text().includes('编辑'))
+    expect(editBtn).toBeTruthy()
+    await editBtn!.trigger('click')
+    await flushPromises()
+
+    await wrapper.find('#mn-name').setValue('美国主机')
+    const saveBtn = wrapper.findAll('button').find(b => b.text().includes('保存更改'))
+    expect(saveBtn).toBeTruthy()
+    await saveBtn!.trigger('click')
+    await flushPromises()
+
+    expect(masterNodeApi.update).toHaveBeenCalledWith({
+      name: '美国主机',
+      traffic_quota: 0,
+      traffic_reset_day: 0,
+      note: '',
+    })
+    expect(wrapper.find('article.card.master h3').text()).toBe('美国主机')
   })
 
   it('安装命令弹窗展示卸载命令并支持一键复制卸载命令', async () => {
-    const node = makeNode({ id: 7, name: '新加坡节点', agent_version: 'v1.4.7', upgrade_available: false })
+    const node = makeNode({ id: 7, name: '新加坡节点', agent_version: 'v1.5.0', upgrade_available: false })
     edgeApi.list.mockResolvedValue([node])
     edgeApi.get.mockResolvedValue({
       ...node,

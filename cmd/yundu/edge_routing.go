@@ -99,10 +99,14 @@ func resolveEdgeFullDecision(pm *ProxyManager, site Site, clientIP string, sessi
 		return decision, decision.NodeID, nil
 	}
 	if sessionEgressNodeID < 0 {
-		return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+		masterName := defaultMasterNodeName
+		if pm != nil && pm.edges != nil {
+			masterName = pm.edges.masterDisplayName()
+		}
+		return edgeRouteDecision{NodeID: 0, NodeName: masterName}, -1, nil
 	}
 	if pm == nil || pm.edges == nil {
-		return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+		return edgeRouteDecision{NodeID: 0, NodeName: defaultMasterNodeName}, -1, nil
 	}
 	decision, lockedID := pm.edges.selectEgressDecision(clientIP, advanceRR)
 	return decision, lockedID, nil

@@ -23,7 +23,7 @@ const commands = computed<Command[]>(() => [
   { id: 'go-dashboard', group: '前往', label: '仪表盘', hint: 'G D', run: () => router.push('/dashboard') },
   { id: 'go-sites', group: '前往', label: '站点', hint: 'G S', run: () => router.push('/sites') },
   { id: 'go-share', group: '前往', label: '分享账号', hint: 'G U', run: () => router.push('/share') },
-  { id: 'go-nodes', group: '前往', label: '从机节点', run: () => router.push('/nodes') },
+  { id: 'go-nodes', group: '前往', label: '节点管理', run: () => router.push('/nodes') },
   { id: 'go-routes', group: '前往', label: '运营商线路', run: () => router.push('/routes') },
   { id: 'go-logs', group: '前往', label: '系统日志', run: () => router.push('/logs') },
   { id: 'go-diagnostics', group: '前往', label: '连接诊断', run: () => router.push('/diagnostics') },
