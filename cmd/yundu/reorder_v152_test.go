@@ -11,13 +11,13 @@ import (
 
 func TestShareUsersAndEdgeNodesReorder(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "reorder.db")
-	db, err := NewDB(dbPath)
+	db, err := openDB(dbPath)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
 
-	pm := NewProxyManager(db)
+	pm := NewProxyManager(db, bytes.Repeat([]byte{0x55}, 32))
 	pm.SetEdgeRuntime(newEdgeNodeRuntime(db, pm, nil))
 	app := &App{db: db, pm: pm}
 
