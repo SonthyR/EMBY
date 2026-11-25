@@ -253,6 +253,7 @@ type edgeAgent struct {
 	startedAt      time.Time
 	masterClient   *http.Client
 	upstreamClient *http.Client
+	egressClient   *http.Client
 	nodeEnabled    atomic.Bool
 	activeStreams  atomic.Int64
 	windowBytes    atomic.Int64
@@ -322,6 +323,9 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 	upstreamTransport.MaxIdleConnsPerHost = 64
 	upstreamTransport.IdleConnTimeout = 90 * time.Second
 
+	egressTransport := upstreamTransport.Clone()
+	egressTransport.DisableCompression = true
+
 	agent := &edgeAgent{
 		cfg:       cfg,
 		startedAt: time.Now(),
@@ -331,6 +335,12 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 		},
 		upstreamClient: &http.Client{
 			Transport: upstreamTransport,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		egressClient: &http.Client{
+			Transport: egressTransport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -1093,6 +1103,10 @@ func (a *edgeAgent) handler() http.Handler {
 			_, _ = fmt.Fprintf(w, `{"ok":true,"version":%q,"tls_active":%v}`, appVersion, a.hasTLS())
 			return
 		}
+		if r.URL.Path == edgeEgressPath {
+			a.handleEgressRequest(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, edgeSpeedtestUIPathPrefix) {
 			a.handleSpeedtestDirectUIRequest(w, r)
 			return
@@ -1310,4 +1324,229 @@ func copyAgentResponseHeaders(dst, src http.Header) {
 	dst.Set("Cache-Control", "private, no-store")
 	dst.Set("Access-Control-Allow-Origin", "*")
 	dst.Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func connectionHeaderTokens(h http.Header) map[string]bool {
+	var tokens map[string]bool
+	for _, val := range h.Values("Connection") {
+		for _, part := range strings.Split(val, ",") {
+			name := strings.ToLower(strings.TrimSpace(part))
+			if name == "" {
+				continue
+			}
+			if tokens == nil {
+				tokens = make(map[string]bool)
+			}
+			tokens[name] = true
+		}
+	}
+	return tokens
+}
+
+// handleEgressRequest forwards an authenticated master control-plane HTTP or
+// WebSocket request to the upstream Emby server out through this edge node's IP.
+func (a *edgeAgent) handleEgressRequest(w http.ResponseWriter, r *http.Request) {
+	if !a.nodeEnabled.Load() {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusUnauthorized, "节点已停用")
+		return
+	}
+	rawTicket := strings.TrimSpace(r.Header.Get(edgeEgressTicketHeader))
+	ticket, err := openEdgeEgressTicket(a.cfg.Token, rawTicket)
+	if err != nil || ticket.NodeID != a.cfg.NodeID {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusUnauthorized, "出口票据无效或已过期")
+		return
+	}
+	targetURL, err := url.Parse(ticket.TargetURL)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") || targetURL.Host == "" {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadRequest, "无效的回源地址")
+		return
+	}
+	if hasUpgradeIntent(r) {
+		if !isWebSocketUpgrade(r) {
+			w.Header().Set(edgeEgressMarkerHeader, "1")
+			writeShareJSONError(w, http.StatusBadRequest, "invalid websocket upgrade")
+			return
+		}
+		a.handleEgressWebSocket(w, r, targetURL, ticket.Host)
+		return
+	}
+
+	client := a.egressClient
+	if client == nil {
+		client = a.upstreamClient
+	}
+	// #nosec G704 -- targetURL comes from an AES-256-GCM ticket authenticated by the master's node token and scheme-validated to http/https.
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadRequest, "构建回源请求失败")
+		return
+	}
+	outReq.ContentLength = r.ContentLength
+	dropTokens := connectionHeaderTokens(r.Header)
+	for k, vals := range r.Header {
+		lk := strings.ToLower(k)
+		if lk == strings.ToLower(edgeEgressTicketHeader) || isHopByHopHeader(lk) || dropTokens[lk] {
+			continue
+		}
+		outReq.Header[k] = append([]string(nil), vals...)
+	}
+	if strings.TrimSpace(ticket.Host) != "" {
+		outReq.Host = strings.TrimSpace(ticket.Host)
+	} else {
+		outReq.Host = targetURL.Host
+	}
+	// #nosec G704 -- upstream target URL is authorized by the master's AES-GCM egress ticket.
+	resp, err := client.Do(outReq)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Printf("edge agent egress error (%s): %v", targetURL.Host, err)
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadGateway, "上游暂不可用")
+		return
+	}
+	defer resp.Body.Close()
+
+	respDropTokens := connectionHeaderTokens(resp.Header)
+	dst := w.Header()
+	for k, vals := range resp.Header {
+		lk := strings.ToLower(k)
+		if isHopByHopHeader(lk) || respDropTokens[lk] {
+			continue
+		}
+		dst[k] = append([]string(nil), vals...)
+	}
+	dst.Set(edgeEgressMarkerHeader, "1")
+	w.WriteHeader(resp.StatusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	buf := make([]byte, edgeAgentCopyBufSize)
+	_, _ = io.CopyBuffer(w, resp.Body, buf)
+}
+
+func (a *edgeAgent) handleEgressWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, overrideHost string) {
+	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		http.Error(w, "websocket upgrade must not carry a body", http.StatusBadRequest)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		http.Error(w, "WebSocket not supported", http.StatusInternalServerError)
+		return
+	}
+	port := target.Port()
+	if port == "" {
+		if target.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	hostPort := net.JoinHostPort(target.Hostname(), port)
+	var upstreamConn net.Conn
+	var err error
+	if target.Scheme == "https" {
+		upstreamConn, err = tls.DialWithDialer(dialer, "tcp", hostPort, secureTLSConfig(target.Hostname()))
+	} else {
+		upstreamConn, err = dialer.Dial("tcp", hostPort)
+	}
+	if err != nil {
+		log.Printf("edge agent egress ws dial error: %v", err)
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadGateway, "上游 WebSocket 暂不可用")
+		return
+	}
+	defer upstreamConn.Close()
+
+	if err := upstreamConn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return
+	}
+	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, target.RequestURI())
+	if _, err := io.WriteString(upstreamConn, reqLine); err != nil { // #nosec G705 -- method and RequestURI are validated by net/http and url.Parse.
+		return
+	}
+	outHeader := r.Header.Clone()
+	outHeader.Del(edgeEgressTicketHeader)
+	upstreamHost := target.Host
+	if strings.TrimSpace(overrideHost) != "" {
+		upstreamHost = strings.TrimSpace(overrideHost)
+	}
+	outHeader.Set("Host", upstreamHost)
+	if err := outHeader.Write(upstreamConn); err != nil {
+		return
+	}
+	if _, err := io.WriteString(upstreamConn, "\r\n"); err != nil {
+		return
+	}
+	if err := upstreamConn.SetWriteDeadline(time.Time{}); err != nil {
+		return
+	}
+	if err := upstreamConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return
+	}
+	upstreamReader := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(upstreamReader, r)
+	if err != nil {
+		log.Printf("edge agent egress ws handshake error: %v", err)
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadGateway, "上游 WebSocket 握手失败")
+		return
+	}
+	defer resp.Body.Close()
+	if err := upstreamConn.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols ||
+		!strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
+		!headerHasToken(resp.Header, "Connection", "upgrade") {
+		w.Header().Set(edgeEgressMarkerHeader, "1")
+		writeShareJSONError(w, http.StatusBadGateway, "upstream refused websocket upgrade")
+		return
+	}
+
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer clientConn.Close()
+	if _, err := io.WriteString(clientConn, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
+		return
+	}
+	if err := resp.Header.Write(clientConn); err != nil {
+		return
+	}
+	if _, err := io.WriteString(clientConn, "\r\n"); err != nil {
+		return
+	}
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(upstreamConn, clientBuf)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(clientConn, upstreamReader)
+		done <- struct{}{}
+	}()
+	<-done
+	_ = clientConn.Close()
+	_ = upstreamConn.Close()
+	<-done
 }

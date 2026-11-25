@@ -4,13 +4,27 @@ import { Copy, Pencil, Zap, ChevronRight } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import type { Site } from '@/api'
+import type { EdgeNode, Site } from '@/api'
 import { formatBytes } from '@/utils/format'
 import { INGRESS_LABEL, UA_LABEL, normalizedIngressMode } from './siteLogic'
 
-const props = defineProps<{ open: boolean; site: Site | null; address: string; latency?: { busy?: boolean; ok?: boolean; ms?: number; error?: string } }>()
+const props = defineProps<{ open: boolean; site: Site | null; address: string; edgeNodes?: EdgeNode[]; latency?: { busy?: boolean; ok?: boolean; ms?: number; error?: string } }>()
 const emit = defineEmits<{ close: []; edit: []; toggle: []; remove: []; test: []; copy: [] }>()
 const mode = computed(() => (props.site ? normalizedIngressMode(props.site) : 'unset'))
+const edgeRoutingText = computed(() => {
+  const s = props.site
+  if (!s) return ''
+  if (s.edge_routing_mode === 'master') return '仅走主机'
+  if (s.edge_routing_mode === 'edge_full') {
+    const pinnedId = Number(s.edge_pinned_node_id) || 0
+    if (pinnedId > 0) {
+      const node = props.edgeNodes?.find(n => n.id === pinnedId)
+      return `同源单 IP 全链路（固定：${node?.name || `节点 #${pinnedId}`}）`
+    }
+    return '同源单 IP 全链路（按运营商自动选最佳）'
+  }
+  return '跟随全局三网分流'
+})
 const quota = computed(() => Number(props.site?.traffic_quota) || 0)
 const state = computed(() => {
   const s = props.site
@@ -45,7 +59,7 @@ const state = computed(() => {
         <div><dt>访问地址</dt><dd class="mono">{{ address || '入口未配置' }}</dd></div>
         <div><dt>回源</dt><dd class="mono">{{ site.target_url }}</dd></div>
         <div><dt>入口</dt><dd>{{ INGRESS_LABEL[mode] }}</dd></div>
-        <div v-if="site.main_video_stream_mode !== 'direct'"><dt>从机分流</dt><dd>{{ site.edge_routing_mode === 'master' ? '仅走主机' : '跟随全局三网分流' }}</dd></div>
+        <div v-if="site.main_video_stream_mode !== 'direct'"><dt>从机分流</dt><dd>{{ edgeRoutingText }}</dd></div>
         <div><dt>客户端身份</dt><dd>{{ UA_LABEL[String(site.ua_mode)] || site.ua_mode }}</dd></div>
         <div>
           <dt>延迟</dt>

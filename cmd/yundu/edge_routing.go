@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -10,19 +13,52 @@ import (
 	"time"
 )
 
+var (
+	errEdgeFullNodeUnavailable    = errors.New("bound edge node is offline or unavailable")
+	errEdgeAgentEgressUnsupported = errors.New("edge agent does not support full-chain egress; please upgrade agent to v1.4.8+")
+)
+
+type edgeEgressTargetContextKey struct{}
+
+type edgeEgressTarget struct {
+	NodeID    int64
+	NodeName  string
+	PublicURL string
+	Token     string
+}
+
+func withEdgeEgressTarget(ctx context.Context, target edgeEgressTarget) context.Context {
+	return context.WithValue(ctx, edgeEgressTargetContextKey{}, target)
+}
+
+func edgeEgressTargetFrom(ctx context.Context) (edgeEgressTarget, bool) {
+	if ctx == nil {
+		return edgeEgressTarget{}, false
+	}
+	v, ok := ctx.Value(edgeEgressTargetContextKey{}).(edgeEgressTarget)
+	if !ok || v.NodeID <= 0 || v.PublicURL == "" || v.Token == "" {
+		return edgeEgressTarget{}, false
+	}
+	return v, true
+}
+
 type edgeRequestContextKey struct{}
 
 type edgeRequestContext struct {
-	clientIP       string
-	shareUser      *shareUserState
-	shareTokenHash string
+	clientIP         string
+	shareUser        *shareUserState
+	shareTokenHash   string
+	edgeFullResolved bool
+	edgeFullDecision edgeRouteDecision
 }
 
-func withEdgeRequestContext(ctx context.Context, clientIP string, shareUser *shareUserState, shareTokenHash string) context.Context {
+func withEdgeRequestContext(ctx context.Context, clientIP string, shareUser *shareUserState, shareTokenHash string, edgeFullResolved bool, edgeFullDecision edgeRouteDecision) context.Context {
 	return context.WithValue(ctx, edgeRequestContextKey{}, edgeRequestContext{
-		clientIP:       clientIP,
-		shareUser:      shareUser,
-		shareTokenHash: shareTokenHash,
+		clientIP:         clientIP,
+		shareUser:        shareUser,
+		shareTokenHash:   shareTokenHash,
+		edgeFullResolved: edgeFullResolved,
+		edgeFullDecision: edgeFullDecision,
 	})
 }
 
@@ -32,6 +68,95 @@ func edgeRequestContextFrom(ctx context.Context) edgeRequestContext {
 	}
 	v, _ := ctx.Value(edgeRequestContextKey{}).(edgeRequestContext)
 	return v
+}
+
+// resolveEdgeFullDecision determines the single consistent egress node for a
+// site running in edge_full mode. lockedNodeID is >0 for a specific edge node,
+// or -1 when explicitly bound to master. Returns errEdgeFullNodeUnavailable
+// (fail-closed) if a pinned or session-locked edge node is offline/unroutable.
+func resolveEdgeFullDecision(pm *ProxyManager, site Site, clientIP string, sessionEgressNodeID int64, advanceRR bool) (edgeRouteDecision, int64, error) {
+	if site.EdgeRoutingMode != edgeRoutingModeEdgeFull {
+		return edgeRouteDecision{}, 0, nil
+	}
+	if site.EdgePinnedNodeID > 0 {
+		if pm == nil || pm.edges == nil {
+			return edgeRouteDecision{}, 0, errEdgeFullNodeUnavailable
+		}
+		decision, ok := pm.edges.nodeDecisionByID(site.EdgePinnedNodeID)
+		if !ok {
+			return edgeRouteDecision{}, 0, errEdgeFullNodeUnavailable
+		}
+		return decision, decision.NodeID, nil
+	}
+	if sessionEgressNodeID > 0 {
+		if pm == nil || pm.edges == nil {
+			return edgeRouteDecision{}, 0, errEdgeFullNodeUnavailable
+		}
+		decision, ok := pm.edges.nodeDecisionByID(sessionEgressNodeID)
+		if !ok {
+			return edgeRouteDecision{}, 0, errEdgeFullNodeUnavailable
+		}
+		return decision, decision.NodeID, nil
+	}
+	if sessionEgressNodeID < 0 {
+		return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+	}
+	if pm == nil || pm.edges == nil {
+		return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+	}
+	decision := pm.edges.selectNodeForIPInternal(clientIP, advanceRR)
+	if decision.NodeID > 0 {
+		return decision, decision.NodeID, nil
+	}
+	return edgeRouteDecision{NodeID: 0, NodeName: "主机"}, -1, nil
+}
+
+type edgeEgressTransport struct {
+	base http.RoundTripper
+}
+
+func (t *edgeEgressTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	target, ok := edgeEgressTargetFrom(req.Context())
+	if !ok {
+		return t.base.RoundTrip(req)
+	}
+	egressEndpoint := strings.TrimRight(target.PublicURL, "/") + edgeEgressPath
+	egressURL, err := url.Parse(egressEndpoint)
+	if err != nil || (egressURL.Scheme != "http" && egressURL.Scheme != "https") || egressURL.Host == "" {
+		return nil, fmt.Errorf("invalid edge egress endpoint: %w", errEdgeFullNodeUnavailable)
+	}
+	hostHeader := req.Host
+	if hostHeader == "" && req.URL != nil {
+		hostHeader = req.URL.Host
+	}
+	ticket := edgeEgressTicket{
+		NodeID:    target.NodeID,
+		TargetURL: req.URL.String(),
+		Host:      hostHeader,
+		ExpiresAt: time.Now().Add(edgeEgressTicketTTL).Unix(),
+	}
+	sealed, err := sealEdgeEgressTicket(target.Token, ticket)
+	if err != nil {
+		return nil, err
+	}
+	outReq := req.Clone(req.Context())
+	outReq.URL = egressURL
+	outReq.Host = egressURL.Host
+	outReq.RequestURI = ""
+	outReq.Header.Set(edgeEgressTicketHeader, sealed)
+
+	resp, err := t.base.RoundTrip(outReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Header.Get(edgeEgressMarkerHeader) != "1" && resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		return nil, errEdgeAgentEgressUnsupported
+	}
+	resp.Header.Del(edgeEgressMarkerHeader)
+	resp.Request = req
+	return resp, nil
 }
 
 // isEdgeOffloadableMediaRequest returns true for video/audio playback streams
@@ -174,7 +299,16 @@ func tryRedirectToEdgeNode(
 	if !isEdgeOffloadableMediaRequest(r) {
 		return false
 	}
-	decision := pm.edges.selectNodeForDispatch(clientIP)
+	var decision edgeRouteDecision
+	if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+		edgeCtx := edgeRequestContextFrom(r.Context())
+		if !edgeCtx.edgeFullResolved {
+			return false
+		}
+		decision = edgeCtx.edgeFullDecision
+	} else {
+		decision = pm.edges.selectNodeForDispatch(clientIP)
+	}
 	if decision.NodeID <= 0 {
 		return false
 	}
@@ -220,7 +354,15 @@ func tryRedirectDynamicResourceToEdgeNode(
 		return false
 	}
 	edgeCtx := edgeRequestContextFrom(r.Context())
-	decision := pm.edges.selectNodeForDispatch(edgeCtx.clientIP)
+	var decision edgeRouteDecision
+	if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+		if !edgeCtx.edgeFullResolved {
+			return false
+		}
+		decision = edgeCtx.edgeFullDecision
+	} else {
+		decision = pm.edges.selectNodeForDispatch(edgeCtx.clientIP)
+	}
 	if decision.NodeID <= 0 {
 		return false
 	}

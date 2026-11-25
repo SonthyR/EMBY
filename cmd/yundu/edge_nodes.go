@@ -37,6 +37,10 @@ const (
 	edgeNodeOfflineAfter     = 30 * time.Second
 	edgeTicketTTL            = 6 * time.Hour
 	edgeTicketPathPrefix     = "/_yundu/p/"
+	edgeEgressPath           = "/_yundu/egress"
+	edgeEgressTicketHeader   = "X-Yundu-Egress-Ticket"
+	edgeEgressMarkerHeader   = "X-Yundu-Egress"
+	edgeEgressTicketTTL      = 2 * time.Minute
 	edgeMaxTicketBytes       = 16 << 10
 	edgeHeartbeatBodyLimit   = 1 << 20
 	edgeNodeDefaultPort      = 19090
@@ -193,6 +197,84 @@ func edgeNodeTokenHash(token string) string {
 func edgeTicketKeyFromToken(token string) []byte {
 	sum := sha256.Sum256(append([]byte("yundu-edge-ticket:v1:"), []byte(token)...))
 	return sum[:]
+}
+
+func edgeEgressKeyFromToken(token string) []byte {
+	sum := sha256.Sum256(append([]byte("yundu-edge-egress:v1:"), []byte(token)...))
+	return sum[:]
+}
+
+type edgeEgressTicket struct {
+	Version   int    `json:"v"`
+	NodeID    int64  `json:"n"`
+	TargetURL string `json:"t"`
+	Host      string `json:"h,omitempty"`
+	ExpiresAt int64  `json:"exp"`
+}
+
+func sealEdgeEgressTicket(token string, ticket edgeEgressTicket) (string, error) {
+	if token == "" {
+		return "", errors.New("edge node token unavailable")
+	}
+	ticket.Version = 1
+	plain, err := json.Marshal(ticket)
+	if err != nil {
+		return "", err
+	}
+	if len(plain) > edgeMaxTicketBytes {
+		return "", errors.New("egress ticket too large")
+	}
+	block, err := aes.NewCipher(edgeEgressKeyFromToken(token))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nonce, nonce, plain, nil)
+	return base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+
+func openEdgeEgressTicket(token, encoded string) (edgeEgressTicket, error) {
+	var ticket edgeEgressTicket
+	if token == "" || encoded == "" || len(encoded) > edgeMaxTicketBytes*2 {
+		return ticket, errors.New("invalid egress ticket")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return ticket, errors.New("malformed egress ticket")
+	}
+	block, err := aes.NewCipher(edgeEgressKeyFromToken(token))
+	if err != nil {
+		return ticket, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return ticket, err
+	}
+	if len(raw) < gcm.NonceSize()+gcm.Overhead() {
+		return ticket, errors.New("truncated egress ticket")
+	}
+	nonce, ciphertext := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return ticket, errors.New("invalid egress ticket signature")
+	}
+	if err := json.Unmarshal(plain, &ticket); err != nil {
+		return ticket, errors.New("corrupt egress ticket")
+	}
+	if ticket.Version != 1 || ticket.TargetURL == "" {
+		return ticket, errors.New("unsupported egress ticket")
+	}
+	if ticket.ExpiresAt > 0 && time.Now().Unix() > ticket.ExpiresAt {
+		return ticket, errors.New("egress ticket expired")
+	}
+	return ticket, nil
 }
 
 type edgePlaybackTicket struct {
@@ -873,6 +955,38 @@ func (rt *edgeNodeRuntime) selectNodeForIP(clientIP string) edgeRouteDecision {
 // selectNodeForDispatch picks a node for live media playback and advances round-robin state.
 func (rt *edgeNodeRuntime) selectNodeForDispatch(clientIP string) edgeRouteDecision {
 	return rt.selectNodeForIPInternal(clientIP, true)
+}
+
+// nodeDecisionByID returns a routable edge decision for a specific node ID.
+func (rt *edgeNodeRuntime) nodeDecisionByID(nodeID int64) (edgeRouteDecision, bool) {
+	if rt == nil || nodeID <= 0 {
+		return edgeRouteDecision{}, false
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	node := rt.nodes[nodeID]
+	if node == nil || !node.routableAt(now) {
+		return edgeRouteDecision{}, false
+	}
+	return edgeRouteDecision{
+		NodeID:    node.id,
+		NodeName:  node.name,
+		PublicURL: node.publicURL(),
+		Token:     node.tokenPlain,
+	}, true
+}
+
+func (rt *edgeNodeRuntime) nodeNameByID(nodeID int64) string {
+	if rt == nil || nodeID <= 0 {
+		return ""
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if node := rt.nodes[nodeID]; node != nil {
+		return node.name
+	}
+	return ""
 }
 
 func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP string, advanceRR bool) edgeRouteDecision {

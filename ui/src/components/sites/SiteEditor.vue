@@ -6,18 +6,18 @@ import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import SiteAccounts from './SiteAccounts.vue'
-import { sitesApi, type IngressCapabilities, type Site, type SiteAccount } from '@/api'
+import { edgeApi, sitesApi, type EdgeNode, type IngressCapabilities, type Site, type SiteAccount } from '@/api'
 import { errorMessage, toast } from '@/stores/toast'
 import { normalizedIngressMode } from './siteLogic'
 
-const props = defineProps<{ open: boolean; site: Site | null; capabilities: IngressCapabilities }>()
+const props = defineProps<{ open: boolean; site: Site | null; capabilities: IngressCapabilities; edgeNodes?: EdgeNode[] }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
 
 type Line = { name: string; url: string; enabled: boolean; test?: string }
 type Header = { name: string; value: string; configured: boolean }
 interface EditorState {
   name: string; target: string; lines: Line[]; ingress: string; pathPrefix: string; routePrefix: string; publicHost: string; port: string | number
-  routing: string; edgeRoutingMode: 'global' | 'master'; profile: string; rules: { type: string; value: string }[]; playbackURL: string; streamHosts: string[]
+  routing: string; edgeRoutingMode: 'global' | 'master' | 'edge_full'; edgePinnedNodeId: number; profile: string; rules: { type: string; value: string }[]; playbackURL: string; streamHosts: string[]
   ua: string; customUA: string; customClient: string; customVersion: string; clientIP: string; headers: Header[]
   cache: boolean; cacheHours: string | number; cacheMB: string | number; cacheRules: string; quotaGB: string | number; speed: string | number
   extremeAck: boolean; extremeName: string
@@ -33,6 +33,7 @@ const cfg = ref<EditorState>({
   port: '' as string | number,
   routing: 'auto',
   edgeRoutingMode: 'global',
+  edgePinnedNodeId: 0,
   profile: 'compatible',
   rules: [] as { type: string; value: string }[],
   playbackURL: '',
@@ -53,6 +54,8 @@ const cfg = ref<EditorState>({
   extremeName: '',
 })
 const accounts = ref<SiteAccount[]>([])
+const loadedEdgeNodes = ref<EdgeNode[]>([])
+const availableEdgeNodes = computed(() => (props.edgeNodes && props.edgeNodes.length ? props.edgeNodes : loadedEdgeNodes.value))
 const dynamicAvailable = ref(true)
 const initialProfile = ref('')
 const saving = ref(false)
@@ -84,7 +87,8 @@ watch(
       publicHost: host,
       port: s.listen_port || '',
       routing: s.main_video_stream_mode === 'direct' ? 'direct' : props.site ? (s.dynamic_discovery_enabled ? 'auto' : 'manual') : 'auto',
-      edgeRoutingMode: s.edge_routing_mode === 'master' ? 'master' : 'global',
+      edgeRoutingMode: s.edge_routing_mode === 'master' ? 'master' : s.edge_routing_mode === 'edge_full' ? 'edge_full' : 'global',
+      edgePinnedNodeId: Number(s.edge_pinned_node_id) > 0 ? Number(s.edge_pinned_node_id) : 0,
       profile: ['safe', 'compatible', 'extreme'].includes(s.dynamic_profile) ? s.dynamic_profile : 'compatible',
       rules: Array.isArray(s.dynamic_domain_rules) ? s.dynamic_domain_rules.map((r: any) => ({ type: r.type || 'suffix', value: r.value || '' })) : [],
       playbackURL: s.playback_target_url || '',
@@ -122,6 +126,13 @@ watch(
       dynamicAvailable.value = profiles?.available === true
     } catch {
       dynamicAvailable.value = false
+    }
+    if (!props.edgeNodes || !props.edgeNodes.length) {
+      try {
+        loadedEdgeNodes.value = await edgeApi.list()
+      } catch {
+        loadedEdgeNodes.value = []
+      }
     }
   },
 )
@@ -230,6 +241,7 @@ function buildPayload(): Record<string, unknown> | null {
     playback_mode: 'direct',
     main_video_stream_mode: cfg.value.routing === 'direct' ? 'direct' : 'proxy',
     edge_routing_mode: cfg.value.edgeRoutingMode,
+    edge_pinned_node_id: cfg.value.edgeRoutingMode === 'edge_full' ? Number(cfg.value.edgePinnedNodeId) || 0 : 0,
     stream_hosts: cfg.value.routing === 'manual' ? cfg.value.streamHosts.map(s => s.trim()).filter(Boolean) : [],
     ...ingress,
     upstream_headers: headers.map(h => ({ name: h.name.trim(), value: h.value.trim() })),
@@ -382,10 +394,35 @@ async function save() {
             <UiButton size="sm" variant="ghost" @click="cfg.streamHosts.push('')"><Plus />添加节点</UiButton>
           </div>
         </template>
-        <UiField v-if="cfg.routing !== 'direct'" label="从机分流" for="se-edge-routing" help="选择「仅走主机」后，该站点视频将跳过三网从机始终由主机中转。">
+        <UiField
+          v-if="cfg.routing !== 'direct'"
+          label="从机分流"
+          for="se-edge-routing"
+          :help="
+            cfg.edgeRoutingMode === 'edge_full'
+              ? '同源单 IP 全链路：登录、接口、WebSocket 与视频播放全部通过同一最佳节点访问源站（需从机升级到 v1.4.8+），节点离线时自动拦截不回退主机 IP，适合限制多 IP/跨区登录的严格 Emby 站。'
+              : cfg.edgeRoutingMode === 'master'
+                ? '仅走主机：该站点所有请求与视频始终由主机中转，跳过三网从机。'
+                : '跟随全局三网分流：控制面走主机，视频流按用户运营商路由分流到最佳从机。'
+          "
+        >
           <select id="se-edge-routing" v-model="cfg.edgeRoutingMode" class="select">
             <option value="global">跟随全局三网分流（默认）</option>
+            <option value="edge_full">同源单 IP 全链路（登录与播放全走同一最佳节点）</option>
             <option value="master">仅走主机（不走从机）</option>
+          </select>
+        </UiField>
+        <UiField
+          v-if="cfg.routing !== 'direct' && cfg.edgeRoutingMode === 'edge_full'"
+          label="出口节点策略"
+          for="se-edge-pinned"
+          help="默认按用户 IP 运营商自动选最佳节点并在本次登录会话内锁定；若多个用户共用同一源站账号且源站严格限制单 IP，可固定到指定从机。"
+        >
+          <select id="se-edge-pinned" v-model.number="cfg.edgePinnedNodeId" class="select">
+            <option :value="0">自动按用户运营商选最佳节点（推荐）</option>
+            <option v-for="node in availableEdgeNodes" :key="node.id" :value="node.id">
+              固定走从机：{{ node.name }}{{ node.online ? '' : '（当前离线）' }}
+            </option>
           </select>
         </UiField>
       </fieldset>

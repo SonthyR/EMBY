@@ -5153,7 +5153,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	expectedKeys := map[string]bool{
 		"id": true, "sort_order": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
 		"primary_line_name":   true,
-		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "edge_routing_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
+		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "edge_routing_mode": true, "edge_pinned_node_id": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
 		"custom_version": true, "client_ip_mode": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,

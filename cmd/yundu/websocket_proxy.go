@@ -46,20 +46,54 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 	}
 	defer inst.untrackHijackedConn(clientConn)
 
-	// Connect to upstream
+	// Connect to upstream (or to the pinned edge node's controlled egress in edge_full mode)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	var upstreamConn net.Conn
-	port := target.Port()
+	upstreamURL := *r.URL
+	applyUpstreamURL(&upstreamURL, target)
+
+	egress, viaEdge := edgeEgressTargetFrom(r.Context())
+	dialTarget := target
+	dialScheme := scheme
+	var egressTicketSealed string
+	if viaEdge {
+		egressURL, parseErr := url.Parse(strings.TrimRight(egress.PublicURL, "/") + edgeEgressPath)
+		if parseErr != nil || (egressURL.Scheme != "http" && egressURL.Scheme != "https") || egressURL.Host == "" {
+			log.Printf("[WS] invalid edge egress URL")
+			writeWebSocketGatewayError(clientConn)
+			return
+		}
+		var sealErr error
+		egressTicketSealed, sealErr = sealEdgeEgressTicket(egress.Token, edgeEgressTicket{
+			NodeID:    egress.NodeID,
+			TargetURL: upstreamURL.String(),
+			Host:      target.Host,
+			ExpiresAt: time.Now().Add(edgeEgressTicketTTL).Unix(),
+		})
+		if sealErr != nil {
+			log.Printf("[WS] seal edge egress ticket: %v", sealErr)
+			writeWebSocketGatewayError(clientConn)
+			return
+		}
+		dialTarget = egressURL
+		if egressURL.Scheme == "https" {
+			dialScheme = "wss"
+		} else {
+			dialScheme = "ws"
+		}
+	}
+
+	port := dialTarget.Port()
 	if port == "" {
-		if scheme == "wss" {
+		if dialScheme == "wss" {
 			port = "443"
 		} else {
 			port = "80"
 		}
 	}
-	host := net.JoinHostPort(target.Hostname(), port)
-	if scheme == "wss" {
-		upstreamConn, err = tls.DialWithDialer(dialer, "tcp", host, secureTLSConfig(target.Hostname()))
+	host := net.JoinHostPort(dialTarget.Hostname(), port)
+	if dialScheme == "wss" {
+		upstreamConn, err = tls.DialWithDialer(dialer, "tcp", host, secureTLSConfig(dialTarget.Hostname()))
 	} else {
 		upstreamConn, err = dialer.Dial("tcp", host)
 	}
@@ -75,9 +109,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		log.Printf("[WS] set handshake deadline: %v", err)
 		return
 	}
-	upstreamURL := *r.URL
-	applyUpstreamURL(&upstreamURL, target)
-	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, upstreamURL.RequestURI())
+	reqURI := upstreamURL.RequestURI()
+	if viaEdge {
+		reqURI = edgeEgressPath
+	}
+	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, reqURI)
 	if _, err := io.WriteString(upstreamConn, reqLine); err != nil { // #nosec G705 -- net/http rejects control characters in the parsed method and RequestURI.
 		log.Printf("[WS] write request line: %v", err)
 		return
@@ -91,6 +127,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		upstreamHeader.Set("Host", target.Host)
 	}
 	applySiteForwardedHost(upstreamHeader, r, inst.Site)
+	if viaEdge {
+		upstreamHeader.Set("Host", dialTarget.Host)
+		upstreamHeader.Set(edgeEgressTicketHeader, egressTicketSealed)
+	}
 	if err := upstreamHeader.Write(upstreamConn); err != nil {
 		log.Printf("[WS] write request headers: %v", err)
 		return

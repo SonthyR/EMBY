@@ -91,6 +91,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PlaybackMode               string                `json:"playback_mode"`
 			MainVideoStreamMode        string                `json:"main_video_stream_mode"`
 			EdgeRoutingMode            string                `json:"edge_routing_mode"`
+			EdgePinnedNodeID           int64                 `json:"edge_pinned_node_id"`
 			FailoverTargets            []string              `json:"failover_targets"`
 			FailoverLines              []FailoverLine        `json:"failover_lines"`
 			StreamHosts                []string              `json:"stream_hosts"`
@@ -277,6 +278,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		req.EdgePinnedNodeID = normalizeEdgePinnedNodeID(req.EdgePinnedNodeID)
 		if err := validateSiteSettings(req.Name, req.ListenPort, req.TargetURL, req.PlaybackTargetURL, req.PlaybackMode, req.StreamHosts, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion, req.Quota, req.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -337,6 +339,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			PlaybackMode:                  req.PlaybackMode,
 			MainVideoStreamMode:           req.MainVideoStreamMode,
 			EdgeRoutingMode:               req.EdgeRoutingMode,
+			EdgePinnedNodeID:              req.EdgePinnedNodeID,
 			FailoverTargets:               string(failoverTargetsJSON),
 			StoredFailoverLines:           string(failoverLinesJSON),
 			StreamHosts:                   string(streamHostsJSON),
@@ -596,6 +599,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			PlaybackMode               *string                `json:"playback_mode"`
 			MainVideoStreamMode        *string                `json:"main_video_stream_mode"`
 			EdgeRoutingMode            *string                `json:"edge_routing_mode"`
+			EdgePinnedNodeID           *int64                 `json:"edge_pinned_node_id"`
 			FailoverTargets            *[]string              `json:"failover_targets"`
 			FailoverLines              *[]FailoverLine        `json:"failover_lines"`
 			StreamHosts                *[]string              `json:"stream_hosts"`
@@ -669,6 +673,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
 			}
+		}
+		edgePinnedNodeID := oldSite.EdgePinnedNodeID
+		if req.EdgePinnedNodeID != nil {
+			edgePinnedNodeID = normalizeEdgePinnedNodeID(*req.EdgePinnedNodeID)
 		}
 		streamHosts := oldSite.StreamHosts
 		if req.StreamHosts != nil {
@@ -867,6 +875,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.PlaybackMode = playbackMode
 		candidate.MainVideoStreamMode = mainVideoStreamMode
 		candidate.EdgeRoutingMode = edgeRoutingMode
+		candidate.EdgePinnedNodeID = edgePinnedNodeID
 		candidate.FailoverTargets = failoverTargets
 		candidate.StoredFailoverLines = failoverLines
 		candidate.StreamHosts = streamHosts

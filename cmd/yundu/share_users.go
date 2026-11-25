@@ -102,6 +102,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_user_sites", "sort_order", "ALTER TABLE share_user_sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
 		{"share_user_sessions", "site_account_id", "ALTER TABLE share_user_sessions ADD COLUMN site_account_id INTEGER NOT NULL DEFAULT 0"},
+		{"share_user_sessions", "egress_node_id", "ALTER TABLE share_user_sessions ADD COLUMN egress_node_id INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+column.table+"') WHERE name=?", column.name).Scan(&exists); err != nil {
@@ -189,8 +190,9 @@ func (a *shareSessionActivity) isWatching(now time.Time) bool {
 }
 
 type shareSessionEntry struct {
-	userID int64
-	siteID int64
+	userID       int64
+	siteID       int64
+	egressNodeID int64
 }
 
 type shareUserState struct {
@@ -348,7 +350,7 @@ func (rt *shareUserRuntime) reload() error {
 	}
 	siteRows.Close()
 
-	sessionRows, err := rt.db.db.Query(`SELECT token_hash, share_user_id, site_id FROM share_user_sessions`)
+	sessionRows, err := rt.db.db.Query(`SELECT token_hash, share_user_id, site_id, egress_node_id FROM share_user_sessions`)
 	if err != nil {
 		return err
 	}
@@ -356,7 +358,7 @@ func (rt *shareUserRuntime) reload() error {
 	for sessionRows.Next() {
 		var hash string
 		var entry shareSessionEntry
-		if err := sessionRows.Scan(&hash, &entry.userID, &entry.siteID); err != nil {
+		if err := sessionRows.Scan(&hash, &entry.userID, &entry.siteID, &entry.egressNodeID); err != nil {
 			sessionRows.Close()
 			return err
 		}
@@ -1056,13 +1058,26 @@ func (rt *shareUserRuntime) markEdgePlayback(tokenHash, nodeName string) {
 	rt.mu.Unlock()
 }
 
+func (rt *shareUserRuntime) sessionEgressNodeID(tokenHash string) (int64, bool) {
+	if rt == nil || tokenHash == "" {
+		return 0, false
+	}
+	rt.mu.RLock()
+	entry, ok := rt.sessions[tokenHash]
+	rt.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	return entry.egressNodeID, true
+}
+
 func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
 	if rt == nil || rt.db == nil || tokenHash == "" {
 		return nil
 	}
 	var session shareStoredSession
-	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
-		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID)
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
+		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		rt.mu.Lock()
 		delete(rt.sessions, tokenHash)
@@ -1095,6 +1110,7 @@ type shareLoginPending struct {
 	device       string
 	client       string
 	clientIP     string
+	egressNodeID int64
 	parsed       *shareLoginBody
 	candidates   []shareUpstreamCandidate
 	candidateIdx int
@@ -1566,8 +1582,8 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	}
 	hash := shareTokenHash(token)
 	accountID := pending.currentAccountID()
-	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
-		hash, pending.user.id, pending.siteID, accountID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
+	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, egress_node_id=excluded.egress_node_id, token_ciphertext=excluded.token_ciphertext, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
+		hash, pending.user.id, pending.siteID, accountID, pending.egressNodeID, ciphertext, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
 		return err
 	}
 	// Upstreams may hand the same token back to a device that signs in again.
@@ -1576,7 +1592,7 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	}
 	rt.mu.Lock()
 	delete(rt.revoked, hash)
-	rt.sessions[hash] = shareSessionEntry{userID: pending.user.id, siteID: pending.siteID}
+	rt.sessions[hash] = shareSessionEntry{userID: pending.user.id, siteID: pending.siteID, egressNodeID: pending.egressNodeID}
 	rt.lastSeen[hash] = time.Now()
 	if act := rt.activity[hash]; act != nil {
 		act.draining = false
@@ -1690,6 +1706,7 @@ type shareStoredSession struct {
 	TokenHash    string `json:"-"`
 	SessionID    string `json:"session_id,omitempty"`
 	ciphertext   string
+	egressNodeID int64
 	lastSeen     time.Time
 	SiteID       int64  `json:"site_id"`
 	SiteName     string `json:"site_name"`
@@ -1732,7 +1749,7 @@ func (rt *shareUserRuntime) lookupSessionRegion(clientIP string) string {
 }
 
 func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, error) {
-	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_id, s.device_name, s.client, s.client_ip, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
+	rows, err := rt.db.db.Query(`SELECT s.token_hash, s.token_ciphertext, s.site_id, COALESCE(t.name, ''), s.device_id, s.device_name, s.client, s.client_ip, s.egress_node_id, COALESCE(s.created_at, ''), COALESCE(s.last_seen_at, '') FROM share_user_sessions s LEFT JOIN sites t ON t.id=s.site_id WHERE s.share_user_id=? ORDER BY s.last_seen_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1740,7 +1757,7 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 	result := make([]shareStoredSession, 0)
 	for rows.Next() {
 		var item shareStoredSession
-		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.CreatedAt, &item.LastSeenAt); err != nil {
+		if err := rows.Scan(&item.TokenHash, &item.ciphertext, &item.SiteID, &item.SiteName, &item.DeviceID, &item.DeviceName, &item.Client, &item.ClientIP, &item.egressNodeID, &item.CreatedAt, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
 		item.SessionID = item.TokenHash
@@ -1767,6 +1784,13 @@ func (rt *shareUserRuntime) listSessions(userID int64) ([]shareStoredSession, er
 		}
 	}
 	rt.mu.RUnlock()
+	if rt.pm != nil && rt.pm.edges != nil {
+		for i := range result {
+			if result[i].NodeName == "" && result[i].egressNodeID > 0 {
+				result[i].NodeName = rt.pm.edges.nodeNameByID(result[i].egressNodeID)
+			}
+		}
+	}
 	return result, nil
 }
 
@@ -1800,19 +1824,22 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 	if rt == nil || rt.db == nil {
 		return []liveShareSessionView{}, nil
 	}
-	rows, err := rt.db.db.Query(`SELECT s.share_user_id, COALESCE(u.username, ''), s.token_hash, s.site_id, COALESCE(t.name, ''), s.device_name, s.client, s.client_ip, COALESCE(s.last_seen_at, '') FROM share_user_sessions s JOIN share_users u ON u.id=s.share_user_id LEFT JOIN sites t ON t.id=s.site_id ORDER BY s.last_seen_at DESC LIMIT 200`)
+	rows, err := rt.db.db.Query(`SELECT s.share_user_id, COALESCE(u.username, ''), s.token_hash, s.site_id, COALESCE(t.name, ''), s.device_name, s.client, s.client_ip, s.egress_node_id, COALESCE(s.last_seen_at, '') FROM share_user_sessions s JOIN share_users u ON u.id=s.share_user_id LEFT JOIN sites t ON t.id=s.site_id ORDER BY s.last_seen_at DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	result := make([]liveShareSessionView, 0)
+	egressNodes := make([]int64, 0)
 	for rows.Next() {
 		var item liveShareSessionView
-		if err := rows.Scan(&item.ShareUserID, &item.Username, &item.SessionID, &item.SiteID, &item.SiteName, &item.DeviceName, &item.Client, &item.ClientIP, &item.LastSeenAt); err != nil {
+		var egressNodeID int64
+		if err := rows.Scan(&item.ShareUserID, &item.Username, &item.SessionID, &item.SiteID, &item.SiteName, &item.DeviceName, &item.Client, &item.ClientIP, &egressNodeID, &item.LastSeenAt); err != nil {
 			return nil, err
 		}
 		item.ClientRegion = rt.lookupSessionRegion(item.ClientIP)
 		result = append(result, item)
+		egressNodes = append(egressNodes, egressNodeID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1831,6 +1858,13 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 		}
 	}
 	rt.mu.RUnlock()
+	if rt.pm != nil && rt.pm.edges != nil {
+		for i := range result {
+			if result[i].NodeName == "" && egressNodes[i] > 0 {
+				result[i].NodeName = rt.pm.edges.nodeNameByID(egressNodes[i])
+			}
+		}
+	}
 	// Sort playing sessions first, preserving recency order within each bucket.
 	playing := make([]liveShareSessionView, 0, len(result))
 	idle := make([]liveShareSessionView, 0, len(result))
@@ -1853,8 +1887,8 @@ func (rt *shareUserRuntime) revokeUserSession(userID int64, sessionID string) (b
 		return false, nil
 	}
 	var session shareStoredSession
-	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id FROM share_user_sessions WHERE share_user_id=? AND token_hash=?`, userID, sessionID).
-		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID)
+	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE share_user_id=? AND token_hash=?`, userID, sessionID).
+		Scan(&session.TokenHash, &session.ciphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1882,7 +1916,7 @@ func (rt *shareUserRuntime) revokeOne(session shareStoredSession) error {
 	rt.revoked[session.TokenHash] = session.SiteID
 	rt.mu.Unlock()
 	if token, err := decryptSiteAccountSecret(session.ciphertext); err == nil && token != "" {
-		rt.logoutUpstream(session.SiteID, token)
+		rt.logoutUpstream(session.SiteID, token, session.egressNodeID)
 	}
 	return nil
 }
@@ -1938,7 +1972,7 @@ func (rt *shareUserRuntime) revokeAsync(userID, siteID int64, reason string) {
 	}()
 }
 
-func (rt *shareUserRuntime) logoutUpstream(siteID int64, token string) {
+func (rt *shareUserRuntime) logoutUpstream(siteID int64, token string, egressNodeID int64) {
 	if rt.pm == nil {
 		return
 	}
@@ -1948,10 +1982,37 @@ func (rt *shareUserRuntime) logoutUpstream(siteID int64, token string) {
 	if inst == nil || inst.shareLogout == nil {
 		return
 	}
+	var egressTarget *edgeEgressTarget
+	if inst.Site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+		nodeID := inst.Site.EdgePinnedNodeID
+		if nodeID <= 0 {
+			nodeID = egressNodeID
+		}
+		if nodeID > 0 {
+			if rt.pm.edges == nil {
+				log.Printf("[%s] skip upstream logout: bound edge node #%d unavailable", inst.Site.Name, nodeID)
+				return
+			}
+			decision, ok := rt.pm.edges.nodeDecisionByID(nodeID)
+			if !ok {
+				log.Printf("[%s] skip upstream logout: bound edge node #%d offline (preventing master IP leak)", inst.Site.Name, nodeID)
+				return
+			}
+			egressTarget = &edgeEgressTarget{
+				NodeID:    decision.NodeID,
+				NodeName:  decision.NodeName,
+				PublicURL: decision.PublicURL,
+				Token:     decision.Token,
+			}
+		}
+	}
 	logout := inst.shareLogout
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), shareLogoutTimeout)
 		defer cancel()
+		if egressTarget != nil {
+			ctx = withEdgeEgressTarget(ctx, *egressTarget)
+		}
 		if err := logout(ctx, token); err != nil {
 			log.Printf("[%s] share session upstream logout failed: %v", inst.Site.Name, err)
 		}

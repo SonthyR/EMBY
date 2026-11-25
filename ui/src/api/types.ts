@@ -16,7 +16,8 @@ export interface Site {
   listen_port: number
   public_host: string
   path_prefix: string
-  edge_routing_mode?: 'global' | 'master' | string
+  edge_routing_mode?: 'global' | 'master' | 'edge_full' | string
+  edge_pinned_node_id?: number
   traffic_used?: number
   monthly_traffic?: number
   [key: string]: unknown

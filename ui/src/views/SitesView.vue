@@ -11,7 +11,7 @@ import SiteEditor from '@/components/sites/SiteEditor.vue'
 import SiteImportDialog from '@/components/sites/SiteImportDialog.vue'
 import SiteExportDialog from '@/components/sites/SiteExportDialog.vue'
 import ReminderHistoryDialog from '@/components/sites/ReminderHistoryDialog.vue'
-import { sitesApi, type AccountReminderRow, type IngressCapabilities, type Site } from '@/api'
+import { edgeApi, sitesApi, type AccountReminderRow, type EdgeNode, type IngressCapabilities, type Site } from '@/api'
 import { INGRESS_LABEL, diagLatency, normalizedIngressMode, siteAccessAddress } from '@/components/sites/siteLogic'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -19,6 +19,7 @@ import { copyText, formatBytes } from '@/utils/format'
 
 type Latency = { busy?: boolean; ok?: boolean; ms?: number; error?: string }
 const sites = ref<Site[]>([])
+const edgeNodes = ref<EdgeNode[]>([])
 const capabilities = ref<IngressCapabilities>({})
 const reminders = ref<AccountReminderRow[]>([])
 const loading = ref(true)
@@ -42,9 +43,14 @@ const fileInput = ref<HTMLInputElement | null>(null)
 async function load(silent = false) {
   if (!silent) loading.value = true
   try {
-    const [list, caps] = await Promise.all([sitesApi.list(), sitesApi.capabilities().catch(() => ({}))])
+    const [list, caps, edges] = await Promise.all([
+      sitesApi.list(),
+      sitesApi.capabilities().catch(() => ({})),
+      edgeApi.list().catch(() => [] as EdgeNode[]),
+    ])
     sites.value = list
     capabilities.value = caps
+    edgeNodes.value = edges
     loadError.value = ''
   } catch (error) {
     loadError.value = errorMessage(error, '读取失败')
@@ -351,6 +357,7 @@ const menuItems = [
       :open="!!selected"
       :site="selected"
       :address="selected ? address(selected) : ''"
+      :edge-nodes="edgeNodes"
       :latency="selected ? latency[selected.id] : undefined"
       @close="selectedId = null"
       @edit="selected && edit(selected)"
@@ -359,7 +366,7 @@ const menuItems = [
       @test="selected && test(selected)"
       @copy="selected && copyAddress(selected)"
     />
-    <SiteEditor :open="editorOpen" :site="editingSite" :capabilities="capabilities" @close="editorOpen = false" @saved="onEditorSaved" />
+    <SiteEditor :open="editorOpen" :site="editingSite" :capabilities="capabilities" :edge-nodes="edgeNodes" @close="editorOpen = false" @saved="onEditorSaved" />
     <SiteImportDialog :open="importOpen" :format="importFormat" :data="importData" @close="importOpen = false" @imported="load(true)" />
     <SiteExportDialog :open="exportOpen" @close="exportOpen = false" />
     <ReminderHistoryDialog :open="historyOpen" @close="historyOpen = false" @changed="load(true)" />

@@ -153,13 +153,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
 	proxyTransport.MaxIdleConnsPerHost = 32
 	inst.transport = proxyTransport
-	inst.shareLogout = newShareLogoutFunc(proxyTransport, target, policy, configuredHeaders)
-	baseTransport := http.RoundTripper(proxyTransport)
+	egressTransport := http.RoundTripper(&edgeEgressTransport{base: proxyTransport})
+	inst.shareLogout = newShareLogoutFunc(egressTransport, target, policy, configuredHeaders)
+	baseTransport := egressTransport
 	if pingCacheState != nil {
 		baseTransport = &pingCacheTransport{base: baseTransport, cache: pingCacheState}
 	}
 	if dynamicIssuer != nil {
-		dynamicIssuer.configuredTransport = proxyTransport
+		dynamicIssuer.configuredTransport = egressTransport
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -277,6 +278,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 			if isClientRequestCancellation(originalRequestContext(r.Context()), err) {
+				return
+			}
+			if errors.Is(err, errEdgeAgentEgressUnsupported) {
+				log.Printf("[%s] proxy edge egress unsupported: %v", site.Name, err)
+				writeShareJSONError(w, http.StatusBadGateway, "从机版本过低，请先在「从机」页面升级从机到 v1.4.8+ 后再使用同源单 IP 全链路模式")
 				return
 			}
 			log.Printf("[%s] proxy error: %v", site.Name, err)
@@ -407,7 +413,34 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				return
 			}
 		}
-		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash))
+		var edgeFullResolved bool
+		var edgeFullDecision edgeRouteDecision
+		if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+			var sessionEgressNodeID int64
+			if shareSessionHash != "" && pm.shares != nil {
+				sessionEgressNodeID, _ = pm.shares.sessionEgressNodeID(shareSessionHash)
+			}
+			var lockedNodeID int64
+			var edgeErr error
+			edgeFullDecision, lockedNodeID, edgeErr = resolveEdgeFullDecision(pm, site, requestLogEntry.ClientIP, sessionEgressNodeID, shareLogin != nil)
+			if edgeErr != nil {
+				writeShareJSONError(w, http.StatusServiceUnavailable, "当前绑定的从机离线或不可用，为保护源站账号安全已拦截本次请求")
+				return
+			}
+			edgeFullResolved = true
+			if shareLogin != nil {
+				shareLogin.egressNodeID = lockedNodeID
+			}
+			if edgeFullDecision.NodeID > 0 {
+				r = r.WithContext(withEdgeEgressTarget(r.Context(), edgeEgressTarget{
+					NodeID:    edgeFullDecision.NodeID,
+					NodeName:  edgeFullDecision.NodeName,
+					PublicURL: edgeFullDecision.PublicURL,
+					Token:     edgeFullDecision.Token,
+				}))
+			}
+		}
+		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash, edgeFullResolved, edgeFullDecision))
 		if isReservedDynamicRoute(r.URL.Path) {
 			var rw http.ResponseWriter
 			if speedLimitBytes > 0 {
