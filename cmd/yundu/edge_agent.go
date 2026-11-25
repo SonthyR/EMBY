@@ -155,6 +155,7 @@ func runEdgeAgentCommand(args []string) error {
 
 	go agent.heartbeatLoop(ctx)
 	go agent.probeLoop(ctx)
+	go agent.ispProbeLoop(ctx)
 
 	log.Println("============================================================")
 	log.Printf("  Yundu Edge Agent %s (node #%d)", appVersion, cfg.NodeID)
@@ -277,6 +278,15 @@ type edgeAgent struct {
 	latencies    map[int64]int
 	probeNowCh   chan struct{}
 
+	ispProbeMu          sync.RWMutex
+	ispProbeEnabled     bool
+	ispProbeIntervalSec int
+	ispProbeTargets     map[string][]string
+	ispProbeLastForceID string
+	ispProbeSeq         uint64
+	ispProbeResults     map[string]agentISPProbeResult
+	ispProbeTriggerCh   chan bool
+
 	upgradeMu            sync.RWMutex
 	upgradeReqID         string
 	upgradeStatus        string
@@ -351,9 +361,11 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 		speedLimits:       make(map[int64]int),
 		traffic:           make(map[agentTrafficKey]*agentTrafficAccum),
 		flushCh:           make(chan struct{}, 1),
-		latencies:         make(map[int64]int),
-		probeNowCh:        make(chan struct{}, 1),
-		speedtestNotifyCh: make(chan struct{}, 1),
+		latencies:           make(map[int64]int),
+		probeNowCh:          make(chan struct{}, 1),
+		ispProbeIntervalSec: defaultISPProbeIntervalSec,
+		ispProbeTriggerCh:   make(chan bool, 1),
+		speedtestNotifyCh:   make(chan struct{}, 1),
 		directBudgets:     make(map[string]directStreamBudget),
 		restartCh:         make(chan struct{}),
 	}
@@ -651,6 +663,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 
 	stProgress := a.snapshotSpeedtestProgress()
 	upgradeReqID, upgradeStatus := a.getUpgradeState()
+	ispSeq, ispResults := a.snapshotISPProbe()
 	payload := agentHeartbeatRequest{
 		Version:           appVersion,
 		ListenPort:        a.cfg.Port,
@@ -661,6 +674,8 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 		UptimeSec:         int64(time.Since(a.startedAt).Seconds()),
 		SupportsSpeedtest: true,
 		UpstreamLatencies: a.snapshotLatencies(),
+		ISPProbeSeq:       ispSeq,
+		ISPProbeResults:   ispResults,
 		SpeedtestProgress: stProgress,
 		UpgradeRequestID:  upgradeReqID,
 		UpgradeStatus:     upgradeStatus,
@@ -743,6 +758,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	}
 	a.ackSpeedtestProgress(stProgress, reply.AckSpeedtestID)
 	a.setProbeTargets(reply.ProbeTargets)
+	a.applyISPProbeConfig(reply.ISPProbeConfig)
 	a.handleSpeedtestDirective(ctx, reply.SpeedtestTask, reply.CancelSpeedtestID)
 	if reply.UpgradeToVersion != "" && reply.UpgradeRequestID != "" {
 		a.maybeTriggerUpgrade(ctx, reply.UpgradeToVersion, reply.UpgradeRequestID)

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Activity, Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle, GripVertical } from '@lucide/vue'
+import { Activity, Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle, GripVertical, ShieldAlert } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
+import IspProbeDrawer from '@/components/edge/IspProbeDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiDialog from '@/components/ui/UiDialog.vue'
@@ -620,6 +621,9 @@ const FILTERS: { key: 'all' | EdgeNodeStatus; label: string }[] = [
 
 const speedtestOpen = ref(false)
 const speedtestNodeId = ref(0)
+const ispProbeOpen = ref(false)
+const probingIspNodeId = ref<number | null>(null)
+const resettingCircuitNodeId = ref<number | null>(null)
 
 function openSpeedtest(nodeId: number) {
   speedtestNodeId.value = nodeId
@@ -630,6 +634,46 @@ function speedPillTone(mbps: number): string {
   if (mbps >= 150) return 'good'
   if (mbps >= 50) return 'warn'
   return 'bad'
+}
+
+function ispHealthTone(h: { tripped: boolean; latency_ms: number; consec_fails: number }): string {
+  if (h.tripped) return 'bad'
+  if (h.latency_ms <= 0 || h.consec_fails > 0) return 'warn'
+  if (h.latency_ms < 180) return 'good'
+  return 'warn'
+}
+
+function ispHealthText(h: { isp_label: string; tripped: boolean; latency_ms: number; consec_fails: number }): string {
+  if (h.tripped) return `${h.isp_label} 已熔断`
+  if (h.latency_ms > 0) return `${h.isp_label} ${h.latency_ms}ms`
+  return `${h.isp_label} 不通(${h.consec_fails || 1})`
+}
+
+async function probeNodeISP(node: EdgeNode) {
+  if (probingIspNodeId.value !== null) return
+  probingIspNodeId.value = node.id
+  try {
+    await edgeApi.probeISP(node.id)
+    toast.success(`已向「${node.name}」下发立即三网复测指令，约 5–10 秒后刷新结果`)
+  } catch (error) {
+    toast.error(errorMessage(error, '下发复测失败'))
+  } finally {
+    probingIspNodeId.value = null
+  }
+}
+
+async function resetNodeCircuit(node: EdgeNode) {
+  if (resettingCircuitNodeId.value !== null) return
+  resettingCircuitNodeId.value = node.id
+  try {
+    await edgeApi.resetCircuit(node.id)
+    toast.success(`已手动解除「${node.name}」的阻断熔断状态`)
+    await load(true)
+  } catch (error) {
+    toast.error(errorMessage(error, '解除熔断失败'))
+  } finally {
+    resettingCircuitNodeId.value = null
+  }
 }
 </script>
 
@@ -645,6 +689,7 @@ function speedPillTone(mbps: number): string {
       >
         <ArrowUpCircle />全部升级（{{ upgradeableNodes.length }}）
       </UiButton>
+      <UiButton @click="ispProbeOpen = true"><ShieldAlert />阻断熔断</UiButton>
       <UiButton @click="openSpeedtest(0)"><Activity />测速中心</UiButton>
       <UiButton variant="primary" @click="openCreate"><Plus />添加从机</UiButton>
     </PageHeader>
@@ -720,6 +765,7 @@ function speedPillTone(mbps: number): string {
             </span>
             <h3>{{ node.name }}</h3>
             <span v-if="node.is_master" class="tag master-tag">主机</span>
+            <span v-if="!node.is_master && node.any_circuit_tripped" class="tag bad">疑似阻断 · 已熔断</span>
             <span v-if="node.agent_version" class="tag">{{ node.agent_version }}</span>
             <span v-if="!node.is_master && node.public_host && node.tls_active" class="tag good">HTTPS 自动证书</span>
             <span v-else-if="!node.is_master && node.public_host && node.tls_mode === 'auto' && node.online" class="tag warn">等待同步证书</span>
@@ -767,6 +813,19 @@ function speedPillTone(mbps: number): string {
             </span>
           </div>
 
+          <div v-if="node.online && node.isp_health?.length" class="latency-row">
+            <span class="faint lat-label">三网连通</span>
+            <span
+              v-for="ih in node.isp_health"
+              :key="ih.isp_group"
+              class="lat-pill"
+              :class="ispHealthTone(ih)"
+              :title="`${ih.isp_label} 北上广 TCP 探活 ${ih.reachable_count}/${ih.total_count} 通${ih.tripped ? ' · 已自动熔断切流' : ''}`"
+            >
+              {{ ispHealthText(ih) }}
+            </span>
+          </div>
+
           <p v-if="!node.is_master && node.auto_https && node.cf_dns_status?.startsWith('error:')" class="upgrade-note bad">
             Cloudflare DNS 同步失败：{{ node.cf_dns_status.slice(6) }}
           </p>
@@ -806,6 +865,26 @@ function speedPillTone(mbps: number): string {
             </UiButton>
           </template>
           <template v-else>
+            <UiButton
+              v-if="node.any_circuit_tripped && node.online"
+              size="sm"
+              variant="accent"
+              :loading="probingIspNodeId === node.id"
+              title="立即重新探测北上广三网 TCP 连通性"
+              @click="probeNodeISP(node)"
+            >
+              <RefreshCw />立即复测
+            </UiButton>
+            <UiButton
+              v-if="node.any_circuit_tripped"
+              size="sm"
+              variant="secondary"
+              :loading="resettingCircuitNodeId === node.id"
+              title="手动解除熔断并重新参与分流"
+              @click="resetNodeCircuit(node)"
+            >
+              解除熔断
+            </UiButton>
             <UiButton
               v-if="isNodeUpgradeable(node)"
               size="sm"
@@ -1059,6 +1138,7 @@ function speedPillTone(mbps: number): string {
     </UiDialog>
 
     <SpeedtestDrawer :open="speedtestOpen" :initial-node-id="speedtestNodeId" @close="speedtestOpen = false" @completed="load()" />
+    <IspProbeDrawer :open="ispProbeOpen" @close="ispProbeOpen = false" @saved="load(true)" />
   </div>
 </template>
 
@@ -1124,6 +1204,7 @@ function speedPillTone(mbps: number): string {
 .tag { display: inline-flex; align-items: center; height: 21px; padding: 0 8px; border-radius: 999px; font-size: 11px; background: var(--surface-2); color: var(--text-2); font-family: var(--mono); }
 .tag.good { color: var(--good); background: var(--good-soft); font-family: inherit; font-weight: 600; }
 .tag.warn { color: var(--warn); background: var(--warn-soft); font-family: inherit; font-weight: 600; }
+.tag.bad { color: var(--bad); background: var(--bad-soft); font-family: inherit; font-weight: 600; }
 .tag.master-tag { color: var(--accent); background: var(--accent-soft); font-family: inherit; font-weight: 600; }
 .auto-https-box { padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .auto-https-hint { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.5; }

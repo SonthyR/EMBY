@@ -11,6 +11,7 @@ import type {
   IP2RegionDBStatus,
   IP2RegionLookupResult,
   IP2RegionStatus,
+  ISPProbeSettings,
   ISPRouteStrategy,
   ISPRoutesResponse,
   LiveShareSession,
@@ -296,6 +297,8 @@ export const edgeApi = {
   resetToken: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-token`),
   resetTraffic: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-traffic`),
   upgrade: (nodeId: number, version = '') => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/upgrade`, version ? { version } : {}),
+  probeISP: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/probe-isp`, {}),
+  resetCircuit: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-circuit`, {}),
   reorder: (nodeIds: number[]) => api.put<{ node_ids: number[] }>('/api/edge-nodes/reorder', { node_ids: nodeIds }),
 }
 
@@ -304,6 +307,13 @@ export const masterNodeApi = {
   update: (input: MasterNodeInput) => api.put<EdgeNode>('/api/master-node', input),
   resetTraffic: () => api.post<EdgeNode>('/api/master-node/reset-traffic'),
   probe: () => api.post<EdgeNode>('/api/master-node/probe'),
+  probeISP: () => api.post<EdgeNode>('/api/master-node/probe-isp'),
+}
+
+export const ispProbeApi = {
+  get: () => api.get<ISPProbeSettings>('/api/isp-probe-settings'),
+  update: (input: Partial<ISPProbeSettings> & { reset_defaults?: boolean }) =>
+    api.put<ISPProbeSettings>('/api/isp-probe-settings', input),
 }
 
 export const edgeAutoHttpsApi = {

@@ -33,7 +33,7 @@ const (
 	edgeNodeTLSModeAuto      = "auto"
 	edgeNodeTLSModeExternal  = "external"
 	edgeNodeTLSModeHTTP      = "http"
-	edgeNodeOfflineAfter     = 30 * time.Second
+	edgeNodeOfflineAfter     = 25 * time.Second
 	edgeTicketTTL            = 6 * time.Hour
 	edgeTicketPathPrefix     = "/_yundu/p/"
 	edgeEgressPath           = "/_yundu/egress"
@@ -149,6 +149,9 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if err := ensureMasterNodeSchema(ctx, conn); err != nil {
+		return err
+	}
+	if err := ensureISPProbeSchema(ctx, conn); err != nil {
 		return err
 	}
 	return ensureEdgeAutoHTTPSSchema(ctx, conn)
@@ -424,6 +427,8 @@ type EdgeNode struct {
 	UptimeSec         int64                 `json:"uptime_sec"`
 	UpstreamLatencies []edgeSiteLatency     `json:"upstream_latencies,omitempty"`
 	SpeedMetrics      []edgeNodeSpeedMetric `json:"speed_metrics,omitempty"`
+	ISPHealth         []edgeISPHealthView   `json:"isp_health,omitempty"`
+	AnyCircuitTripped bool                  `json:"any_circuit_tripped,omitempty"`
 	PublicURL         string                `json:"public_url"`
 	Status            string                `json:"status"` // online, offline, disabled, quota, waiting
 	InstallCommand    string                `json:"install_command,omitempty"`
@@ -488,6 +493,9 @@ type edgeNodeLiveState struct {
 	supportsSpeedtest   bool
 	supportsDirectPopup bool
 	supportsEgress      bool
+	ispHealth           map[string]*ispHealthState
+	ispProbeSeq         uint64
+	ispForceProbeID     string
 
 	pending           atomic.Int64
 	persistedTotalIn  int64
@@ -584,6 +592,20 @@ func (n *edgeNodeLiveState) routableAt(now time.Time) bool {
 	return n.publicURL() != ""
 }
 
+func (n *edgeNodeLiveState) isISPTripped(group string) bool {
+	if n == nil {
+		return false
+	}
+	return isISPTrippedInMap(n.ispHealth, group)
+}
+
+func (n *edgeNodeLiveState) routableForGroupAt(group string, now time.Time) bool {
+	if !n.routableAt(now) {
+		return false
+	}
+	return !n.isISPTripped(group)
+}
+
 func agentVersionSupportsEgress(version string) bool {
 	v := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(version), "v"))
 	if v == "" {
@@ -638,6 +660,8 @@ type edgeNodeRuntime struct {
 	speedMetrics     map[int64]map[string]edgeNodeSpeedMetric
 	rrCounters       map[string]*atomic.Uint64
 	blockNonMainland bool
+	ispProbe         ISPProbeSettings
+	pendingISPAlerts []string
 	flushMu          sync.Mutex
 	speedReloadMu    sync.Mutex
 }
@@ -657,6 +681,7 @@ func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNo
 		strategies:   make(map[string]string),
 		speedMetrics: make(map[int64]map[string]edgeNodeSpeedMetric),
 		rrCounters:   counters,
+		ispProbe:     defaultISPProbeSettings(),
 	}
 	if db != nil {
 		if err := rt.reload(); err != nil {
@@ -756,6 +781,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	}
 
 	speedMap := rt.loadSpeedMetricsFromDB()
+	ispProbeCfg := rt.db.loadISPProbeSettings()
 
 	var (
 		mName        = defaultMasterNodeName
@@ -858,6 +884,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	rt.strategies = strategies
 	rt.speedMetrics = speedMap
 	rt.blockNonMainland = blockNonMainland
+	rt.ispProbe = ispProbeCfg
 	return nil
 }
 
@@ -1151,7 +1178,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, watchingCounts
 				continue
 			}
 			node := rt.nodes[rule.NodeID]
-			if node != nil && node.routableAt(now) && node.supportsEgressControl() {
+			if node != nil && node.routableForGroupAt(group, now) && node.supportsEgressControl() {
 				candidates = append(candidates, balanceCandidate{
 					nodeID:            node.id,
 					name:              node.name,
@@ -1188,7 +1215,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, watchingCounts
 			return decision, -1
 		}
 		node := rt.nodes[rule.NodeID]
-		if node != nil && node.routableAt(now) && node.supportsEgressControl() {
+		if node != nil && node.routableForGroupAt(group, now) && node.supportsEgressControl() {
 			decision.NodeID = node.id
 			decision.NodeName = node.name
 			decision.PublicURL = node.publicURL()
@@ -1260,7 +1287,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 		eval.currentRoutable = !rt.masterQuotaExceededLocked()
 	} else if currentNodeID > 0 {
 		node := rt.nodes[currentNodeID]
-		eval.currentRoutable = node != nil && node.routableAt(now) && node.supportsEgressControl()
+		eval.currentRoutable = node != nil && node.routableForGroupAt(group, now) && node.supportsEgressControl()
 	}
 
 	ruleNodeID := currentNodeID
@@ -1382,7 +1409,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash stri
 				continue
 			}
 			node := rt.nodes[rule.NodeID]
-			if node != nil && node.routableAt(now) {
+			if node != nil && node.routableForGroupAt(decision.ISPGroup, now) {
 				candidates = append(candidates, balanceCandidate{
 					nodeID:            node.id,
 					name:              node.name,
@@ -1421,7 +1448,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash stri
 			return decision
 		}
 		node := rt.nodes[rule.NodeID]
-		if node != nil && node.routableAt(now) {
+		if node != nil && node.routableForGroupAt(decision.ISPGroup, now) {
 			decision.NodeID = node.id
 			decision.NodeName = node.name
 			decision.PublicURL = node.publicURL()
@@ -1631,6 +1658,7 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 	token := state.tokenPlain
 	listenPort := state.effectiveListenPort()
 	view.SpeedMetrics = a.pm.edges.speedMetricsMapCopyLocked(state.id)
+	view.ISPHealth, view.AnyCircuitTripped = buildISPHealthViews(state.ispHealth)
 	a.pm.edges.mu.RUnlock()
 
 	if len(rawLatencies) > 0 && a.pm != nil {
@@ -2153,6 +2181,43 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 		}
 		view, _ := a.buildEdgeNodeView(id, origin, true)
 		a.jsonOK(w, view)
+	case "probe-isp":
+		if r.Method != http.MethodPost {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if a.pm != nil && a.pm.edges != nil {
+			a.pm.edges.mu.Lock()
+			if state := a.pm.edges.nodes[id]; state != nil {
+				state.ispForceProbeID = newEdgeUpgradeRequestID()
+			}
+			a.pm.edges.mu.Unlock()
+		}
+		view, _ := a.buildEdgeNodeView(id, origin, true)
+		a.jsonOK(w, view)
+	case "reset-circuit":
+		if r.Method != http.MethodPost {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if a.pm != nil && a.pm.edges != nil {
+			a.pm.edges.mu.Lock()
+			if state := a.pm.edges.nodes[id]; state != nil {
+				for _, st := range state.ispHealth {
+					if st == nil {
+						continue
+					}
+					st.tripped = false
+					st.trippedAt = time.Time{}
+					st.consecFails = 0
+					st.consecSuccesses = 0
+					st.alertNotified = false
+				}
+			}
+			a.pm.edges.mu.Unlock()
+		}
+		view, _ := a.buildEdgeNodeView(id, origin, true)
+		a.jsonOK(w, view)
 	default:
 		a.jsonErr(w, http.StatusNotFound, "not found")
 	}
@@ -2166,6 +2231,7 @@ type ispRouteNodeView struct {
 	Online            bool                 `json:"online"`
 	Status            string               `json:"status"`
 	Active            bool                 `json:"active"`
+	CircuitTripped    bool                 `json:"circuit_tripped,omitempty"`
 	MaxBalanceStreams int                  `json:"max_balance_streams"`
 	ActiveSessions    int                  `json:"active_sessions"`
 	PublicURL         string               `json:"public_url,omitempty"`
@@ -2236,7 +2302,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 						}
 						continue
 					}
-					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
+					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableForGroupAt(group, now) {
 						activePool[node.id] = true
 					}
 				}
@@ -2257,7 +2323,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 						assigned = true
 						break
 					}
-					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableAt(now) {
+					if node := a.pm.edges.nodes[rule.NodeID]; node != nil && node.routableForGroupAt(group, now) {
 						activePool[node.id] = true
 						assigned = true
 						break
@@ -2299,6 +2365,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 				Online:            node.isOnline(now),
 				Status:            node.statusAt(now),
 				Active:            activePool[node.id],
+				CircuitTripped:    node.isISPTripped(group),
 				MaxBalanceStreams: normalizeMaxBalanceStreams(node.maxBalanceStreams),
 				ActiveSessions:    watchingCounts[node.id],
 				PublicURL:         node.publicURL(),
@@ -2550,22 +2617,25 @@ type agentHeartbeatRequest struct {
 	UptimeSec           int64                   `json:"uptime_sec"`
 	SupportsSpeedtest   bool                    `json:"supports_speedtest,omitempty"`
 	SupportsDirectPopup bool                    `json:"supports_direct_popup,omitempty"`
-	UpstreamLatencies   map[int64]int           `json:"upstream_latencies,omitempty"`
-	SpeedtestProgress   *agentSpeedtestProgress `json:"speedtest_progress,omitempty"`
-	UpgradeRequestID    string                  `json:"upgrade_request_id,omitempty"`
-	UpgradeStatus       string                  `json:"upgrade_status,omitempty"`
-	CertFingerprint     string                  `json:"cert_fingerprint"`
-	TrafficReports      []agentTrafficReport    `json:"traffic_reports"`
+	UpstreamLatencies   map[int64]int                  `json:"upstream_latencies,omitempty"`
+	ISPProbeSeq         uint64                         `json:"isp_probe_seq,omitempty"`
+	ISPProbeResults     map[string]agentISPProbeResult `json:"isp_probe_results,omitempty"`
+	SpeedtestProgress   *agentSpeedtestProgress        `json:"speedtest_progress,omitempty"`
+	UpgradeRequestID    string                         `json:"upgrade_request_id,omitempty"`
+	UpgradeStatus       string                         `json:"upgrade_status,omitempty"`
+	CertFingerprint     string                         `json:"cert_fingerprint"`
+	TrafficReports      []agentTrafficReport           `json:"traffic_reports"`
 }
 
 type agentHeartbeatResponse struct {
-	OK                bool                `json:"ok"`
-	NodeEnabled       bool                `json:"node_enabled"`
-	BlockedUsers      []int64             `json:"blocked_users"`
-	RevokedHashes     []string            `json:"revoked_hashes"`
-	UserSpeedLimits   map[int64]int       `json:"user_speed_limits"`
-	ProbeTargets      []agentProbeTarget  `json:"probe_targets,omitempty"`
-	SpeedtestTask     *agentSpeedtestTask `json:"speedtest_task,omitempty"`
+	OK                bool                 `json:"ok"`
+	NodeEnabled       bool                 `json:"node_enabled"`
+	BlockedUsers      []int64              `json:"blocked_users"`
+	RevokedHashes     []string             `json:"revoked_hashes"`
+	UserSpeedLimits   map[int64]int        `json:"user_speed_limits"`
+	ProbeTargets      []agentProbeTarget   `json:"probe_targets,omitempty"`
+	ISPProbeConfig    *agentISPProbeConfig `json:"isp_probe_config,omitempty"`
+	SpeedtestTask     *agentSpeedtestTask  `json:"speedtest_task,omitempty"`
 	CancelSpeedtestID string              `json:"cancel_speedtest_id,omitempty"`
 	AckSpeedtestID    string              `json:"ack_speedtest_id,omitempty"`
 	UpgradeToVersion  string              `json:"upgrade_to_version,omitempty"`
@@ -2748,6 +2818,23 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		node.upstreamLatencies = lat
 	}
+	if req.ISPProbeSeq > 0 && len(req.ISPProbeResults) > 0 {
+		alerts := a.pm.edges.applyISPProbeReportLocked(node.name, false, &node.ispProbeSeq, &node.ispHealth, req.ISPProbeSeq, req.ISPProbeResults, now)
+		if len(alerts) > 0 {
+			a.pm.edges.pendingISPAlerts = append(a.pm.edges.pendingISPAlerts, alerts...)
+		}
+	}
+	ispProbeInterval := a.pm.edges.ispProbe.IntervalSec
+	if anyISPTrippedInMap(node.ispHealth) {
+		ispProbeInterval = a.pm.edges.ispProbe.RecoveryIntervalSec
+	}
+	ispProbeCfg := &agentISPProbeConfig{
+		Enabled:      a.pm.edges.ispProbe.Enabled,
+		IntervalSec:  ispProbeInterval,
+		ForceProbeID: node.ispForceProbeID,
+		Targets:      cloneISPProbeTargets(a.pm.edges.ispProbe.Targets),
+	}
+	node.ispForceProbeID = ""
 	if node.upgradeTarget != "" {
 		if req.Version == node.upgradeTarget {
 			node.upgradeTarget = ""
@@ -2802,6 +2889,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		RevokedHashes:    []string{},
 		UserSpeedLimits:  map[int64]int{},
 		ProbeTargets:     probeTargets,
+		ISPProbeConfig:   ispProbeCfg,
 		UpgradeToVersion: upgradeVersion,
 		UpgradeRequestID: upgradeReqID,
 	}

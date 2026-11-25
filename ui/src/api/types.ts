@@ -154,6 +154,27 @@ export interface EdgeSiteLatency {
   latency_ms: number
 }
 
+export interface EdgeISPHealth {
+  isp_group: 'ct' | 'cu' | 'cm' | string
+  isp_label: string
+  latency_ms: number
+  reachable_count: number
+  total_count: number
+  consec_fails: number
+  tripped: boolean
+  tripped_at?: string
+  last_checked_at?: string
+}
+
+export interface ISPProbeSettings {
+  enabled: boolean
+  interval_sec: number
+  recovery_interval_sec: number
+  fail_threshold: number
+  recover_threshold: number
+  targets: Record<string, string[]>
+}
+
 export interface EdgeNode {
   id: number
   name: string
@@ -187,6 +208,8 @@ export interface EdgeNode {
   uptime_sec?: number
   upstream_latencies?: EdgeSiteLatency[]
   speed_metrics?: EdgeNodeSpeedMetric[]
+  isp_health?: EdgeISPHealth[]
+  any_circuit_tripped?: boolean
   public_url: string
   status: EdgeNodeStatus
   is_master?: boolean
@@ -258,6 +281,7 @@ export interface ISPRouteNode {
   online: boolean
   status: EdgeNodeStatus | string
   active: boolean
+  circuit_tripped?: boolean
   max_balance_streams: number
   active_sessions: number
   public_url?: string

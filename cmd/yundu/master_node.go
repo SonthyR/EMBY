@@ -75,6 +75,8 @@ type masterNodeState struct {
 	note                string
 	maxBalanceStreams   int
 	latencies           map[int64]int
+	ispHealth           map[string]*ispHealthState
+	ispProbeSeq         uint64
 	currentBps          int64
 	alertQuota80Period  string
 	alertQuota100Period string
@@ -213,6 +215,7 @@ func runMasterNodeMonitor(ctx context.Context, rt *edgeNodeRuntime) {
 		return
 	}
 	rt.master.lastWindowAt.Store(time.Now().UnixNano())
+	go runMasterISPProbeMonitor(ctx, rt)
 	// Run an initial latency probe shortly after startup so sites show latencies quickly.
 	initTimer := time.NewTimer(1500 * time.Millisecond)
 	bwTicker := time.NewTicker(masterBandwidthSampleTick)
@@ -247,6 +250,8 @@ func (a *App) buildMasterNodeView(origin string) EdgeNode {
 		status            = "online"
 		rawLatencies      map[int64]int
 		speedMetrics      []edgeNodeSpeedMetric
+		ispHealth         []edgeISPHealthView
+		anyCircuitTripped bool
 	)
 	if a != nil && a.pm != nil && a.pm.edges != nil {
 		a.pm.edges.mu.RLock()
@@ -265,6 +270,7 @@ func (a *App) buildMasterNodeView(origin string) EdgeNode {
 			}
 		}
 		speedMetrics = a.pm.edges.speedMetricsMapCopyLocked(0)
+		ispHealth, anyCircuitTripped = buildISPHealthViews(a.pm.edges.master.ispHealth)
 		a.pm.edges.mu.RUnlock()
 	}
 
@@ -320,6 +326,8 @@ func (a *App) buildMasterNodeView(origin string) EdgeNode {
 		Note:              note,
 		UpstreamLatencies: latViews,
 		SpeedMetrics:      speedMetrics,
+		ISPHealth:         ispHealth,
+		AnyCircuitTripped: anyCircuitTripped,
 	}
 }
 
@@ -422,6 +430,12 @@ func (a *App) handleMasterNodeAction(w http.ResponseWriter, r *http.Request) {
 	case "probe":
 		probeCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		a.pm.edges.probeMasterUpstreamLatencies(probeCtx)
+		a.pm.edges.probeMasterISPOnce(probeCtx)
+		cancel()
+		a.jsonOK(w, a.buildMasterNodeView(origin))
+	case "probe-isp":
+		probeCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		a.pm.edges.probeMasterISPOnce(probeCtx)
 		cancel()
 		a.jsonOK(w, a.buildMasterNodeView(origin))
 	default:

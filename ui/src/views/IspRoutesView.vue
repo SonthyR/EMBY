@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { Activity, ArrowDownWideNarrow, ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldBan, Trash2 } from '@lucide/vue'
+import { Activity, ArrowDownWideNarrow, ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldAlert, ShieldBan, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
+import IspProbeDrawer from '@/components/edge/IspProbeDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import {
@@ -186,6 +187,7 @@ async function toggleGroupBlock(group: ISPRouteGroup, value: boolean) {
 
 function nodeStatusText(node: ISPRouteNode): string {
   if (node.is_master) return node.status === 'quota' ? '超额' : '主机'
+  if (node.circuit_tripped) return '已熔断（已切流）'
   switch (node.status) {
     case 'online':
       return '在线'
@@ -203,6 +205,7 @@ function nodeStatusText(node: ISPRouteNode): string {
 }
 
 function nodeStatusClass(node: ISPRouteNode): string {
+  if (!node.is_master && node.circuit_tripped) return 'bad'
   if (node.status === 'quota') return 'warn'
   if (node.is_master || node.status === 'online') return 'good'
   if (node.status === 'waiting') return 'warn'
@@ -219,6 +222,7 @@ function activeNodeLabel(group: ISPRouteGroup): string {
 }
 
 const speedtestOpen = ref(false)
+const ispProbeOpen = ref(false)
 
 const STRATEGIES: { key: ISPRouteStrategy; label: string }[] = [
   { key: 'priority', label: '手动优先级' },
@@ -340,6 +344,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 <template>
   <div class="routes-page">
     <PageHeader title="线路" description="按访问者运营商智能分流媒体播放流：支持手动优先级与按排序阶梯填满的负载均衡。">
+      <UiButton @click="ispProbeOpen = true"><ShieldAlert />阻断熔断</UiButton>
       <UiButton @click="speedtestOpen = true"><Activity />单线程测速</UiButton>
       <UiButton @click="load()"><RefreshCw />刷新</UiButton>
     </PageHeader>
@@ -437,6 +442,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                 :class="{
                   active: node.active,
                   off: !node.enabled,
+                  tripped: !node.is_master && !!node.circuit_tripped,
                   dragging: pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
                   'is-sort-placeholder': pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
                   movable: group.nodes.length > 1 && !savingGroup,
@@ -656,6 +662,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
     </template>
 
     <SpeedtestDrawer :open="speedtestOpen" @close="speedtestOpen = false" @completed="load(true)" />
+    <IspProbeDrawer :open="ispProbeOpen" @close="ispProbeOpen = false" @saved="load(true)" />
   </div>
 </template>
 
@@ -698,6 +705,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .node-row.movable { cursor: grab; touch-action: pan-y; }
 .node-row.active { border-color: var(--accent-border); background: linear-gradient(90deg, var(--accent-soft) 0%, var(--surface) 75%); }
 .node-row.off { opacity: 0.55; }
+.node-row.tripped { border-color: color-mix(in srgb, var(--bad) 42%, var(--border)); background: color-mix(in srgb, var(--bad) 5%, var(--surface-2)); }
 .node-row.dragging { opacity: 0.24; border-style: dashed; border-color: var(--accent); background: var(--accent-soft); cursor: grabbing; }
 
 .grip { display: inline-flex; align-items: center; color: var(--text-3); touch-action: none; cursor: grab; }

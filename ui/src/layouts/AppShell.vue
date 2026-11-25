@@ -76,7 +76,7 @@ function go(path: string) {
         <RouterLink to="/dashboard" class="brand">
           <span class="brand-mark"><img :src="logo" alt="" /></span>
           <span class="brand-name">云渡</span>
-          <span class="brand-ver mono">v1.5.3</span>
+          <span class="brand-ver mono">v1.5.4</span>
         </RouterLink>
 
         <nav class="nav-capsule" aria-label="主导航">

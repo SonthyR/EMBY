@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.3"
+var appVersion = "v1.5.4"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -300,6 +300,7 @@ func main() {
 	mux.HandleFunc("/api/edge-nodes/reorder", cors(app.authMiddleware(app.handleEdgeNodeReorder)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))
+	mux.HandleFunc("/api/isp-probe-settings", cors(app.authMiddleware(app.handleISPProbeSettings)))
 	mux.HandleFunc("/api/speedtest/targets", cors(app.authMiddleware(app.handleSpeedtestTargets)))
 	mux.HandleFunc("/api/speedtest/custom-targets", cors(app.authMiddleware(app.handleSpeedtestCustomTargets)))
 	mux.HandleFunc("/api/speedtest/custom-targets/", cors(app.authMiddleware(app.handleSpeedtestCustomTargetByID)))
