@@ -112,6 +112,9 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		{"edge_nodes", "cf_dns_status", `ALTER TABLE edge_nodes ADD COLUMN cf_dns_status TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "sort_order", `ALTER TABLE edge_nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`},
 		{"edge_nodes", "max_balance_streams", `ALTER TABLE edge_nodes ADD COLUMN max_balance_streams INTEGER NOT NULL DEFAULT 2`},
+		{"isp_route_rules", "schedule_mode", `ALTER TABLE isp_route_rules ADD COLUMN schedule_mode TEXT NOT NULL DEFAULT 'always'`},
+		{"isp_route_rules", "schedule_start", `ALTER TABLE isp_route_rules ADD COLUMN schedule_start TEXT NOT NULL DEFAULT ''`},
+		{"isp_route_rules", "schedule_end", `ALTER TABLE isp_route_rules ADD COLUMN schedule_end TEXT NOT NULL DEFAULT ''`},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+col.table+"') WHERE name=?", col.name).Scan(&exists); err != nil {
@@ -641,9 +644,12 @@ func (n *edgeNodeLiveState) supportsEgressControl() bool {
 }
 
 type ispRouteRule struct {
-	NodeID    int64 `json:"node_id"`
-	SortOrder int   `json:"sort_order"`
-	Enabled   bool  `json:"enabled"`
+	NodeID        int64  `json:"node_id"`
+	SortOrder     int    `json:"sort_order"`
+	Enabled       bool   `json:"enabled"`
+	ScheduleMode  string `json:"schedule_mode,omitempty"`
+	ScheduleStart string `json:"schedule_start,omitempty"`
+	ScheduleEnd   string `json:"schedule_end,omitempty"`
 }
 
 type edgeNodeRuntime struct {
@@ -730,7 +736,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	}
 	rows.Close()
 
-	routeRows, err := rt.db.db.Query(`SELECT isp_group, node_id, sort_order, enabled FROM isp_route_rules ORDER BY isp_group, sort_order, node_id`)
+	routeRows, err := rt.db.db.Query(`SELECT isp_group, node_id, sort_order, enabled, schedule_mode, schedule_start, schedule_end FROM isp_route_rules ORDER BY isp_group, sort_order, node_id`)
 	if err != nil {
 		return err
 	}
@@ -739,11 +745,20 @@ func (rt *edgeNodeRuntime) reload() error {
 		var group string
 		var rule ispRouteRule
 		var enabled int
-		if err := routeRows.Scan(&group, &rule.NodeID, &rule.SortOrder, &enabled); err != nil {
+		if err := routeRows.Scan(&group, &rule.NodeID, &rule.SortOrder, &enabled, &rule.ScheduleMode, &rule.ScheduleStart, &rule.ScheduleEnd); err != nil {
 			routeRows.Close()
 			return err
 		}
 		rule.Enabled = enabled != 0
+		if normMode, normStart, normEnd, normErr := normalizeRouteSchedule(rule.ScheduleMode, rule.ScheduleStart, rule.ScheduleEnd); normErr == nil {
+			rule.ScheduleMode = normMode
+			rule.ScheduleStart = normStart
+			rule.ScheduleEnd = normEnd
+		} else {
+			rule.ScheduleMode = routeScheduleModeAlways
+			rule.ScheduleStart = ""
+			rule.ScheduleEnd = ""
+		}
 		routes[group] = append(routes[group], rule)
 	}
 	if err := routeRows.Err(); err != nil {
@@ -1162,7 +1177,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, watchingCounts
 	if strategy == ispStrategyBalance {
 		candidates := make([]balanceCandidate, 0, len(rules))
 		for _, rule := range rules {
-			if !rule.Enabled {
+			if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 				continue
 			}
 			if rule.NodeID == 0 {
@@ -1203,7 +1218,7 @@ func (rt *edgeNodeRuntime) selectEgressTargetLocked(group string, watchingCounts
 	}
 
 	for _, rule := range rules {
-		if !rule.Enabled {
+		if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 			continue
 		}
 		if rule.NodeID == 0 {
@@ -1233,7 +1248,7 @@ func (rt *edgeNodeRuntime) selectEgressDecision(clientIP string, _ bool) (edgeRo
 	if rt == nil {
 		return edgeRouteDecision{ISPGroup: group, ISPLabel: ispGroupLabel(group), NodeID: 0, NodeName: defaultMasterNodeName}, -1
 	}
-	now := time.Now()
+	now := routeScheduleNow()
 	var watchingCounts map[int64]int
 	hasShareCounts := false
 	if rt.pm != nil && rt.pm.shares != nil {
@@ -1271,7 +1286,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 		eval.currentAllowed = true
 		return eval
 	}
-	now := time.Now()
+	now := routeScheduleNow()
 	var watchingCounts map[int64]int
 	hasShareCounts := false
 	if rt.pm != nil && rt.pm.shares != nil {
@@ -1295,7 +1310,7 @@ func (rt *edgeNodeRuntime) evaluateEdgeFullHandoff(clientIP string, currentNodeI
 		ruleNodeID = 0
 	}
 	for _, rule := range rt.routes[group] {
-		if rule.NodeID == ruleNodeID && rule.Enabled {
+		if rule.NodeID == ruleNodeID && rule.Enabled && rule.isScheduledActiveAt(now) {
 			eval.currentAllowed = true
 			break
 		}
@@ -1354,7 +1369,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash stri
 		decision.ISP = res.ISP
 		decision.NonMainlandCN = res.NonMainlandCN
 	}
-	now := time.Now()
+	now := routeScheduleNow()
 	// Fetch share watching counts & session stickiness BEFORE acquiring rt.mu
 	// to guarantee zero lock inversion between edges.mu and shares.mu.
 	var watchingCounts map[int64]int
@@ -1393,7 +1408,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash stri
 	if strategy == ispStrategyBalance {
 		candidates := make([]balanceCandidate, 0, len(rules))
 		for _, rule := range rules {
-			if !rule.Enabled {
+			if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 				continue
 			}
 			if rule.NodeID == 0 {
@@ -1434,7 +1449,7 @@ func (rt *edgeNodeRuntime) selectNodeForIPInternal(clientIP, shareTokenHash stri
 	}
 
 	for _, rule := range rules {
-		if !rule.Enabled {
+		if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 			continue
 		}
 		if rule.NodeID == 0 {
@@ -2232,6 +2247,11 @@ type ispRouteNodeView struct {
 	Status            string               `json:"status"`
 	Active            bool                 `json:"active"`
 	CircuitTripped    bool                 `json:"circuit_tripped,omitempty"`
+	ScheduleMode      string               `json:"schedule_mode"`
+	ScheduleStart     string               `json:"schedule_start,omitempty"`
+	ScheduleEnd       string               `json:"schedule_end,omitempty"`
+	ScheduleDormant   bool                 `json:"schedule_dormant,omitempty"`
+	ScheduleResumeAt  string               `json:"schedule_resume_at,omitempty"`
 	MaxBalanceStreams int                  `json:"max_balance_streams"`
 	ActiveSessions    int                  `json:"active_sessions"`
 	PublicURL         string               `json:"public_url,omitempty"`
@@ -2260,7 +2280,7 @@ func (a *App) buildISPRoutesPayload() map[string]any {
 }
 
 func (a *App) buildISPRouteGroups() []ispRouteGroupView {
-	now := time.Now()
+	now := routeScheduleNow()
 	result := make([]ispRouteGroupView, 0, len(allISPGroups))
 	if a.pm == nil || a.pm.edges == nil {
 		return result
@@ -2293,7 +2313,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			switch strategy {
 			case ispStrategyBalance:
 				for _, rule := range rules {
-					if !rule.Enabled {
+					if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 						continue
 					}
 					if rule.NodeID == 0 {
@@ -2312,7 +2332,7 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 			default:
 				assigned := false
 				for _, rule := range rules {
-					if !rule.Enabled {
+					if !rule.Enabled || !rule.isScheduledActiveAt(now) {
 						continue
 					}
 					if rule.NodeID == 0 {
@@ -2339,6 +2359,9 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 		masterStatus := a.pm.edges.master.status()
 		masterCap := normalizeMaxBalanceStreams(a.pm.edges.master.maxBalanceStreams)
 		for _, rule := range rules {
+			schedMode := rule.effectiveScheduleMode()
+			schedDormant := rule.isScheduledDormantAt(now)
+			schedResume := rule.scheduleResumeAt(now)
 			if rule.NodeID == 0 {
 				nodes = append(nodes, ispRouteNodeView{
 					NodeID:            0,
@@ -2348,6 +2371,11 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 					Online:            true,
 					Status:            masterStatus,
 					Active:            activePool[0],
+					ScheduleMode:      schedMode,
+					ScheduleStart:     rule.ScheduleStart,
+					ScheduleEnd:       rule.ScheduleEnd,
+					ScheduleDormant:   schedDormant,
+					ScheduleResumeAt:  schedResume,
 					MaxBalanceStreams: masterCap,
 					ActiveSessions:    watchingCounts[0],
 					SpeedMetric:       metricPtrFor(0),
@@ -2366,6 +2394,11 @@ func (a *App) buildISPRouteGroups() []ispRouteGroupView {
 				Status:            node.statusAt(now),
 				Active:            activePool[node.id],
 				CircuitTripped:    node.isISPTripped(group),
+				ScheduleMode:      schedMode,
+				ScheduleStart:     rule.ScheduleStart,
+				ScheduleEnd:       rule.ScheduleEnd,
+				ScheduleDormant:   schedDormant,
+				ScheduleResumeAt:  schedResume,
 				MaxBalanceStreams: normalizeMaxBalanceStreams(node.maxBalanceStreams),
 				ActiveSessions:    watchingCounts[node.id],
 				PublicURL:         node.publicURL(),
@@ -2396,10 +2429,20 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			Strategy         *string `json:"strategy"`
 			BlockConnect     *bool   `json:"block_connect"`
 			Nodes            []struct {
-				NodeID            int64 `json:"node_id"`
-				Enabled           bool  `json:"enabled"`
-				MaxBalanceStreams *int  `json:"max_balance_streams,omitempty"`
+				NodeID            int64   `json:"node_id"`
+				Enabled           bool    `json:"enabled"`
+				MaxBalanceStreams *int    `json:"max_balance_streams,omitempty"`
+				ScheduleMode      *string `json:"schedule_mode,omitempty"`
+				ScheduleStart     *string `json:"schedule_start,omitempty"`
+				ScheduleEnd       *string `json:"schedule_end,omitempty"`
 			} `json:"nodes"`
+			SchedulePatch *struct {
+				NodeID        int64    `json:"node_id"`
+				Groups        []string `json:"groups"`
+				ScheduleMode  string   `json:"schedule_mode"`
+				ScheduleStart string   `json:"schedule_start"`
+				ScheduleEnd   string   `json:"schedule_end"`
+			} `json:"schedule_patch,omitempty"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, "invalid request")
@@ -2407,7 +2450,7 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Group = strings.ToLower(strings.TrimSpace(req.Group))
 		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil || req.Strategy != nil
-		if !hasGroupOp && req.BlockNonMainland == nil {
+		if !hasGroupOp && req.BlockNonMainland == nil && req.SchedulePatch == nil {
 			a.jsonErr(w, http.StatusBadRequest, "线路配置参数无效")
 			return
 		}
@@ -2421,6 +2464,40 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			normalizedStrategy, ok = normalizeISPStrategy(*req.Strategy)
 			if !ok {
 				a.jsonErr(w, http.StatusBadRequest, "调度策略无效")
+				return
+			}
+		}
+		var patchMode, patchStart, patchEnd string
+		var patchGroups []string
+		if req.SchedulePatch != nil {
+			if req.SchedulePatch.NodeID < 0 {
+				a.jsonErr(w, http.StatusBadRequest, "节点参数无效")
+				return
+			}
+			var err error
+			patchMode, patchStart, patchEnd, err = normalizeRouteSchedule(
+				req.SchedulePatch.ScheduleMode,
+				req.SchedulePatch.ScheduleStart,
+				req.SchedulePatch.ScheduleEnd,
+			)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			seenGrp := make(map[string]bool, len(req.SchedulePatch.Groups))
+			for _, g := range req.SchedulePatch.Groups {
+				g = strings.ToLower(strings.TrimSpace(g))
+				if !validISPGroup(g) {
+					a.jsonErr(w, http.StatusBadRequest, "同步分组参数无效")
+					return
+				}
+				if !seenGrp[g] {
+					seenGrp[g] = true
+					patchGroups = append(patchGroups, g)
+				}
+			}
+			if len(patchGroups) == 0 {
+				a.jsonErr(w, http.StatusBadRequest, "请至少选择一个线路分组")
 				return
 			}
 		}
@@ -2483,10 +2560,52 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if _, err := tx.Exec(`INSERT INTO isp_route_rules(isp_group, node_id, sort_order, enabled) VALUES(?,?,?,?) ON CONFLICT(isp_group, node_id) DO UPDATE SET sort_order=excluded.sort_order, enabled=excluded.enabled`,
-				req.Group, item.NodeID, idx+1, sqliteBool(item.Enabled)); err != nil {
-				a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
-				return
+			if item.ScheduleMode != nil {
+				startStr := ""
+				endStr := ""
+				if item.ScheduleStart != nil {
+					startStr = *item.ScheduleStart
+				}
+				if item.ScheduleEnd != nil {
+					endStr = *item.ScheduleEnd
+				}
+				sMode, sStart, sEnd, sErr := normalizeRouteSchedule(*item.ScheduleMode, startStr, endStr)
+				if sErr != nil {
+					a.jsonErr(w, http.StatusBadRequest, sErr.Error())
+					return
+				}
+				if _, err := tx.Exec(`INSERT INTO isp_route_rules(isp_group, node_id, sort_order, enabled, schedule_mode, schedule_start, schedule_end) VALUES(?,?,?,?,?,?,?) ON CONFLICT(isp_group, node_id) DO UPDATE SET sort_order=excluded.sort_order, enabled=excluded.enabled, schedule_mode=excluded.schedule_mode, schedule_start=excluded.schedule_start, schedule_end=excluded.schedule_end`,
+					req.Group, item.NodeID, idx+1, sqliteBool(item.Enabled), sMode, sStart, sEnd); err != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
+					return
+				}
+			} else {
+				if _, err := tx.Exec(`INSERT INTO isp_route_rules(isp_group, node_id, sort_order, enabled) VALUES(?,?,?,?) ON CONFLICT(isp_group, node_id) DO UPDATE SET sort_order=excluded.sort_order, enabled=excluded.enabled`,
+					req.Group, item.NodeID, idx+1, sqliteBool(item.Enabled)); err != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "保存线路排序失败")
+					return
+				}
+			}
+		}
+		if req.SchedulePatch != nil {
+			if req.SchedulePatch.NodeID > 0 {
+				var count int
+				if err := tx.QueryRow(`SELECT COUNT(*) FROM edge_nodes WHERE id=?`, req.SchedulePatch.NodeID).Scan(&count); err != nil || count == 0 {
+					a.jsonErr(w, http.StatusBadRequest, "包含不存在的从机")
+					return
+				}
+			}
+			for _, g := range patchGroups {
+				var nextOrder int
+				_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) + 1 FROM isp_route_rules WHERE isp_group=?`, g).Scan(&nextOrder)
+				if nextOrder <= 0 {
+					nextOrder = 1
+				}
+				if _, err := tx.Exec(`INSERT INTO isp_route_rules(isp_group, node_id, sort_order, enabled, schedule_mode, schedule_start, schedule_end) VALUES(?,?,?,1,?,?,?) ON CONFLICT(isp_group, node_id) DO UPDATE SET schedule_mode=excluded.schedule_mode, schedule_start=excluded.schedule_start, schedule_end=excluded.schedule_end`,
+					g, req.SchedulePatch.NodeID, nextOrder, patchMode, patchStart, patchEnd); err != nil {
+					a.jsonErr(w, http.StatusInternalServerError, "保存时段策略失败")
+					return
+				}
 			}
 		}
 		if err := tx.Commit(); err != nil {

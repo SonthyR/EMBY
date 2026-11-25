@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { Activity, ArrowDownWideNarrow, ArrowUpToLine, Database, Download, GripVertical, RefreshCw, ShieldAlert, ShieldBan, Trash2 } from '@lucide/vue'
+import { Activity, ArrowDownWideNarrow, ArrowUpToLine, Clock3, Database, Download, GripVertical, RefreshCw, ShieldAlert, ShieldBan, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
 import IspProbeDrawer from '@/components/edge/IspProbeDrawer.vue'
+import RouteScheduleDialog from '@/components/edge/RouteScheduleDialog.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import {
@@ -14,6 +15,7 @@ import {
   type ISPRouteGroup,
   type ISPRouteNode,
   type ISPRouteStrategy,
+  type ISPRoutesResponse,
 } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
@@ -186,8 +188,11 @@ async function toggleGroupBlock(group: ISPRouteGroup, value: boolean) {
 }
 
 function nodeStatusText(node: ISPRouteNode): string {
+  if (!node.is_master && node.circuit_tripped) return '已熔断（已切流）'
+  if (node.enabled && node.schedule_dormant) {
+    return node.schedule_resume_at ? `避峰休眠 · ${node.schedule_resume_at}恢复` : '避峰休眠'
+  }
   if (node.is_master) return node.status === 'quota' ? '超额' : '主机'
-  if (node.circuit_tripped) return '已熔断（已切流）'
   switch (node.status) {
     case 'online':
       return '在线'
@@ -206,11 +211,32 @@ function nodeStatusText(node: ISPRouteNode): string {
 
 function nodeStatusClass(node: ISPRouteNode): string {
   if (!node.is_master && node.circuit_tripped) return 'bad'
+  if (node.enabled && node.schedule_dormant) return 'warn'
   if (node.status === 'quota') return 'warn'
   if (node.is_master || node.status === 'online') return 'good'
   if (node.status === 'waiting') return 'warn'
   if (node.status === 'offline') return 'bad'
   return 'muted'
+}
+
+function schedulePillText(node: ISPRouteNode): string {
+  if (node.schedule_mode === 'avoid' && node.schedule_start && node.schedule_end) {
+    return `避峰 ${node.schedule_start}-${node.schedule_end}`
+  }
+  if (node.schedule_mode === 'only' && node.schedule_start && node.schedule_end) {
+    return `仅 ${node.schedule_start}-${node.schedule_end}`
+  }
+  return ''
+}
+
+function scheduleButtonTitle(node: ISPRouteNode): string {
+  if (node.schedule_mode === 'avoid' && node.schedule_start && node.schedule_end) {
+    return `避开北京时间 ${node.schedule_start}–${node.schedule_end}（点击修改时段策略）`
+  }
+  if (node.schedule_mode === 'only' && node.schedule_start && node.schedule_end) {
+    return `仅北京时间 ${node.schedule_start}–${node.schedule_end} 生效（点击修改时段策略）`
+  }
+  return '设置生效时段 / 避峰自动切换'
 }
 
 function activeNodeLabel(group: ISPRouteGroup): string {
@@ -223,6 +249,26 @@ function activeNodeLabel(group: ISPRouteGroup): string {
 
 const speedtestOpen = ref(false)
 const ispProbeOpen = ref(false)
+const scheduleModal = ref<{ open: boolean; groupKey: string; groupLabel: string; node: ISPRouteNode | null }>({
+  open: false,
+  groupKey: '',
+  groupLabel: '',
+  node: null,
+})
+
+function openScheduleModal(group: ISPRouteGroup, node: ISPRouteNode) {
+  scheduleModal.value = {
+    open: true,
+    groupKey: group.group,
+    groupLabel: group.label,
+    node,
+  }
+}
+
+function onScheduleSaved(res: ISPRoutesResponse) {
+  blockNonMainland.value = !!res.block_non_mainland
+  groups.value = res.groups || []
+}
 
 const STRATEGIES: { key: ISPRouteStrategy; label: string }[] = [
   { key: 'priority', label: '手动优先级' },
@@ -442,6 +488,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                 :class="{
                   active: node.active,
                   off: !node.enabled,
+                  dormant: node.enabled && !!node.schedule_dormant,
                   tripped: !node.is_master && !!node.circuit_tripped,
                   dragging: pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
                   'is-sort-placeholder': pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
@@ -483,6 +530,22 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                     @click="promoteNode(group.group, node)"
                   >
                     <ArrowUpToLine />
+                  </button>
+                  <button
+                    type="button"
+                    class="sched-btn"
+                    :class="{
+                      configured: !!schedulePillText(node),
+                      dormant: node.enabled && !!node.schedule_dormant,
+                    }"
+                    :title="scheduleButtonTitle(node)"
+                    :aria-label="scheduleButtonTitle(node)"
+                    :disabled="!!savingGroup"
+                    @pointerdown.stop
+                    @click.stop="openScheduleModal(group, node)"
+                  >
+                    <Clock3 />
+                    <span v-if="schedulePillText(node)" class="mono">{{ schedulePillText(node) }}</span>
                   </button>
                   <label
                     v-if="group.strategy === 'balance'"
@@ -663,6 +726,15 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 
     <SpeedtestDrawer :open="speedtestOpen" @close="speedtestOpen = false" @completed="load(true)" />
     <IspProbeDrawer :open="ispProbeOpen" @close="ispProbeOpen = false" @saved="load(true)" />
+    <RouteScheduleDialog
+      :open="scheduleModal.open"
+      :group-key="scheduleModal.groupKey"
+      :group-label="scheduleModal.groupLabel"
+      :node="scheduleModal.node"
+      :all-groups="groups"
+      @close="scheduleModal.open = false"
+      @saved="onScheduleSaved"
+    />
   </div>
 </template>
 
@@ -705,6 +777,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .node-row.movable { cursor: grab; touch-action: pan-y; }
 .node-row.active { border-color: var(--accent-border); background: linear-gradient(90deg, var(--accent-soft) 0%, var(--surface) 75%); }
 .node-row.off { opacity: 0.55; }
+.node-row.dormant { opacity: 0.78; border-color: color-mix(in srgb, var(--warn) 38%, var(--border)); background: color-mix(in srgb, var(--warn) 5%, var(--surface-2)); }
 .node-row.tripped { border-color: color-mix(in srgb, var(--bad) 42%, var(--border)); background: color-mix(in srgb, var(--bad) 5%, var(--surface-2)); }
 .node-row.dragging { opacity: 0.24; border-style: dashed; border-color: var(--accent); background: var(--accent-soft); cursor: grabbing; }
 
@@ -742,6 +815,36 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .icon-btn { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .icon-btn:hover { background: var(--surface); color: var(--accent); }
 .icon-btn svg { width: 14px; height: 14px; }
+.sched-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.sched-btn svg { width: 13.5px; height: 13.5px; flex-shrink: 0; }
+.sched-btn:hover { background: var(--surface); border-color: var(--border); color: var(--accent); }
+.sched-btn.configured {
+  padding: 0 8px;
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+.sched-btn.dormant {
+  background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 42%, var(--border));
+  color: var(--warn);
+}
 
 .card-panel { padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-card); }
 

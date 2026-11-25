@@ -272,6 +272,15 @@ export interface EdgeAutoHTTPSInput {
 }
 
 export type ISPRouteStrategy = 'priority' | 'balance'
+export type ISPRouteScheduleMode = 'always' | 'avoid' | 'only'
+
+export interface ISPRouteSchedulePatch {
+  node_id: number
+  groups: string[]
+  schedule_mode: ISPRouteScheduleMode
+  schedule_start: string
+  schedule_end: string
+}
 
 export interface ISPRouteNode {
   node_id: number
@@ -282,6 +291,11 @@ export interface ISPRouteNode {
   status: EdgeNodeStatus | string
   active: boolean
   circuit_tripped?: boolean
+  schedule_mode?: ISPRouteScheduleMode | string
+  schedule_start?: string
+  schedule_end?: string
+  schedule_dormant?: boolean
+  schedule_resume_at?: string
   max_balance_streams: number
   active_sessions: number
   public_url?: string

@@ -12,6 +12,7 @@ import type {
   IP2RegionLookupResult,
   IP2RegionStatus,
   ISPProbeSettings,
+  ISPRouteSchedulePatch,
   ISPRouteStrategy,
   ISPRoutesResponse,
   LiveShareSession,
@@ -333,6 +334,8 @@ export const ispRoutesApi = {
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, block_connect: blockConnect }),
   setBlockNonMainland: (blockNonMainland: boolean) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { block_non_mainland: blockNonMainland }),
+  setSchedule: (patch: ISPRouteSchedulePatch) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { schedule_patch: patch }),
 }
 
 export const speedtestApi = {
