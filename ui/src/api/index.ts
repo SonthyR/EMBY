@@ -267,6 +267,7 @@ export const shareApi = {
     api.post<{ revoked: boolean }>(`/api/share-users/${id(userId)}/sessions/${encodeURIComponent(sessionId)}/kick`),
   resetTraffic: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-traffic`),
   renew: (userId: number, days: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/renew`, { days }),
+  reorder: (userIds: number[]) => api.put<{ user_ids: number[] }>('/api/share-users/reorder', { user_ids: userIds }),
 }
 
 export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput> = {}): ShareUserInput {
@@ -295,6 +296,7 @@ export const edgeApi = {
   resetToken: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-token`),
   resetTraffic: (nodeId: number) => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/reset-traffic`),
   upgrade: (nodeId: number, version = '') => api.post<EdgeNode>(`/api/edge-nodes/${id(nodeId)}/upgrade`, version ? { version } : {}),
+  reorder: (nodeIds: number[]) => api.put<{ node_ids: number[] }>('/api/edge-nodes/reorder', { node_ids: nodeIds }),
 }
 
 export const masterNodeApi = {

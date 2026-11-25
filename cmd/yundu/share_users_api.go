@@ -117,7 +117,7 @@ func (d *DB) shareUserSites(id int64) ([]ShareUserSite, error) {
 }
 
 func (d *DB) listShareUserIDs() ([]int64, error) {
-	rows, err := d.db.Query(`SELECT id FROM share_users ORDER BY id`)
+	rows, err := d.db.Query(`SELECT id FROM share_users ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -267,8 +267,10 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken)
+		var maxOrder int
+		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM share_users`).Scan(&maxOrder)
+		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken, maxOrder+1)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				if strings.Contains(err.Error(), "route_prefix") {
@@ -565,6 +567,84 @@ func (a *App) handleShareUsers(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+var errInvalidShareUserOrder = errors.New("invalid share user order")
+
+func (d *DB) reorderShareUsers(userIDs []int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id FROM share_users`)
+	if err != nil {
+		return err
+	}
+	stored := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[id] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(userIDs) != len(stored) {
+		return fmt.Errorf("%w: user_ids must contain every share user exactly once", errInvalidShareUserOrder)
+	}
+	seen := make(map[int64]struct{}, len(userIDs))
+	for position, id := range userIDs {
+		if id <= 0 {
+			return fmt.Errorf("%w: invalid share user id", errInvalidShareUserOrder)
+		}
+		if _, ok := stored[id]; !ok {
+			return fmt.Errorf("%w: share user %d does not exist", errInvalidShareUserOrder, id)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("%w: share user %d is duplicated", errInvalidShareUserOrder, id)
+		}
+		seen[id] = struct{}{}
+		if _, err := tx.Exec(`UPDATE share_users SET sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, position+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PUT /api/share-users/reorder
+func (a *App) handleShareUserReorder(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPut {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		UserIDs []int64 `json:"user_ids"`
+	}
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := a.db.reorderShareUsers(req.UserIDs); err != nil {
+		if errors.Is(err, errInvalidShareUserOrder) {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("reorder share users: %v", err)
+		a.jsonErr(w, http.StatusInternalServerError, "保存分享账号顺序失败")
+		return
+	}
+	a.jsonOK(w, map[string]any{
+		"user_ids": req.UserIDs,
+	})
 }
 
 func (a *App) reloadShareUsers() {

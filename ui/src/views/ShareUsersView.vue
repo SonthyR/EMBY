@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Copy, Ticket } from '@lucide/vue'
+import { Plus, Search, Copy, Ticket, GripVertical } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
@@ -10,6 +10,7 @@ import ShareUserDetail from '@/components/share/ShareUserDetail.vue'
 import ShareTextDialog from '@/components/share/ShareTextDialog.vue'
 import RedeemCodesPanel from '@/components/share/RedeemCodesPanel.vue'
 import { shareApi, sitesApi, type ShareStatus, type ShareUser, type Site } from '@/api'
+import { usePointerSort } from '@/composables/usePointerSort'
 import { copyText, daysUntil, dateOnly, formatBytes } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
 import { STATUS_LABEL, STATUS_TONE } from '@/components/share/shareStatus'
@@ -32,9 +33,12 @@ const shareText = ref('')
 const justCreated = ref(false)
 
 const selected = computed(() => users.value.find(u => u.id === selectedId.value) || null)
+const savingOrder = ref(false)
+const pointerSort = usePointerSort()
 let listLoadGen = 0
 
 async function load(silent = false) {
+  if (silent && (pointerSort.isDragging.value || savingOrder.value)) return
   const gen = ++listLoadGen
   if (!silent) loading.value = true
   try {
@@ -93,6 +97,50 @@ const visible = computed(() => {
     return !q || [user.username, user.route_prefix || '', user.note, ...user.sites.map(s => s.site_name || '')].some(v => (v || '').toLowerCase().includes(q))
   })
 })
+const canSort = computed(() => filter.value === 'all' && !query.value.trim() && users.value.length > 1 && !savingOrder.value)
+
+function openUserDetail(user: ShareUser) {
+  if (pointerSort.shouldSuppressClick()) return
+  selectedId.value = user.id
+}
+
+function startUserSort(event: PointerEvent, user: ShareUser) {
+  if (!canSort.value) return
+  const itemEl = (event.currentTarget as HTMLElement | null)?.closest<HTMLElement>('[data-share-sort-id]')
+  const containerEl = itemEl?.closest<HTMLElement>('.table')
+  if (!itemEl || !containerEl) return
+
+  pointerSort.start<ShareUser>({
+    event,
+    itemEl,
+    containerEl,
+    itemSelector: '[data-share-sort-id]',
+    getKeyFromEl: el => {
+      const id = Number(el.dataset.shareSortId)
+      return Number.isNaN(id) ? null : id
+    },
+    activeKey: user.id,
+    scope: 'share-users',
+    mode: 'list',
+    getList: () => users.value,
+    getItemKey: item => item.id,
+    applyList: next => {
+      users.value = next
+    },
+    onCommit: async (next, previous) => {
+      savingOrder.value = true
+      try {
+        await shareApi.reorder(next.map(u => u.id))
+        toast.success('分享账号顺序已保存')
+      } catch (error) {
+        users.value = previous
+        toast.error(errorMessage(error, '保存分享账号顺序失败'))
+      } finally {
+        savingOrder.value = false
+      }
+    },
+  })
+}
 
 function expiryText(user: ShareUser) {
   if (!user.expires_at) return { text: '永久', tone: '' }
@@ -208,21 +256,40 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
             <div
               v-for="user in visible"
               :key="user.id"
+              :data-share-sort-id="user.id"
               class="row item"
-              :class="{ active: selectedId === user.id, dim: user.status !== 'active' }"
+              :class="{
+                active: selectedId === user.id,
+                dim: user.status !== 'active',
+                dragging: pointerSort.draggingScope.value === 'share-users' && pointerSort.draggingKey.value === user.id,
+                'is-sort-placeholder': pointerSort.draggingScope.value === 'share-users' && pointerSort.draggingKey.value === user.id,
+              }"
               role="row"
               tabindex="0"
-              @click="selectedId = user.id"
-              @keydown.enter="selectedId = user.id"
+              @click="openUserDetail(user)"
+              @keydown.enter="openUserDetail(user)"
             >
-              <span class="who" role="cell">
-                <span class="who-top">
-                  <span class="name">{{ user.username }}</span>
-                  <span v-if="user.active_site_name || user.sites[0]?.site_name" class="emby-chip">
-                    {{ user.active_site_name || user.sites[0]?.site_name }}
+              <span class="who-cell" role="cell">
+                <button
+                  v-if="canSort"
+                  type="button"
+                  class="drag-handle"
+                  title="按住拖动调整顺序"
+                  aria-label="拖动调整顺序"
+                  @click.stop
+                  @pointerdown.stop="startUserSort($event, user)"
+                >
+                  <GripVertical />
+                </button>
+                <span class="who">
+                  <span class="who-top">
+                    <span class="name">{{ user.username }}</span>
+                    <span v-if="user.active_site_name || user.sites[0]?.site_name" class="emby-chip">
+                      {{ user.active_site_name || user.sites[0]?.site_name }}
+                    </span>
                   </span>
+                  <span class="sub">{{ [user.route_prefix, user.note || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
                 </span>
-                <span class="sub">{{ [user.route_prefix, user.note || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
               </span>
               <span class="status" role="cell">
                 <span class="status-pill" :class="STATUS_TONE[user.status]">
@@ -352,9 +419,30 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 .row.item + .row.item { box-shadow: inset 0 1px 0 var(--border); }
 .row.item:hover, .row.item:focus-visible, .row.item.active { background: var(--surface-2); box-shadow: none; }
 .row.item:hover + .row.item, .row.item.active + .row.item { box-shadow: none; }
+.row.item.dragging { opacity: 0.24; background: var(--accent-soft); outline: 1px dashed var(--accent); box-shadow: none; }
 .row.dim .who .name { color: var(--text-2); }
 
-.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.who-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.drag-handle {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-left: -4px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: grab;
+  touch-action: none;
+  flex: 0 0 auto;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.drag-handle:hover { color: var(--text); background: var(--surface-hover); }
+.drag-handle:active { cursor: grabbing; }
+.drag-handle svg { width: 15px; height: 15px; }
+.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .who-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .emby-chip {
@@ -406,7 +494,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
   .search kbd { display: none; }
   .row.head { display: none; }
   .row.item { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'who status' 'meta meta'; gap: 6px 12px; padding: 12px; }
-  .who { grid-area: who; }
+  .who-cell { grid-area: who; }
   .status { grid-area: status; }
   .traffic, .expiry, .devices, .act { display: none; }
   .who .sub { display: none; }

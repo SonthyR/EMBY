@@ -112,6 +112,7 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		{"edge_nodes", "cf_record_type", `ALTER TABLE edge_nodes ADD COLUMN cf_record_type TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "cf_record_ip", `ALTER TABLE edge_nodes ADD COLUMN cf_record_ip TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "cf_dns_status", `ALTER TABLE edge_nodes ADD COLUMN cf_dns_status TEXT NOT NULL DEFAULT ''`},
+		{"edge_nodes", "sort_order", `ALTER TABLE edge_nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+col.table+"') WHERE name=?", col.name).Scan(&exists); err != nil {
@@ -123,6 +124,11 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 			}
 			if col.table == "edge_nodes" && col.name == "total_bytes_out" {
 				if _, err := conn.ExecContext(ctx, `UPDATE edge_nodes SET total_bytes_out=traffic_used WHERE traffic_used > 0 AND total_bytes_in = 0 AND total_bytes_out = 0`); err != nil {
+					return err
+				}
+			}
+			if col.table == "edge_nodes" && col.name == "sort_order" {
+				if _, err := conn.ExecContext(ctx, `UPDATE edge_nodes SET sort_order = id`); err != nil {
 					return err
 				}
 			}
@@ -1681,7 +1687,7 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 			a.jsonOK(w, []EdgeNode{})
 			return
 		}
-		rows, err := a.db.db.Query(`SELECT id FROM edge_nodes ORDER BY id`)
+		rows, err := a.db.db.Query(`SELECT id FROM edge_nodes ORDER BY sort_order ASC, id ASC`)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "从机列表读取失败")
 			return
@@ -1751,8 +1757,10 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer tx.Rollback()
-		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.Note)
+		var maxNodeOrder int
+		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM edge_nodes`).Scan(&maxNodeOrder)
+		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, note, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.Note, maxNodeOrder+1)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
@@ -1794,6 +1802,84 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+var errInvalidEdgeNodeOrder = errors.New("invalid edge node order")
+
+func (d *DB) reorderEdgeNodes(nodeIDs []int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id FROM edge_nodes`)
+	if err != nil {
+		return err
+	}
+	stored := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[id] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(nodeIDs) != len(stored) {
+		return fmt.Errorf("%w: node_ids must contain every edge node exactly once", errInvalidEdgeNodeOrder)
+	}
+	seen := make(map[int64]struct{}, len(nodeIDs))
+	for position, id := range nodeIDs {
+		if id <= 0 {
+			return fmt.Errorf("%w: invalid edge node id", errInvalidEdgeNodeOrder)
+		}
+		if _, ok := stored[id]; !ok {
+			return fmt.Errorf("%w: edge node %d does not exist", errInvalidEdgeNodeOrder, id)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("%w: edge node %d is duplicated", errInvalidEdgeNodeOrder, id)
+		}
+		seen[id] = struct{}{}
+		if _, err := tx.Exec(`UPDATE edge_nodes SET sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, position+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PUT /api/edge-nodes/reorder
+func (a *App) handleEdgeNodeReorder(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPut {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		NodeIDs []int64 `json:"node_ids"`
+	}
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		a.jsonErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := a.db.reorderEdgeNodes(req.NodeIDs); err != nil {
+		if errors.Is(err, errInvalidEdgeNodeOrder) {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("reorder edge nodes: %v", err)
+		a.jsonErr(w, http.StatusInternalServerError, "保存从机顺序失败")
+		return
+	}
+	a.jsonOK(w, map[string]any{
+		"node_ids": req.NodeIDs,
+	})
 }
 
 // /api/edge-nodes/{id}[/action]

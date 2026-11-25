@@ -473,6 +473,129 @@ async function pollDirectPopupReport(row: DirectRowState, expectedRunId: number)
   }
 }
 
+function canRunSingleDirect(row: DirectRowState): boolean {
+  if (!row.target.online || row.status === 'blocked') return false
+  if (needsHTTPPopup(row.target)) {
+    return !!(row.target.supports_popup && row.target.popup_url && row.target.report_id)
+  }
+  return !!row.target.stream_url
+}
+
+async function runDirectFetchRow(row: DirectRowState, runId: number, masterCtrl: AbortController) {
+  row.status = 'running'
+  row.mbps = 0
+  row.ttfbMs = -1
+  row.receivedBytes = 0
+  row.note = '正在连接...'
+
+  const ctrl = new AbortController()
+  const onParentAbort = () => ctrl.abort(masterCtrl.signal.reason || 'stopped')
+  masterCtrl.signal.addEventListener('abort', onParentAbort, { once: true })
+  const maxDurationMs = 5000
+  const timeoutId = window.setTimeout(() => ctrl.abort('duration_reached'), maxDurationMs + 2500)
+
+  try {
+    const startAt = performance.now()
+    const resp = await fetch(row.target.stream_url, {
+      method: 'GET',
+      cache: 'no-store',
+      credentials: row.target.is_master ? 'same-origin' : 'omit',
+      signal: ctrl.signal,
+    })
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`)
+    }
+    row.ttfbMs = Math.max(1, Math.round(performance.now() - startAt))
+    if (!resp.body) {
+      throw new Error('浏览器不支持流式读取')
+    }
+
+    const reader = resp.body.getReader()
+    const streamStart = performance.now()
+    let warmAt = 0
+    let warmBytes = 0
+    let received = 0
+    row.note = '测速中...'
+
+    while (true) {
+      if (runId !== directRunId || !props.open || activeTab.value !== 'direct') {
+        ctrl.abort('stopped')
+        break
+      }
+      const elapsed = performance.now() - streamStart
+      if (elapsed >= maxDurationMs) {
+        ctrl.abort('duration_reached')
+        break
+      }
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        received += value.byteLength
+        row.receivedBytes = received
+        const now = performance.now()
+        if (warmAt === 0 && now - streamStart >= 700) {
+          warmAt = now
+          warmBytes = received
+        }
+        const measureMs = warmAt > 0 && now - warmAt >= 300 ? now - warmAt : Math.max(10, now - streamStart)
+        const measureBytes = warmAt > 0 && now - warmAt >= 300 ? received - warmBytes : received
+        row.mbps = Math.round(((measureBytes * 8) / (measureMs * 1000)) * 10) / 10
+      }
+    }
+    if (received <= 0 || row.ttfbMs <= 0) {
+      throw new Error('未收到测速数据字节')
+    }
+    const totalElapsed = Math.max(10, performance.now() - (warmAt > 0 && performance.now() - warmAt >= 400 ? warmAt : streamStart))
+    const countedBytes = warmAt > 0 && performance.now() - warmAt >= 400 ? received - warmBytes : received
+    row.mbps = Math.round(((countedBytes * 8) / (totalElapsed * 1000)) * 10) / 10
+    row.status = 'done'
+    row.note = `已拉取 ${formatBytes(received)}`
+  } catch (err) {
+    if (runId !== directRunId || masterCtrl.signal.aborted) {
+      row.status = 'idle'
+      row.note = '已手动停止'
+    } else if (
+      row.receivedBytes > 0 &&
+      row.ttfbMs > 0 &&
+      (ctrl.signal.reason === 'duration_reached' || String(err).includes('AbortError'))
+    ) {
+      row.status = 'done'
+      row.note = `已拉取 ${formatBytes(row.receivedBytes)}`
+    } else {
+      row.status = 'error'
+      row.note = ctrl.signal.reason === 'duration_reached' ? '连接或读取首字节超时' : errorMessage(err, '连接或 CORS 请求失败')
+    }
+  } finally {
+    masterCtrl.signal.removeEventListener('abort', onParentAbort)
+    window.clearTimeout(timeoutId)
+  }
+}
+
+async function runSingleDirect(row: DirectRowState) {
+  if (directRunning.value || !canRunSingleDirect(row)) {
+    return
+  }
+  if (needsHTTPPopup(row.target)) {
+    await runSingleDirectPopup(row)
+    return
+  }
+  const runId = ++directRunId
+  const masterCtrl = new AbortController()
+  directAbort = masterCtrl
+  directRunning.value = true
+  try {
+    await runDirectFetchRow(row, runId, masterCtrl)
+  } finally {
+    if (runId === directRunId) {
+      directRunning.value = false
+      directAbort = null
+    }
+    if (!row.target.is_master) {
+      void refreshDirectTargetRow(row.target.node_id)
+    }
+  }
+}
+
 async function runSingleDirectPopup(row: DirectRowState) {
   if (directRunning.value || !row.target.online || !row.target.supports_popup || !row.target.popup_url || !row.target.report_id) {
     return
@@ -529,92 +652,9 @@ async function runDirectTests() {
         continue
       }
 
-      row.status = 'running'
-      row.mbps = 0
-      row.ttfbMs = -1
-      row.receivedBytes = 0
-      row.note = '正在连接...'
-
-      const ctrl = new AbortController()
-      const onParentAbort = () => ctrl.abort(masterCtrl.signal.reason || 'stopped')
-      masterCtrl.signal.addEventListener('abort', onParentAbort, { once: true })
-      const maxDurationMs = 5000
-      const timeoutId = window.setTimeout(() => ctrl.abort('duration_reached'), maxDurationMs + 2500)
-
-      try {
-        const startAt = performance.now()
-        const resp = await fetch(row.target.stream_url, {
-          method: 'GET',
-          cache: 'no-store',
-          credentials: row.target.is_master ? 'same-origin' : 'omit',
-          signal: ctrl.signal,
-        })
-        if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status}`)
-        }
-        row.ttfbMs = Math.max(1, Math.round(performance.now() - startAt))
-        if (!resp.body) {
-          throw new Error('浏览器不支持流式读取')
-        }
-
-        const reader = resp.body.getReader()
-        const streamStart = performance.now()
-        let warmAt = 0
-        let warmBytes = 0
-        let received = 0
-        row.note = '测速中...'
-
-        while (true) {
-          if (runId !== directRunId || !props.open || activeTab.value !== 'direct') {
-            ctrl.abort('stopped')
-            break
-          }
-          const elapsed = performance.now() - streamStart
-          if (elapsed >= maxDurationMs) {
-            ctrl.abort('duration_reached')
-            break
-          }
-          const { done, value } = await reader.read()
-          if (done) break
-          if (value) {
-            received += value.byteLength
-            row.receivedBytes = received
-            const now = performance.now()
-            if (warmAt === 0 && now - streamStart >= 700) {
-              warmAt = now
-              warmBytes = received
-            }
-            const measureMs = warmAt > 0 && now - warmAt >= 300 ? now - warmAt : Math.max(10, now - streamStart)
-            const measureBytes = warmAt > 0 && now - warmAt >= 300 ? received - warmBytes : received
-            row.mbps = Math.round(((measureBytes * 8) / (measureMs * 1000)) * 10) / 10
-          }
-        }
-        if (received <= 0 || row.ttfbMs <= 0) {
-          throw new Error('未收到测速数据字节')
-        }
-        const totalElapsed = Math.max(10, performance.now() - (warmAt > 0 && performance.now() - warmAt >= 400 ? warmAt : streamStart))
-        const countedBytes = warmAt > 0 && performance.now() - warmAt >= 400 ? received - warmBytes : received
-        row.mbps = Math.round(((countedBytes * 8) / (totalElapsed * 1000)) * 10) / 10
-        row.status = 'done'
-        row.note = `已拉取 ${formatBytes(received)}`
-      } catch (err) {
-        if (runId !== directRunId || masterCtrl.signal.aborted) {
-          row.status = 'idle'
-          row.note = '已手动停止'
-        } else if (
-          row.receivedBytes > 0 &&
-          row.ttfbMs > 0 &&
-          (ctrl.signal.reason === 'duration_reached' || String(err).includes('AbortError'))
-        ) {
-          row.status = 'done'
-          row.note = `已拉取 ${formatBytes(row.receivedBytes)}`
-        } else {
-          row.status = 'error'
-          row.note = ctrl.signal.reason === 'duration_reached' ? '连接或读取首字节超时' : errorMessage(err, '连接或 CORS 请求失败')
-        }
-      } finally {
-        masterCtrl.signal.removeEventListener('abort', onParentAbort)
-        window.clearTimeout(timeoutId)
+      await runDirectFetchRow(row, runId, masterCtrl)
+      if (!row.target.is_master) {
+        void refreshDirectTargetRow(row.target.node_id)
       }
     }
   } finally {
@@ -980,11 +1020,11 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="num">
                   <UiButton
-                    v-if="row.target.online && needsHTTPPopup(row.target) && row.target.supports_popup && row.target.popup_url && row.target.report_id"
+                    v-if="canRunSingleDirect(row)"
                     size="sm"
                     variant="ghost"
                     :disabled="directRunning"
-                    @click="runSingleDirectPopup(row)"
+                    @click="runSingleDirect(row)"
                   >
                     单独直测
                   </UiButton>

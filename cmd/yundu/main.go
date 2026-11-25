@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.1"
+var appVersion = "v1.5.2"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -284,6 +284,7 @@ func main() {
 	mux.HandleFunc("/api/account-reminders/history", cors(app.authMiddleware(app.handleAccountReminderRecords)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/share-users", cors(app.authMiddleware(app.handleShareUsers)))
+	mux.HandleFunc("/api/share-users/reorder", cors(app.authMiddleware(app.handleShareUserReorder)))
 	mux.HandleFunc("/api/share-users/", cors(app.authMiddleware(app.handleShareUserByID)))
 	mux.HandleFunc("/api/live-sessions", cors(app.authMiddleware(app.handleLiveSessions)))
 	mux.HandleFunc("/api/redeem-codes", cors(app.authMiddleware(app.handleRedeemCodes)))
@@ -296,6 +297,7 @@ func main() {
 	mux.HandleFunc("/api/edge-auto-https", cors(app.authMiddleware(app.handleEdgeAutoHTTPS)))
 	mux.HandleFunc("/api/edge-auto-https/", cors(app.authMiddleware(app.handleEdgeAutoHTTPSAction)))
 	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
+	mux.HandleFunc("/api/edge-nodes/reorder", cors(app.authMiddleware(app.handleEdgeNodeReorder)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))
 	mux.HandleFunc("/api/speedtest/targets", cors(app.authMiddleware(app.handleSpeedtestTargets)))

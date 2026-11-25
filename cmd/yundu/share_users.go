@@ -99,6 +99,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_users", "portal_token", "ALTER TABLE share_users ADD COLUMN portal_token TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "speed_limit", "ALTER TABLE share_users ADD COLUMN speed_limit INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "route_prefix", "ALTER TABLE share_users ADD COLUMN route_prefix TEXT NOT NULL DEFAULT ''"},
+		{"share_users", "sort_order", "ALTER TABLE share_users ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sites", "sort_order", "ALTER TABLE share_user_sites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
 		{"share_user_sessions", "device_id", "ALTER TABLE share_user_sessions ADD COLUMN device_id TEXT NOT NULL DEFAULT ''"},
 		{"share_user_sessions", "site_account_id", "ALTER TABLE share_user_sessions ADD COLUMN site_account_id INTEGER NOT NULL DEFAULT 0"},
@@ -113,6 +114,11 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		if exists == 0 {
 			if _, err := conn.ExecContext(ctx, column.sql); err != nil {
 				return err
+			}
+			if column.table == "share_users" && column.name == "sort_order" {
+				if _, err := conn.ExecContext(ctx, `UPDATE share_users SET sort_order = id`); err != nil {
+					return err
+				}
 			}
 			if column.table == "share_user_sites" && column.name == "sort_order" {
 				if _, err := conn.ExecContext(ctx, `UPDATE share_user_sites SET sort_order = COALESCE((SELECT s.sort_order FROM sites s WHERE s.id = share_user_sites.site_id), site_id)`); err != nil {

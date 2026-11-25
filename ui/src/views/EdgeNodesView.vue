@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Activity, Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle } from '@lucide/vue'
+import { Activity, Plus, Search, Terminal, Copy, RefreshCw, Pencil, Trash2, Power, RotateCcw, ChevronDown, ArrowUpCircle, GripVertical } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SpeedtestDrawer from '@/components/edge/SpeedtestDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
@@ -10,6 +10,7 @@ import UiField from '@/components/ui/UiField.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import { edgeApi, edgeAutoHttpsApi, masterNodeApi, type EdgeAutoHTTPSStatus, type EdgeNode, type EdgeNodeInput, type EdgeNodeStatus, type MasterNodeInput } from '@/api'
+import { usePointerSort } from '@/composables/usePointerSort'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { GB, copyText, formatBytes, relativeTime } from '@/utils/format'
@@ -203,7 +204,11 @@ async function upgradeAllNodes() {
   }
 }
 
+const savingOrder = ref(false)
+const pointerSort = usePointerSort()
+
 async function load(silent = false) {
+  if (silent && (pointerSort.isDragging.value || savingOrder.value)) return
   if (!silent) loading.value = true
   try {
     const masterPromise = masterNodeApi?.get ? masterNodeApi.get().catch(() => null) : Promise.resolve(null)
@@ -253,6 +258,45 @@ const visible = computed(() => {
 })
 
 const showAddEdgeHintCard = computed(() => !!masterNode.value && nodes.value.length === 0 && filter.value === 'all' && !query.value.trim())
+const canSortEdges = computed(() => filter.value === 'all' && !query.value.trim() && nodes.value.length > 1 && !savingOrder.value)
+
+function startEdgeSort(event: PointerEvent, node: EdgeNode) {
+  if (node.is_master || !canSortEdges.value) return
+  const itemEl = (event.currentTarget as HTMLElement | null)?.closest<HTMLElement>('[data-edge-sort-id]')
+  const containerEl = itemEl?.closest<HTMLElement>('.list')
+  if (!itemEl || !containerEl) return
+
+  pointerSort.start<EdgeNode>({
+    event,
+    itemEl,
+    containerEl,
+    itemSelector: '[data-edge-sort-id]',
+    getKeyFromEl: el => {
+      const id = Number(el.dataset.edgeSortId)
+      return Number.isNaN(id) ? null : id
+    },
+    activeKey: node.id,
+    scope: 'edge-nodes',
+    mode: 'grid',
+    getList: () => nodes.value,
+    getItemKey: item => item.id,
+    applyList: next => {
+      nodes.value = next
+    },
+    onCommit: async (next, previous) => {
+      savingOrder.value = true
+      try {
+        await edgeApi.reorder(next.map(n => n.id))
+        toast.success('节点顺序已保存')
+      } catch (error) {
+        nodes.value = previous
+        toast.error(errorMessage(error, '保存节点顺序失败'))
+      } finally {
+        savingOrder.value = false
+      }
+    },
+  })
+}
 
 function clearErrors() {
   for (const key of Object.keys(errors)) delete errors[key]
@@ -627,15 +671,32 @@ function speedPillTone(mbps: number): string {
     <div v-else-if="!visible.length" class="empty">
       <p>没有匹配的节点。</p>
     </div>
-    <div v-else class="list">
+    <TransitionGroup v-else name="grid-sort" tag="div" class="list">
       <article
         v-for="node in visible"
         :key="node.is_master ? 'master' : node.id"
+        :data-edge-sort-id="node.is_master ? undefined : node.id"
         class="card"
-        :class="{ muted: !node.enabled, master: node.is_master }"
+        :class="{
+          muted: !node.enabled,
+          master: node.is_master,
+          dragging: !node.is_master && pointerSort.draggingScope.value === 'edge-nodes' && pointerSort.draggingKey.value === node.id,
+          'is-sort-placeholder': !node.is_master && pointerSort.draggingScope.value === 'edge-nodes' && pointerSort.draggingKey.value === node.id,
+        }"
       >
         <div class="card-main">
           <div class="title-row">
+            <button
+              v-if="!node.is_master && canSortEdges"
+              type="button"
+              class="drag-handle"
+              title="按住拖动调整顺序"
+              aria-label="拖动调整顺序"
+              @click.stop
+              @pointerdown.stop="startEdgeSort($event, node)"
+            >
+              <GripVertical />
+            </button>
             <span class="status-pill" :class="STATUS_TONE[node.status]">
               <span class="dot" />{{ STATUS_LABEL[node.status] }}
             </span>
@@ -760,14 +821,14 @@ function speedPillTone(mbps: number): string {
         </div>
       </article>
 
-      <article v-if="showAddEdgeHintCard" class="card add-hint">
+      <article v-if="showAddEdgeHintCard" key="add-hint" class="card add-hint">
         <h3>添加从机节点</h3>
         <p class="faint">
           当前仅主机在提供服务。添加普通 VPS 或 NAT 小鸡作为轻量中转节点（约 15–25 MB 内存），视频播放可按三网运营商自动就近卸载。
         </p>
         <UiButton variant="primary" @click="openCreate"><Plus />添加第一个从机</UiButton>
       </article>
-    </div>
+    </TransitionGroup>
 
     <UiDrawer
       :open="masterFormOpen"
@@ -992,6 +1053,27 @@ function speedPillTone(mbps: number): string {
 .card.add-hint h3 { margin: 0; font-size: 15.5px; font-weight: 700; }
 .card.add-hint p { margin: 0; font-size: 13px; line-height: 1.6; max-width: 420px; }
 .card.muted { opacity: 0.68; }
+.card.dragging { opacity: 0.24; border-style: dashed; border-color: var(--accent); background: var(--accent-soft); box-shadow: none; }
+.drag-handle {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-left: -6px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: grab;
+  touch-action: none;
+  flex: 0 0 auto;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.drag-handle:hover { color: var(--text); background: var(--surface-2); }
+.drag-handle:active { cursor: grabbing; }
+.drag-handle svg { width: 15px; height: 15px; }
+.grid-sort-move { transition: transform 180ms var(--ease); }
 .card.skeleton { height: 180px; }
 .card.skeleton span { display: block; width: 45%; height: 14px; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.4; } }

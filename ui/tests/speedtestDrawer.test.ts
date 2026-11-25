@@ -6,6 +6,7 @@ const speedtestApi = vi.hoisted(() => ({
   jobs: vi.fn(),
   start: vi.fn(),
   targets: vi.fn(),
+  directTargets: vi.fn(),
 }))
 
 vi.mock('@/api', () => ({ speedtestApi }))
@@ -63,5 +64,63 @@ describe('测速目标选择', () => {
     await wrapper.get('.custom-bar .btn-primary').trigger('click')
     await flushPromises()
     expect(speedtestApi.start).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'all', custom_target_ids: [9] }))
+  })
+
+  it('本机直测支持主机与 HTTPS 从机单行单独直测', async () => {
+    speedtestApi.directTargets.mockResolvedValue({
+      targets: [
+        { node_id: 0, name: '主机', is_master: true, online: true, scheme: 'https', stream_url: '/api/speedtest/direct-stream', size_bytes: 1048576 },
+        {
+          node_id: 8,
+          name: '美西 NAT',
+          is_master: false,
+          online: true,
+          public_url: 'https://node-8.example.com:19090',
+          scheme: 'https',
+          stream_url: 'https://node-8.example.com:19090/_yundu/st/ticket',
+          size_bytes: 1048576,
+        },
+      ],
+    })
+    const chunk = new Uint8Array(64 * 1024)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => {
+          let readCount = 0
+          return {
+            read: async () => (readCount++ === 0 ? { done: false, value: chunk } : { done: true, value: undefined }),
+          }
+        },
+      },
+    } as unknown as Response)
+
+    try {
+      const wrapper = await openDrawer()
+      const directTab = wrapper.findAll('.st-tabs button').find(b => b.text().includes('本机直测'))
+      expect(directTab).toBeTruthy()
+      await directTab!.trigger('click')
+      await flushPromises()
+
+      const rows = wrapper.findAll('.direct-table tbody tr')
+      expect(rows).toHaveLength(2)
+      expect(rows[0].text()).toContain('单独直测')
+      expect(rows[1].text()).toContain('单独直测')
+
+      const httpsSingleBtn = rows[1].findAll('button').find(b => b.text().includes('单独直测'))
+      await httpsSingleBtn!.trigger('click')
+      await flushPromises()
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://node-8.example.com:19090/_yundu/st/ticket',
+        expect.objectContaining({ method: 'GET', credentials: 'omit' }),
+      )
+      expect(rows[0].text()).toContain('待测')
+      expect(rows[1].text()).toContain('完成')
+    } finally {
+      fetchSpy.mockRestore()
+    }
   })
 })

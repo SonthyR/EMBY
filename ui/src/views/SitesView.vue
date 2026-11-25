@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Copy, Zap, MoreHorizontal, ArrowUp, ArrowDown, GripVertical } from '@lucide/vue'
+import { Plus, Search, Copy, Zap, MoreHorizontal, GripVertical } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiMenu from '@/components/ui/UiMenu.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
@@ -13,6 +13,7 @@ import SiteExportDialog from '@/components/sites/SiteExportDialog.vue'
 import ReminderHistoryDialog from '@/components/sites/ReminderHistoryDialog.vue'
 import { edgeApi, sitesApi, type AccountReminderRow, type EdgeNode, type IngressCapabilities, type Site } from '@/api'
 import { INGRESS_LABEL, diagLatency, normalizedIngressMode, siteAccessAddress } from '@/components/sites/siteLogic'
+import { usePointerSort } from '@/composables/usePointerSort'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { copyText, formatBytes } from '@/utils/format'
@@ -28,11 +29,8 @@ const query = ref('')
 const filter = ref<'all' | 'running' | 'stopped'>('all')
 const latency = ref<Record<number, Latency>>({})
 const selectedId = ref<number | null>(null)
-const sorting = ref(false)
-const sortDraft = ref<Site[]>([])
 const savingOrder = ref(false)
-const draggingIdx = ref<number | null>(null)
-const dragOverIdx = ref<number | null>(null)
+const pointerSort = usePointerSort()
 const importOpen = ref(false)
 const importFormat = ref('json')
 const importData = ref('')
@@ -81,7 +79,6 @@ const selected = computed(() => sites.value.find(s => s.id === selectedId.value)
 const counts = computed(() => ({ all: sites.value.length, running: sites.value.filter(s => s.running).length, stopped: sites.value.filter(s => !s.running).length }))
 const totalTraffic = computed(() => sites.value.reduce((n, s) => n + (Number(s.traffic_used) || 0), 0))
 const visible = computed(() => {
-  if (sorting.value) return sortDraft.value
   const q = query.value.trim().toLowerCase()
   return sites.value.filter(s => {
     if (filter.value === 'running' && !s.running) return false
@@ -89,6 +86,7 @@ const visible = computed(() => {
     return !q || `${s.name} ${s.target_url} ${s.public_host || ''} ${s.path_prefix || ''}`.toLowerCase().includes(q)
   })
 })
+const canSort = computed(() => filter.value === 'all' && !query.value.trim() && sites.value.length > 1 && !savingOrder.value)
 const address = (site: Site) => siteAccessAddress(site, capabilities.value)
 
 async function test(site: Site) {
@@ -144,50 +142,47 @@ function latencyText(site: Site) {
   return { text: `${l.ms} ms`, tone: (l.ms || 0) < 200 ? 'good' : (l.ms || 0) < 800 ? 'warn' : 'bad' }
 }
 
-function startSorting() {
-  selectedId.value = null
-  sortDraft.value = [...sites.value]
-  sorting.value = true
+function openSiteDetail(site: Site) {
+  if (pointerSort.shouldSuppressClick()) return
+  selectedId.value = site.id
 }
-function move(index: number, delta: number) {
-  const next = [...sortDraft.value]
-  const [item] = next.splice(index, 1)
-  next.splice(index + delta, 0, item)
-  sortDraft.value = next
-}
-function onSortDragStart(index: number, event: DragEvent) {
-  draggingIdx.value = index
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', String(index))
-  }
-}
-function onSortDragOver(index: number, event: DragEvent) {
-  event.preventDefault()
-  dragOverIdx.value = index
-  if (draggingIdx.value === null || draggingIdx.value === index) return
-  const next = [...sortDraft.value]
-  const [item] = next.splice(draggingIdx.value, 1)
-  next.splice(index, 0, item)
-  sortDraft.value = next
-  draggingIdx.value = index
-}
-function onSortDragEnd() {
-  draggingIdx.value = null
-  dragOverIdx.value = null
-}
-async function saveOrder() {
-  savingOrder.value = true
-  try {
-    await sitesApi.reorder(sortDraft.value.map(s => s.id))
-    sites.value = [...sortDraft.value]
-    sorting.value = false
-    toast.success('顺序已保存')
-  } catch (error) {
-    toast.error(errorMessage(error, '保存失败'))
-  } finally {
-    savingOrder.value = false
-  }
+
+function startSiteSort(event: PointerEvent, site: Site) {
+  if (!canSort.value) return
+  const itemEl = (event.currentTarget as HTMLElement | null)?.closest<HTMLElement>('[data-site-sort-id]')
+  const containerEl = itemEl?.closest<HTMLElement>('.site-grid')
+  if (!itemEl || !containerEl) return
+
+  pointerSort.start<Site>({
+    event,
+    itemEl,
+    containerEl,
+    itemSelector: '[data-site-sort-id]',
+    getKeyFromEl: el => {
+      const id = Number(el.dataset.siteSortId)
+      return Number.isNaN(id) ? null : id
+    },
+    activeKey: site.id,
+    scope: 'sites',
+    mode: 'grid',
+    getList: () => sites.value,
+    getItemKey: item => item.id,
+    applyList: next => {
+      sites.value = next
+    },
+    onCommit: async (next, previous) => {
+      savingOrder.value = true
+      try {
+        await sitesApi.reorder(next.map(s => s.id))
+        toast.success('站点顺序已保存')
+      } catch (error) {
+        sites.value = previous
+        toast.error(errorMessage(error, '保存站点顺序失败'))
+      } finally {
+        savingOrder.value = false
+      }
+    },
+  })
 }
 function pickImport(format: string) {
   importFormat.value = format
@@ -207,12 +202,10 @@ function onMenu(key: string) {
   else if (key === 'import-json') pickImport('json')
   else if (key === 'import-csv') pickImport('csv')
   else if (key === 'export') exportOpen.value = true
-  else if (key === 'sort') startSorting()
   else if (key === 'history') historyOpen.value = true
 }
 const menuItems = [
   { key: 'test', label: '全部测速' },
-  { key: 'sort', label: '拖拽调整顺序' },
   { key: 'd1', label: '', divider: true },
   { key: 'import-json', label: '导入 JSON' },
   { key: 'import-csv', label: '导入 CSV' },
@@ -238,7 +231,7 @@ const menuItems = [
       <div class="kpi-card" :class="{ warn: reminders.length }"><dt>账号即将到期</dt><dd class="num">{{ reminders.length }}</dd></div>
     </dl>
 
-    <button v-if="reminders.length && !sorting" type="button" class="notice" @click="historyOpen = true">
+    <button v-if="reminders.length" type="button" class="notice" @click="historyOpen = true">
       <span class="dot warn" />
       <span>
         <template v-for="(r, i) in reminders.slice(0, 3)" :key="r.account.id">{{ i ? '，' : '' }}{{ r.site_name }} 的 {{ r.account.account_name || r.account.username }}{{ r.status === 'expired' ? ' 已到期' : ` 剩 ${r.days_left} 天` }}</template>
@@ -246,14 +239,7 @@ const menuItems = [
       </span>
     </button>
 
-    <div v-if="sorting" class="sortbar">
-      <span class="muted">直接拖拽卡片或点击箭头调整顺序，分享信息和列表都会按这个顺序显示。</span>
-      <div class="sort-acts">
-        <UiButton size="sm" @click="sorting = false">取消</UiButton>
-        <UiButton size="sm" variant="accent" :loading="savingOrder" @click="saveOrder">保存顺序</UiButton>
-      </div>
-    </div>
-    <div v-else class="toolbar-card">
+    <div class="toolbar-card">
       <nav class="seg" aria-label="按状态筛选">
         <button type="button" :class="{ on: filter === 'all' }" @click="filter = 'all'">全部<span class="n">{{ counts.all }}</span></button>
         <button type="button" :class="{ on: filter === 'running' }" @click="filter = 'running'">运行中<span class="n">{{ counts.running }}</span></button>
@@ -275,81 +261,78 @@ const menuItems = [
       </div>
     </div>
 
-    <div v-else-if="sorting" class="sort-list">
-      <div
-        v-for="(site, index) in visible"
-        :key="site.id"
-        class="sort-row"
-        :class="{ dragging: draggingIdx === index, over: dragOverIdx === index && draggingIdx !== index }"
-        draggable="true"
-        @dragstart="onSortDragStart(index, $event)"
-        @dragover="onSortDragOver(index, $event)"
-        @dragend="onSortDragEnd"
-      >
-        <span class="grip"><GripVertical /></span>
-        <span class="rank-badge num">#{{ index + 1 }}</span>
-        <div class="who">
-          <span class="name">{{ site.name }}</span>
-          <span class="sub mono">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
-        </div>
-        <div class="sort-btns">
-          <UiButton variant="ghost" size="sm" icon :disabled="index === 0" aria-label="上移" @click="move(index, -1)"><ArrowUp /></UiButton>
-          <UiButton variant="ghost" size="sm" icon :disabled="index === visible.length - 1" aria-label="下移" @click="move(index, 1)"><ArrowDown /></UiButton>
-        </div>
-      </div>
-    </div>
-
-    <div v-else class="site-grid">
-      <article
-        v-for="site in visible"
-        :key="site.id"
-        class="site-card"
-        :class="{ active: selectedId === site.id, stopped: !site.running }"
-        tabindex="0"
-        @click="selectedId = site.id"
-        @keydown.enter="selectedId = site.id"
-      >
-        <div class="card-top">
-          <div class="who">
-            <h3 class="name">{{ site.name }}</h3>
-            <span class="sub mono" :title="address(site)">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
-          </div>
-          <span class="status-pill" :class="site.running ? 'good' : site.enabled ? 'bad' : 'off'">
-            <span class="dot" :class="site.running ? 'good' : site.enabled ? 'bad' : ''" />
-            {{ site.running ? '运行中' : site.enabled ? '启动失败' : '已停用' }}
-          </span>
-        </div>
-
-        <div class="card-metrics">
-          <div class="metric-box">
-            <span class="m-label">已用流量</span>
-            <span class="m-val num">
-              {{ formatBytes(Number(site.traffic_used) || 0) }}
-              <small v-if="site.traffic_quota" class="faint">/ {{ formatBytes(Number(site.traffic_quota)) }}</small>
+    <template v-else>
+      <TransitionGroup v-if="visible.length" name="grid-sort" tag="div" class="site-grid">
+        <article
+          v-for="site in visible"
+          :key="site.id"
+          :data-site-sort-id="site.id"
+          class="site-card"
+          :class="{
+            active: selectedId === site.id,
+            stopped: !site.running,
+            dragging: pointerSort.draggingScope.value === 'sites' && pointerSort.draggingKey.value === site.id,
+            'is-sort-placeholder': pointerSort.draggingScope.value === 'sites' && pointerSort.draggingKey.value === site.id,
+          }"
+          tabindex="0"
+          @click="openSiteDetail(site)"
+          @keydown.enter="openSiteDetail(site)"
+        >
+          <div class="card-top">
+            <div class="card-head-left">
+              <button
+                v-if="canSort"
+                type="button"
+                class="drag-handle"
+                title="按住拖动调整顺序"
+                aria-label="拖动调整顺序"
+                @click.stop
+                @pointerdown.stop="startSiteSort($event, site)"
+              >
+                <GripVertical />
+              </button>
+              <div class="who">
+                <h3 class="name">{{ site.name }}</h3>
+                <span class="sub mono" :title="address(site)">{{ address(site) || INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
+              </div>
+            </div>
+            <span class="status-pill" :class="site.running ? 'good' : site.enabled ? 'bad' : 'off'">
+              <span class="dot" :class="site.running ? 'good' : site.enabled ? 'bad' : ''" />
+              {{ site.running ? '运行中' : site.enabled ? '启动失败' : '已停用' }}
             </span>
           </div>
-          <div class="metric-box">
-            <span class="m-label">源站延迟</span>
-            <span class="m-val num" :class="latencyText(site).tone">{{ latencyText(site).text }}</span>
-          </div>
-          <div class="metric-box">
-            <span class="m-label">接入模式</span>
-            <span class="m-val">{{ INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
-          </div>
-        </div>
 
-        <UiProgress v-if="site.traffic_quota" :value="Number(site.traffic_used) || 0" :max="Number(site.traffic_quota)" />
-
-        <div class="card-foot">
-          <span class="faint hint-text">点击查看详情与源站账号</span>
-          <div class="act" @click.stop>
-            <UiButton variant="secondary" size="sm" @click="test(site)"><Zap />测速</UiButton>
-            <UiButton variant="secondary" size="sm" @click="copyAddress(site)"><Copy />复制</UiButton>
+          <div class="card-metrics">
+            <div class="metric-box">
+              <span class="m-label">已用流量</span>
+              <span class="m-val num">
+                {{ formatBytes(Number(site.traffic_used) || 0) }}
+                <small v-if="site.traffic_quota" class="faint">/ {{ formatBytes(Number(site.traffic_quota)) }}</small>
+              </span>
+            </div>
+            <div class="metric-box">
+              <span class="m-label">源站延迟</span>
+              <span class="m-val num" :class="latencyText(site).tone">{{ latencyText(site).text }}</span>
+            </div>
+            <div class="metric-box">
+              <span class="m-label">接入模式</span>
+              <span class="m-val">{{ INGRESS_LABEL[normalizedIngressMode(site)] }}</span>
+            </div>
           </div>
-        </div>
-      </article>
-      <p v-if="!visible.length" class="none">没有符合条件的站点</p>
-    </div>
+
+          <UiProgress v-if="site.traffic_quota" :value="Number(site.traffic_used) || 0" :max="Number(site.traffic_quota)" />
+
+          <div class="card-foot">
+            <span class="faint hint-text">点击查看详情与源站账号</span>
+            <div class="act" @click.stop>
+              <UiButton variant="secondary" size="sm" @click="test(site)"><Zap />测速</UiButton>
+              <UiButton variant="secondary" size="sm" @click="copyAddress(site)"><Copy />复制</UiButton>
+            </div>
+          </div>
+        </article>
+      </TransitionGroup>
+      <p v-else class="none">没有符合条件的站点</p>
+    </template>
 
     <input ref="fileInput" type="file" hidden @change="onFile" />
 
@@ -484,9 +467,31 @@ const menuItems = [
   transform: translateY(-2px);
 }
 .site-card.stopped { opacity: 0.78; }
+.site-card.dragging { opacity: 0.24; border-style: dashed; border-color: var(--accent); background: var(--accent-soft); transform: none; box-shadow: none; }
 
 .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.card-head-left { display: flex; align-items: flex-start; gap: 8px; min-width: 0; flex: 1; }
+.drag-handle {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-left: -6px;
+  margin-top: -1px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: grab;
+  touch-action: none;
+  flex: 0 0 auto;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.drag-handle:hover { color: var(--text); background: var(--surface-2); }
+.drag-handle:active { cursor: grabbing; }
+.drag-handle svg { width: 15px; height: 15px; }
+.who { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .name { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -539,38 +544,7 @@ const menuItems = [
 .hint-text { font-size: 12px; }
 .act { display: flex; gap: 6px; }
 
-.sort-list { display: flex; flex-direction: column; gap: 10px; }
-.sort-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: var(--radius);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-card);
-  cursor: grab;
-  transition: transform 140ms var(--ease), border-color 140ms var(--ease), opacity 140ms var(--ease);
-}
-.sort-row:active { cursor: grabbing; }
-.sort-row.dragging { opacity: 0.55; border-color: var(--accent); }
-.sort-row.over { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.grip { display: grid; place-items: center; color: var(--text-3); }
-.grip svg { width: 16px; height: 16px; }
-.rank-badge {
-  display: inline-grid;
-  place-items: center;
-  min-width: 28px;
-  height: 24px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  font-size: 11.5px;
-  font-weight: 700;
-  color: var(--text-2);
-}
-.sort-row .who { flex: 1; }
-.sort-btns { display: flex; gap: 4px; }
+.grid-sort-move { transition: transform 180ms var(--ease); }
 
 .skeleton { min-height: 168px; cursor: default; }
 .skeleton span { height: 16px; width: 45%; border-radius: 6px; background: var(--surface-hover); animation: pulse 1.2s ease-in-out infinite; }

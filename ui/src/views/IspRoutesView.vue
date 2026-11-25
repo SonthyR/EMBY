@@ -17,6 +17,7 @@ import {
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { formatBytes } from '@/utils/format'
+import { usePointerSort } from '@/composables/usePointerSort'
 
 const groups = ref<ISPRouteGroup[]>([])
 const blockNonMainland = ref(false)
@@ -37,9 +38,7 @@ const testing = ref(false)
 const testResult = ref<IP2RegionLookupResult | null>(null)
 const testError = ref('')
 
-// Drag state scoped per ISP group
-const dragState = ref<{ group: string; nodeId: number; before: number[] } | null>(null)
-let touchDragActive = false
+const pointerSort = usePointerSort()
 
 function formatTimestamp(raw?: string): string {
   if (!raw) return ''
@@ -50,7 +49,7 @@ function formatTimestamp(raw?: string): string {
 }
 
 async function load(silent = false) {
-  if (dragState.value || savingGroup.value || savingNonMainland.value) return
+  if (pointerSort.isDragging.value || savingGroup.value || savingNonMainland.value) return
   if (!silent) loading.value = true
   try {
     const [routeRes, ipStatus] = await Promise.all([ispRoutesApi.get(), ip2regionApi.status()])
@@ -72,19 +71,6 @@ onMounted(() => {
 })
 onBeforeUnmount(() => clearInterval(timer))
 
-function reorderLocal(groupKey: string, sourceId: number, targetId: number) {
-  if (sourceId === targetId) return
-  const group = groups.value.find(g => g.group === groupKey)
-  if (!group) return
-  const list = [...group.nodes]
-  const from = list.findIndex(n => n.node_id === sourceId)
-  const to = list.findIndex(n => n.node_id === targetId)
-  if (from < 0 || to < 0) return
-  const [moved] = list.splice(from, 1)
-  list.splice(to, 0, moved)
-  group.nodes = list
-}
-
 async function persistGroup(groupKey: string) {
   const group = groups.value.find(g => g.group === groupKey)
   if (!group) return
@@ -104,64 +90,37 @@ async function persistGroup(groupKey: string) {
   }
 }
 
-function onDragStart(event: DragEvent, groupKey: string, node: ISPRouteNode) {
+function startRouteSort(event: PointerEvent, groupKey: string, node: ISPRouteNode) {
+  const targetEl = event.target as HTMLElement | null
+  if (targetEl?.closest('button, input, a, [role="switch"]')) return
   const group = groups.value.find(g => g.group === groupKey)
   if (!group || group.nodes.length <= 1 || savingGroup.value) return
-  dragState.value = { group: groupKey, nodeId: node.node_id, before: group.nodes.map(n => n.node_id) }
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', String(node.node_id))
-  }
-}
+  const itemEl = (event.currentTarget as HTMLElement | null)?.closest<HTMLElement>('[data-route-node]')
+  const containerEl = itemEl?.closest<HTMLElement>('.node-list')
+  if (!itemEl || !containerEl) return
 
-function onDragOver(event: DragEvent, groupKey: string, target: ISPRouteNode) {
-  if (!dragState.value || dragState.value.group !== groupKey) return
-  event.preventDefault()
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-  if (dragState.value.nodeId !== target.node_id) {
-    reorderLocal(groupKey, dragState.value.nodeId, target.node_id)
-  }
-}
-
-function onDrop(event: DragEvent) {
-  event.preventDefault()
-}
-
-async function onDragEnd() {
-  if (!dragState.value) return
-  const { group: groupKey, before } = dragState.value
-  dragState.value = null
-  const group = groups.value.find(g => g.group === groupKey)
-  if (!group) return
-  const after = group.nodes.map(n => n.node_id)
-  if (after.length === before.length && after.every((id, i) => id === before[i])) return
-  await persistGroup(groupKey)
-}
-
-function onTouchStart(event: TouchEvent, groupKey: string, node: ISPRouteNode) {
-  const group = groups.value.find(g => g.group === groupKey)
-  if (!group || group.nodes.length <= 1 || savingGroup.value || event.touches.length !== 1) return
-  touchDragActive = true
-  dragState.value = { group: groupKey, nodeId: node.node_id, before: group.nodes.map(n => n.node_id) }
-}
-
-function onTouchMove(event: TouchEvent) {
-  if (!touchDragActive || !dragState.value || event.touches.length !== 1) return
-  event.preventDefault()
-  const touch = event.touches[0]
-  const el = document.elementFromPoint(touch.clientX, touch.clientY)?.closest<HTMLElement>('[data-route-node]')
-  if (!el) return
-  const targetGroup = el.dataset.routeGroup
-  const targetId = Number(el.dataset.routeNode)
-  if (targetGroup === dragState.value.group && !Number.isNaN(targetId) && targetId !== dragState.value.nodeId) {
-    reorderLocal(targetGroup, dragState.value.nodeId, targetId)
-  }
-}
-
-async function onTouchEnd() {
-  if (!touchDragActive) return
-  touchDragActive = false
-  await onDragEnd()
+  pointerSort.start<ISPRouteNode>({
+    event,
+    itemEl,
+    containerEl,
+    itemSelector: '[data-route-node]',
+    getKeyFromEl: el => {
+      const id = Number(el.dataset.routeNode)
+      return Number.isNaN(id) ? null : id
+    },
+    activeKey: node.node_id,
+    scope: groupKey,
+    mode: 'list',
+    getList: () => groups.value.find(g => g.group === groupKey)?.nodes || [],
+    getItemKey: item => item.node_id,
+    applyList: next => {
+      const g = groups.value.find(item => item.group === groupKey)
+      if (g) g.nodes = next
+    },
+    onCommit: async () => {
+      await persistGroup(groupKey)
+    },
+  })
 }
 
 async function promoteNode(groupKey: string, node: ISPRouteNode) {
@@ -449,23 +408,16 @@ async function deleteIPDB(version: 'v4' | 'v6') {
                 :class="{
                   active: node.active,
                   off: !node.enabled,
-                  dragging: dragState?.group === group.group && dragState?.nodeId === node.node_id,
-                  movable: group.nodes.length > 1,
+                  dragging: pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
+                  'is-sort-placeholder': pointerSort.draggingScope.value === group.group && pointerSort.draggingKey.value === node.node_id,
+                  movable: group.nodes.length > 1 && !savingGroup,
                 }"
-                :draggable="group.nodes.length > 1 && !savingGroup"
-                @dragstart="onDragStart($event, group.group, node)"
-                @dragover="onDragOver($event, group.group, node)"
-                @drop="onDrop"
-                @dragend="onDragEnd"
+                @pointerdown="startRouteSort($event, group.group, node)"
               >
                 <span
                   v-if="group.nodes.length > 1"
                   class="grip"
-                  title="拖动调整优先级"
-                  @touchstart="onTouchStart($event, group.group, node)"
-                  @touchmove="onTouchMove"
-                  @touchend="onTouchEnd"
-                  @touchcancel="onTouchEnd"
+                  title="按住拖动调整优先级"
                 >
                   <GripVertical />
                 </span>
@@ -691,11 +643,11 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .test-result .bad { color: var(--bad); }
 
 .node-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.node-row { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), opacity var(--dur) var(--ease); }
-.node-row.movable { cursor: grab; }
+.node-row { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); user-select: none; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), opacity var(--dur) var(--ease); }
+.node-row.movable { cursor: grab; touch-action: pan-y; }
 .node-row.active { border-color: var(--accent-border); background: linear-gradient(90deg, var(--accent-soft) 0%, var(--surface) 75%); }
 .node-row.off { opacity: 0.55; }
-.node-row.dragging { opacity: 0.45; border-style: dashed; border-color: var(--accent); cursor: grabbing; }
+.node-row.dragging { opacity: 0.24; border-style: dashed; border-color: var(--accent); background: var(--accent-soft); cursor: grabbing; }
 
 .grip { display: inline-flex; align-items: center; color: var(--text-3); touch-action: none; cursor: grab; }
 .grip svg { width: 15px; height: 15px; }
