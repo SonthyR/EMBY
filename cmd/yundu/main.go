@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.0"
+var appVersion = "v1.5.1"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -236,6 +236,7 @@ func main() {
 		routeDirect:       envBool("PANEL_ROUTE_DIRECT"),
 		panelTLSEnabled:   panelTLSEnabled,
 		panelCertificates: panelCertificates,
+		edgeAutoHTTPS:     newEdgeAutoHTTPSManager(db, dbPath, pm.edges),
 		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
 		panelBindHost:     panelBindHost,
 		panelListenPort:   port,
@@ -243,6 +244,7 @@ func main() {
 		restartCh:         make(chan struct{}),
 	}
 	go runPanelCertificateRenewalScheduler(ctx, db, panelCertificates)
+	go runEdgeAutoHTTPSMonitor(ctx, app.edgeAutoHTTPS)
 	go app.runTelegramBot(ctx)
 
 	mux := http.NewServeMux()
@@ -291,6 +293,8 @@ func main() {
 	mux.HandleFunc("/api/redeem/register", cors(app.csrfMiddleware(app.handleRedeemRegister)))
 	mux.HandleFunc("/api/master-node", cors(app.authMiddleware(app.handleMasterNode)))
 	mux.HandleFunc("/api/master-node/", cors(app.authMiddleware(app.handleMasterNodeAction)))
+	mux.HandleFunc("/api/edge-auto-https", cors(app.authMiddleware(app.handleEdgeAutoHTTPS)))
+	mux.HandleFunc("/api/edge-auto-https/", cors(app.authMiddleware(app.handleEdgeAutoHTTPSAction)))
 	mux.HandleFunc("/api/edge-nodes", cors(app.authMiddleware(app.handleEdgeNodes)))
 	mux.HandleFunc("/api/edge-nodes/", cors(app.authMiddleware(app.handleEdgeNodeByID)))
 	mux.HandleFunc("/api/isp-routes", cors(app.authMiddleware(app.handleISPRoutes)))

@@ -3,6 +3,8 @@ import type {
   AuthCheck,
   ClientFilterConfig,
   DashboardAnalyticsResponse,
+  EdgeAutoHTTPSInput,
+  EdgeAutoHTTPSStatus,
   EdgeNode,
   EdgeNodeInput,
   MasterNodeInput,
@@ -300,6 +302,13 @@ export const masterNodeApi = {
   update: (input: MasterNodeInput) => api.put<EdgeNode>('/api/master-node', input),
   resetTraffic: () => api.post<EdgeNode>('/api/master-node/reset-traffic'),
   probe: () => api.post<EdgeNode>('/api/master-node/probe'),
+}
+
+export const edgeAutoHttpsApi = {
+  get: () => api.get<EdgeAutoHTTPSStatus>('/api/edge-auto-https'),
+  update: (input: EdgeAutoHTTPSInput) => api.put<EdgeAutoHTTPSStatus>('/api/edge-auto-https', input),
+  issue: (force = false) => api.post<EdgeAutoHTTPSStatus>('/api/edge-auto-https/issue', { force }),
+  sync: () => api.post<{ synced: number; status: EdgeAutoHTTPSStatus }>('/api/edge-auto-https/sync', {}),
 }
 
 export const ispRoutesApi = {

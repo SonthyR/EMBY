@@ -1,5 +1,14 @@
 # 更新记录
 
+## v1.5.1
+
+发布日期：2026-11-25
+
+- 新增「**从机全自动 HTTPS（Cloudflare 泛域名证书 + 自动 DNS/DDNS）**」，专门解决 NAT 小鸡裸 IP 明文 HTTP 易被跨境拦截且需手动配置域名解析与证书的痛点：
+  - **独立证书目录，100% 兼容 1Panel / OpenResty / 宝塔外部反代**：新增「设置 → 从机自动 HTTPS」页面与 `/api/edge-auto-https` 接口，只需配置一次泛域名（如 `*.example.com`）、邮箱与 Cloudflare DNS API Token，即可自动申请并自动续期泛域名证书（存储于独立 `edge-tls/` 目录，绝不修改主机 HTTP 监听端口与外部反代配置）。
+  - **添加从机一键开启，全链路自动化**：创建或编辑从机时勾选「自动配置 HTTPS」，系统自动分配子域名（如 `node-8.example.com`，亦支持自定义一级子域名）；从机首次心跳上报公网 IP 后，主机自动调用 Cloudflare API 写入仅 DNS（关闭小黄云）的 `A / AAAA` 记录并下发泛域名证书，约 5 秒即亮起绿色 `HTTPS 自动证书` 与 `CF DNS` 状态标签。
+  - **全生命周期维护**：NAT 机器公网 IP 变动时自动触发 DDNS 更新 Cloudflare 解析；关闭自动 HTTPS、更换域名或删除从机时自动清理对应的 Cloudflare DNS 记录；备份恢复时自动重加密保存的 Cloudflare API Token。
+
 ## v1.5.0
 
 发布日期：2026-11-25

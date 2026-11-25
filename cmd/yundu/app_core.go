@@ -33,6 +33,7 @@ type App struct {
 	routeDirect       bool
 	panelTLSEnabled   bool
 	panelCertificates *panelCertificateManager
+	edgeAutoHTTPS     *edgeAutoHTTPSManager
 	panelBindLoopback bool
 	panelBindHost     string
 	panelListenPort   int

@@ -16,10 +16,17 @@ const masterNodeApi = vi.hoisted(() => ({
   resetTraffic: vi.fn(),
 }))
 
+const edgeAutoHttpsApi = vi.hoisted(() => ({
+  get: vi.fn(),
+  update: vi.fn(),
+  issue: vi.fn(),
+  sync: vi.fn(),
+}))
+
 const confirmMock = vi.hoisted(() => vi.fn())
 const copyTextMock = vi.hoisted(() => vi.fn())
 
-vi.mock('@/api', () => ({ edgeApi, masterNodeApi }))
+vi.mock('@/api', () => ({ edgeApi, masterNodeApi, edgeAutoHttpsApi }))
 vi.mock('@/stores/confirm', () => ({ confirm: confirmMock }))
 vi.mock('@/utils/format', async importOriginal => {
   const actual = await importOriginal<typeof import('@/utils/format')>()
@@ -107,6 +114,21 @@ beforeEach(() => {
   masterNodeApi.probe.mockResolvedValue(makeMasterNode({ upstream_latencies: [{ site_name: '主力站', latency_ms: 12 }] }))
   masterNodeApi.resetTraffic.mockResolvedValue(makeMasterNode({ traffic_used: 0 }))
   masterNodeApi.update.mockResolvedValue(makeMasterNode({ name: '美国主机' }))
+  edgeAutoHttpsApi.get.mockResolvedValue({
+    enabled: true,
+    base_domain: 'example.com',
+    wildcard_domain: '*.example.com',
+    subdomain_prefix: 'node',
+    acme_email: 'ops@example.com',
+    token_configured: true,
+    cert_configured: true,
+    cert_valid: true,
+    cert_matches_domain: true,
+    cert_days_remaining: 80,
+    issuing: false,
+    auto_nodes_count: 1,
+    synced_nodes_count: 1,
+  })
 })
 
 describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () => {
@@ -120,7 +142,7 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
     ]
     edgeApi.list.mockResolvedValue(nodes)
 
-    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true } } })
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true, RouterLink: true } } })
     await flushPromises()
 
     expect(wrapper.text()).toContain('1 主 · 5 从')
@@ -144,7 +166,7 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
 
   it('主机卡片支持刷新延迟、编辑配置与清零本期流量', async () => {
     edgeApi.list.mockResolvedValue([])
-    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true } } })
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true, RouterLink: true } } })
     await flushPromises()
 
     expect(wrapper.text()).toContain('1 主 · 0 从')
@@ -192,7 +214,7 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
       uninstall_command: 'bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent --uninstall',
     })
 
-    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true } } })
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true, RouterLink: true } } })
     await flushPromises()
 
     const installBtn = wrapper.findAll('button').find(b => b.text().includes('安装命令'))

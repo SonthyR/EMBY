@@ -163,6 +163,9 @@ export interface EdgeNode {
   public_ip: string
   detected_ip: string
   tls_mode: EdgeNodeTLSMode | string
+  auto_https?: boolean
+  cf_dns_status?: string
+  cf_record_ip?: string
   enabled: boolean
   traffic_quota: number
   traffic_used: number
@@ -206,10 +209,40 @@ export interface EdgeNodeInput {
   public_host?: string
   public_ip?: string
   tls_mode?: EdgeNodeTLSMode | string
+  auto_https?: boolean
   enabled?: boolean
   traffic_quota?: number
   traffic_reset_day?: number
   note?: string
+}
+
+export interface EdgeAutoHTTPSStatus {
+  enabled: boolean
+  base_domain: string
+  wildcard_domain: string
+  subdomain_prefix: string
+  acme_email: string
+  token_configured: boolean
+  zone_id?: string
+  cert_configured: boolean
+  cert_valid: boolean
+  cert_matches_domain: boolean
+  cert_expires_at?: string
+  cert_days_remaining?: number
+  cert_dns_names?: string[]
+  issuing: boolean
+  last_cert_error?: string
+  last_renewed_at?: string
+  auto_nodes_count: number
+  synced_nodes_count: number
+}
+
+export interface EdgeAutoHTTPSInput {
+  enabled?: boolean
+  base_domain?: string
+  subdomain_prefix?: string
+  acme_email?: string
+  cf_api_token?: string
 }
 
 export type ISPRouteStrategy = 'priority' | 'auto' | 'balance'

@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import TlsSettings from '@/components/settings/TlsSettings.vue'
+import EdgeAutoHttpsSettings from '@/components/settings/EdgeAutoHttpsSettings.vue'
 import TelegramSettings from '@/components/settings/TelegramSettings.vue'
 import UpdateSettings from '@/components/settings/UpdateSettings.vue'
 import ClientFilterSettings from '@/components/settings/ClientFilterSettings.vue'
@@ -19,10 +21,20 @@ const SECTIONS = [
   { key: 'logs', label: '请求日志' },
   { key: 'backup', label: '备份与恢复' },
   { key: 'tls', label: '面板地址与证书' },
+  { key: 'edge-https', label: '从机自动 HTTPS' },
   { key: 'telegram', label: 'Telegram 机器人' },
   { key: 'update', label: '版本更新' },
 ]
-const section = ref('general')
+const route = useRoute()
+const validSectionKeys = new Set(SECTIONS.map(s => s.key))
+const initialSection = typeof route.query.section === 'string' && validSectionKeys.has(route.query.section) ? route.query.section : 'general'
+const section = ref(initialSection)
+watch(
+  () => route.query.section,
+  val => {
+    if (typeof val === 'string' && validSectionKeys.has(val)) section.value = val
+  },
+)
 const settings = ref<Settings | null>(null)
 const original = ref('')
 const saving = ref(false)
@@ -227,6 +239,7 @@ async function doRestore() {
 
         <ClientFilterSettings v-if="section === 'client-filter'" />
         <TlsSettings v-if="section === 'tls'" />
+        <EdgeAutoHttpsSettings v-if="section === 'edge-https'" />
         <TelegramSettings v-if="section === 'telegram'" />
         <UpdateSettings v-if="section === 'update'" />
 

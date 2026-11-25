@@ -107,6 +107,11 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		{"isp_group_settings", "strategy", `ALTER TABLE isp_group_settings ADD COLUMN strategy TEXT NOT NULL DEFAULT 'priority'`},
 		{"edge_nodes", "total_bytes_in", `ALTER TABLE edge_nodes ADD COLUMN total_bytes_in INTEGER NOT NULL DEFAULT 0`},
 		{"edge_nodes", "total_bytes_out", `ALTER TABLE edge_nodes ADD COLUMN total_bytes_out INTEGER NOT NULL DEFAULT 0`},
+		{"edge_nodes", "auto_https", `ALTER TABLE edge_nodes ADD COLUMN auto_https INTEGER NOT NULL DEFAULT 0`},
+		{"edge_nodes", "cf_record_id", `ALTER TABLE edge_nodes ADD COLUMN cf_record_id TEXT NOT NULL DEFAULT ''`},
+		{"edge_nodes", "cf_record_type", `ALTER TABLE edge_nodes ADD COLUMN cf_record_type TEXT NOT NULL DEFAULT ''`},
+		{"edge_nodes", "cf_record_ip", `ALTER TABLE edge_nodes ADD COLUMN cf_record_ip TEXT NOT NULL DEFAULT ''`},
+		{"edge_nodes", "cf_dns_status", `ALTER TABLE edge_nodes ADD COLUMN cf_dns_status TEXT NOT NULL DEFAULT ''`},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+col.table+"') WHERE name=?", col.name).Scan(&exists); err != nil {
@@ -134,11 +139,28 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO isp_group_settings(isp_group, block_connect, strategy) VALUES(?, 0, 'priority')`, ispSettingNonMainlandKey); err != nil {
 		return err
 	}
-	return ensureMasterNodeSchema(ctx, conn)
+	if err := ensureMasterNodeSchema(ctx, conn); err != nil {
+		return err
+	}
+	return ensureEdgeAutoHTTPSSchema(ctx, conn)
 }
 
 // reencryptEdgeNodeSecrets moves edge node secrets to a new credential key during backup restore.
 func reencryptEdgeNodeSecrets(tx *sql.Tx, oldKey, newKey []byte) error {
+	if hasTable, err := backupSQLiteColumnExists(tx, "edge_tls_settings", "cf_token_ciphertext"); err == nil && hasTable {
+		var cipher string
+		if err := tx.QueryRow(`SELECT cf_token_ciphertext FROM edge_tls_settings WHERE id=1`).Scan(&cipher); err == nil && cipher != "" {
+			plain, decErr := decryptPanelACMETokenWithSecret(cipher, oldKey)
+			if decErr != nil {
+				plain, decErr = decryptPanelACMETokenWithSecret(cipher, newKey)
+			}
+			if decErr != nil {
+				_, _ = tx.Exec(`UPDATE edge_tls_settings SET cf_token_ciphertext='' WHERE id=1`)
+			} else if reenc, encErr := encryptPanelACMETokenWithSecret(plain, newKey); encErr == nil {
+				_, _ = tx.Exec(`UPDATE edge_tls_settings SET cf_token_ciphertext=? WHERE id=1`, reenc)
+			}
+		}
+	}
 	hasTable, err := backupSQLiteColumnExists(tx, "edge_nodes", "token_ciphertext")
 	if err != nil || !hasTable {
 		return err
@@ -369,6 +391,9 @@ type EdgeNode struct {
 	PublicIP          string                `json:"public_ip"`
 	DetectedIP        string                `json:"detected_ip"`
 	TLSMode           string                `json:"tls_mode"`
+	AutoHTTPS         bool                  `json:"auto_https"`
+	CFDNSStatus       string                `json:"cf_dns_status,omitempty"`
+	CFRecordIP        string                `json:"cf_record_ip,omitempty"`
 	Enabled           bool                  `json:"enabled"`
 	TrafficQuota      int64                 `json:"traffic_quota"`
 	TrafficUsed       int64                 `json:"traffic_used"`
@@ -404,6 +429,7 @@ type EdgeNodeInput struct {
 	PublicHost   string `json:"public_host"`
 	PublicIP     string `json:"public_ip"`
 	TLSMode      string `json:"tls_mode"`
+	AutoHTTPS    bool   `json:"auto_https"`
 	Enabled      *bool  `json:"enabled"`
 	TrafficQuota int64  `json:"traffic_quota"`
 	ResetDay     int    `json:"traffic_reset_day"`
@@ -419,6 +445,11 @@ type edgeNodeLiveState struct {
 	publicIP            string
 	detectedIP          string
 	tlsMode             string
+	autoHTTPS           bool
+	cfRecordID          string
+	cfRecordType        string
+	cfRecordIP          string
+	cfDNSStatus         string
 	tokenHash           string
 	tokenPlain          string
 	enabled             bool
@@ -627,7 +658,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	if rt == nil || rt.db == nil {
 		return nil
 	}
-	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY id`)
+	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, auto_https, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -637,6 +668,9 @@ func (rt *edgeNodeRuntime) reload() error {
 		publicPort, listenPort, resetDay int
 		name, publicHost, publicIP       string
 		detectedIP, tlsMode              string
+		autoHTTPS                        bool
+		cfRecordID, cfRecordType         string
+		cfRecordIP, cfDNSStatus          string
 		tokenHash, tokenCipher           string
 		resetPeriod, note, version, seen string
 		enabled                          bool
@@ -644,12 +678,13 @@ func (rt *edgeNodeRuntime) reload() error {
 	var list []loadedNode
 	for rows.Next() {
 		var item loadedNode
-		var enabled int
-		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
+		var enabled, autoHTTPSInt int
+		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &autoHTTPSInt, &item.cfRecordID, &item.cfRecordType, &item.cfRecordIP, &item.cfDNSStatus, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
 			rows.Close()
 			return err
 		}
 		item.enabled = enabled != 0
+		item.autoHTTPS = autoHTTPSInt != 0
 		list = append(list, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -749,6 +784,11 @@ func (rt *edgeNodeRuntime) reload() error {
 			state.detectedIP = item.detectedIP
 		}
 		state.tlsMode = item.tlsMode
+		state.autoHTTPS = item.autoHTTPS
+		state.cfRecordID = item.cfRecordID
+		state.cfRecordType = item.cfRecordType
+		state.cfRecordIP = item.cfRecordIP
+		state.cfDNSStatus = item.cfDNSStatus
 		state.tokenHash = item.tokenHash
 		if item.tokenCipher != "" {
 			if plain, err := decryptSiteAccountSecret(item.tokenCipher); err == nil {
@@ -1509,6 +1549,9 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 		PublicIP:         state.publicIP,
 		DetectedIP:       state.detectedIP,
 		TLSMode:          state.tlsMode,
+		AutoHTTPS:        state.autoHTTPS,
+		CFDNSStatus:      state.cfDNSStatus,
+		CFRecordIP:       state.cfRecordIP,
 		Enabled:          state.enabled,
 		TrafficQuota:     state.quota,
 		TrafficUsed:      state.totalUsed(),
@@ -1666,6 +1709,23 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		var autoCfg edgeAutoHTTPSSettings
+		if input.AutoHTTPS {
+			if a.edgeAutoHTTPS == nil {
+				a.jsonErr(w, http.StatusBadRequest, "从机自动 HTTPS 服务未初始化")
+				return
+			}
+			autoCfg, err = a.edgeAutoHTTPS.loadSettings()
+			if err != nil || autoCfg.BaseDomain == "" || autoCfg.CFTokenCiphertext == "" {
+				a.jsonErr(w, http.StatusBadRequest, "请先在「设置 → 从机自动 HTTPS」配置泛域名与 Cloudflare API Token")
+				return
+			}
+			if input.PublicHost != "" && !isSingleLevelSubdomainOf(input.PublicHost, autoCfg.BaseDomain) {
+				a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("开启自动 HTTPS 时，自定义域名必须是 *.%s 下的一级子域名（留空将自动分配）", autoCfg.BaseDomain))
+				return
+			}
+			input.TLSMode = edgeNodeTLSModeAuto
+		}
 		token, err := generateEdgeNodeToken()
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "生成节点密钥失败")
@@ -1681,14 +1741,18 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 			enabled = *input.Enabled
 		}
 		resetPeriod, _ := shareResetPeriod(time.Now().In(a.db.shareLocation()), input.ResetDay)
+		initialDNSStatus := ""
+		if input.AutoHTTPS {
+			initialDNSStatus = "pending_ip"
+		}
 		tx, err := a.db.db.Begin()
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
 		}
 		defer tx.Rollback()
-		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.Note)
+		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.Note)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
@@ -1697,6 +1761,13 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
+		}
+		if input.AutoHTTPS && input.PublicHost == "" {
+			assignedHost := autoEdgeHostname(autoCfg.SubdomainPrefix, id, autoCfg.BaseDomain)
+			if _, err := tx.Exec(`UPDATE edge_nodes SET public_host=? WHERE id=?`, assignedHost, id); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "分配自动 HTTPS 子域名失败")
+				return
+			}
 		}
 		for _, group := range allISPGroups {
 			var maxOrder int
@@ -1712,6 +1783,11 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		if a.pm != nil && a.pm.edges != nil {
 			_ = a.pm.edges.reload()
+		}
+		if input.AutoHTTPS && input.PublicIP != "" && a.edgeAutoHTTPS != nil {
+			syncCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			_ = a.edgeAutoHTTPS.syncNodeDNS(syncCtx, id)
+			cancel()
 		}
 		view, _ := a.buildEdgeNodeView(id, origin, true)
 		a.jsonResponse(w, http.StatusCreated, view)
@@ -1756,6 +1832,44 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, http.StatusBadRequest, err.Error())
 				return
 			}
+			var prevAutoInt int
+			var prevHost, prevRecID, prevRecType, prevRecIP, prevDNSStatus, prevDetectedIP string
+			_ = a.db.db.QueryRow(`SELECT auto_https, public_host, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, detected_ip FROM edge_nodes WHERE id=?`, id).
+				Scan(&prevAutoInt, &prevHost, &prevRecID, &prevRecType, &prevRecIP, &prevDNSStatus, &prevDetectedIP)
+			prevAuto := prevAutoInt != 0
+
+			nextRecID, nextRecType, nextRecIP, nextDNSStatus := prevRecID, prevRecType, prevRecIP, prevDNSStatus
+			var staleRecordToDelete string
+
+			if input.AutoHTTPS {
+				if a.edgeAutoHTTPS == nil {
+					a.jsonErr(w, http.StatusBadRequest, "从机自动 HTTPS 服务未初始化")
+					return
+				}
+				autoCfg, cfgErr := a.edgeAutoHTTPS.loadSettings()
+				if cfgErr != nil || autoCfg.BaseDomain == "" || autoCfg.CFTokenCiphertext == "" {
+					a.jsonErr(w, http.StatusBadRequest, "请先在「设置 → 从机自动 HTTPS」配置泛域名与 Cloudflare API Token")
+					return
+				}
+				if input.PublicHost == "" {
+					input.PublicHost = autoEdgeHostname(autoCfg.SubdomainPrefix, id, autoCfg.BaseDomain)
+				} else if !isSingleLevelSubdomainOf(input.PublicHost, autoCfg.BaseDomain) {
+					a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("开启自动 HTTPS 时，自定义域名必须是 *.%s 下的一级子域名（留空将自动分配）", autoCfg.BaseDomain))
+					return
+				}
+				input.TLSMode = edgeNodeTLSModeAuto
+				if prevRecID != "" && !strings.EqualFold(prevHost, input.PublicHost) {
+					staleRecordToDelete = prevRecID
+					nextRecID, nextRecType, nextRecIP = "", "", ""
+				}
+				if nextDNSStatus == "" || !prevAuto || staleRecordToDelete != "" {
+					nextDNSStatus = "pending_ip"
+				}
+			} else if prevAuto {
+				staleRecordToDelete = prevRecID
+				nextRecID, nextRecType, nextRecIP, nextDNSStatus = "", "", "", ""
+			}
+
 			enabled := true
 			if input.Enabled != nil {
 				enabled = *input.Enabled
@@ -1766,17 +1880,42 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			resetPeriod, _ := shareResetPeriod(time.Now().In(a.db.shareLocation()), input.ResetDay)
-			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, enabled=?, traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.Note, id); err != nil {
+			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, auto_https=?, cf_record_id=?, cf_record_type=?, cf_record_ip=?, cf_dns_status=?, enabled=?, traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), nextRecID, nextRecType, nextRecIP, nextDNSStatus, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.Note, id); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存失败")
 				return
 			}
 			if a.pm != nil && a.pm.edges != nil {
 				_ = a.pm.edges.reload()
 			}
+			if staleRecordToDelete != "" && a.edgeAutoHTTPS != nil {
+				a.edgeAutoHTTPS.deleteRecordAsync(staleRecordToDelete)
+			}
+			if input.AutoHTTPS && a.edgeAutoHTTPS != nil {
+				effectiveIP := input.PublicIP
+				if effectiveIP == "" {
+					if a.pm != nil && a.pm.edges != nil {
+						a.pm.edges.mu.RLock()
+						if st := a.pm.edges.nodes[id]; st != nil && st.detectedIP != "" {
+							effectiveIP = st.detectedIP
+						}
+						a.pm.edges.mu.RUnlock()
+					}
+					if effectiveIP == "" {
+						effectiveIP = prevDetectedIP
+					}
+				}
+				if effectiveIP != "" {
+					syncCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+					_ = a.edgeAutoHTTPS.syncNodeDNS(syncCtx, id)
+					cancel()
+				}
+			}
 			view, _ := a.buildEdgeNodeView(id, origin, true)
 			a.jsonOK(w, view)
 		case http.MethodDelete:
+			var cfRecordID string
+			_ = a.db.db.QueryRow(`SELECT cf_record_id FROM edge_nodes WHERE id=?`, id).Scan(&cfRecordID)
 			tx, err := a.db.db.Begin()
 			if err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "删除失败")
@@ -1797,6 +1936,9 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 			}
 			if a.pm != nil && a.pm.edges != nil {
 				_ = a.pm.edges.reload()
+			}
+			if cfRecordID != "" && a.edgeAutoHTTPS != nil {
+				a.edgeAutoHTTPS.deleteRecordAsync(cfRecordID)
 			}
 			a.jsonOK(w, map[string]bool{"deleted": true})
 		default:
@@ -2286,6 +2428,12 @@ func (a *App) masterTLSPEMForHost(hostname string) (certPEM, keyPEM, fingerprint
 	if hostname == "" || a == nil {
 		return "", "", "", false
 	}
+	// Prefer dedicated Edge Auto-HTTPS wildcard certificate (works even behind OpenResty/1Panel).
+	if a.edgeAutoHTTPS != nil {
+		if c, k, fp, found := a.edgeAutoHTTPS.certPEMForHost(hostname); found {
+			return c, k, fp, true
+		}
+	}
 	certFile, keyFile := panelTLSPaths(a.dbPath)
 	if a.db != nil {
 		if settings, err := a.db.PanelSettings(); err == nil && settings.CertificatePath != "" && settings.PrivateKeyPath != "" {
@@ -2467,7 +2615,21 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	upgradeVersion := node.upgradeTarget
 	upgradeReqID := node.upgradeRequestID
+	needAutoDNSSync := false
+	if node.autoHTTPS && node.publicHost != "" {
+		effectiveIP := strings.TrimSpace(node.publicIP)
+		if effectiveIP == "" {
+			effectiveIP = strings.TrimSpace(node.detectedIP)
+		}
+		if effectiveIP != "" && (effectiveIP != node.cfRecordIP || node.cfRecordID == "" || strings.HasPrefix(node.cfDNSStatus, "error:")) {
+			needAutoDNSSync = true
+		}
+	}
 	a.pm.edges.mu.Unlock()
+
+	if needAutoDNSSync && a.edgeAutoHTTPS != nil {
+		a.edgeAutoHTTPS.maybeSyncNodeDNSAsync(nodeID, false)
+	}
 
 	var probeTargets []agentProbeTarget
 	a.pm.mu.RLock()

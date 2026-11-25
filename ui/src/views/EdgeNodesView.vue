@@ -9,12 +9,13 @@ import UiDialog from '@/components/ui/UiDialog.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
-import { edgeApi, masterNodeApi, type EdgeNode, type EdgeNodeInput, type EdgeNodeStatus, type MasterNodeInput } from '@/api'
+import { edgeApi, edgeAutoHttpsApi, masterNodeApi, type EdgeAutoHTTPSStatus, type EdgeNode, type EdgeNodeInput, type EdgeNodeStatus, type MasterNodeInput } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { GB, copyText, formatBytes, relativeTime } from '@/utils/format'
 
 const masterNode = ref<EdgeNode | null>(null)
+const edgeAutoHttps = ref<EdgeAutoHTTPSStatus | null>(null)
 const nodes = ref<EdgeNode[]>([])
 const loading = ref(true)
 const loadError = ref('')
@@ -44,6 +45,7 @@ const form = reactive({
   public_host: '',
   public_ip: '',
   tls_mode: 'auto' as 'auto' | 'external' | 'http',
+  auto_https: false,
   enabled: true,
   quota_gb: '',
   traffic_reset_day: 0,
@@ -205,9 +207,11 @@ async function load(silent = false) {
   if (!silent) loading.value = true
   try {
     const masterPromise = masterNodeApi?.get ? masterNodeApi.get().catch(() => null) : Promise.resolve(null)
-    const [edgeList, master] = await Promise.all([edgeApi.list(), masterPromise])
+    const autoHttpsPromise = edgeAutoHttpsApi?.get ? edgeAutoHttpsApi.get().catch(() => null) : Promise.resolve(null)
+    const [edgeList, master, autoCfg] = await Promise.all([edgeApi.list(), masterPromise, autoHttpsPromise])
     nodes.value = edgeList
     masterNode.value = master
+    edgeAutoHttps.value = autoCfg
     loadError.value = ''
   } catch (error) {
     loadError.value = errorMessage(error, '读取节点列表失败')
@@ -215,6 +219,8 @@ async function load(silent = false) {
     loading.value = false
   }
 }
+
+const autoHttpsReady = computed(() => !!(edgeAutoHttps.value?.enabled && edgeAutoHttps.value?.base_domain && edgeAutoHttps.value?.token_configured))
 
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
@@ -340,6 +346,7 @@ function openCreate() {
     public_host: '',
     public_ip: '',
     tls_mode: 'auto',
+    auto_https: autoHttpsReady.value,
     enabled: true,
     quota_gb: '',
     traffic_reset_day: 0,
@@ -369,6 +376,7 @@ function openEdit(node: EdgeNode) {
     public_host: node.public_host || '',
     public_ip: node.public_ip || '',
     tls_mode: (node.tls_mode === 'external' || node.tls_mode === 'http' ? node.tls_mode : 'auto') as 'auto' | 'external' | 'http',
+    auto_https: !!node.auto_https,
     enabled: node.enabled,
     quota_gb: node.traffic_quota > 0 ? String(Math.round((node.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: node.traffic_reset_day || 0,
@@ -414,7 +422,8 @@ async function saveForm() {
     listen_port: listenPort,
     public_host: form.public_host.trim(),
     public_ip: form.public_ip.trim(),
-    tls_mode: form.public_host.trim() ? form.tls_mode : 'http',
+    tls_mode: form.auto_https ? 'auto' : form.public_host.trim() ? form.tls_mode : 'http',
+    auto_https: form.auto_https,
     enabled: form.enabled,
     traffic_quota: quotaBytes,
     traffic_reset_day: quotaBytes > 0 ? Number(form.traffic_reset_day) || 0 : 0,
@@ -476,6 +485,7 @@ async function toggleEnabled(node: EdgeNode) {
       public_host: node.public_host,
       public_ip: node.public_ip,
       tls_mode: node.tls_mode,
+      auto_https: !!node.auto_https,
       enabled: !node.enabled,
       traffic_quota: node.traffic_quota,
       traffic_reset_day: node.traffic_reset_day,
@@ -633,7 +643,10 @@ function speedPillTone(mbps: number): string {
             <span v-if="node.is_master" class="tag master-tag">主机</span>
             <span v-if="node.agent_version" class="tag">{{ node.agent_version }}</span>
             <span v-if="!node.is_master && node.public_host && node.tls_active" class="tag good">HTTPS 自动证书</span>
+            <span v-else-if="!node.is_master && node.public_host && node.tls_mode === 'auto' && node.online" class="tag warn">等待同步证书</span>
             <span v-else-if="!node.is_master && node.public_host && node.tls_mode === 'external'" class="tag">外部 HTTPS</span>
+            <span v-if="!node.is_master && node.auto_https && node.cf_dns_status === 'synced'" class="tag good" :title="`Cloudflare DNS 已解析至 ${node.cf_record_ip || node.detected_ip}`">CF DNS</span>
+            <span v-else-if="!node.is_master && node.auto_https && node.cf_dns_status === 'pending_ip'" class="tag warn">等待写入 CF DNS</span>
             <span v-if="!node.is_master && node.listen_port && node.listen_port !== node.public_port" class="tag">
               NAT {{ node.listen_port }} → {{ node.public_port }}
             </span>
@@ -674,6 +687,10 @@ function speedPillTone(mbps: number): string {
               {{ sm.isp_label }} {{ sm.avg_return_mbps.toFixed(1) }}Mbps
             </span>
           </div>
+
+          <p v-if="!node.is_master && node.auto_https && node.cf_dns_status?.startsWith('error:')" class="upgrade-note bad">
+            Cloudflare DNS 同步失败：{{ node.cf_dns_status.slice(6) }}
+          </p>
 
           <p v-if="upgradeStatusInfo(node)" class="upgrade-note" :class="upgradeStatusInfo(node)!.tone">
             {{ upgradeStatusInfo(node)!.text }}
@@ -827,6 +844,24 @@ function speedPillTone(mbps: number): string {
           >
             <input id="en-port" v-model="form.public_port" class="input num" type="number" min="1" max="65535" inputmode="numeric" />
           </UiField>
+          <div class="auto-https-box">
+            <UiSwitch
+              v-model="form.auto_https"
+              :disabled="!autoHttpsReady && !form.auto_https"
+              label="自动配置 HTTPS（Cloudflare DNS + 泛域名证书）"
+              :description="
+                autoHttpsReady
+                  ? `上线自动分配 ${edgeAutoHttps?.subdomain_prefix || 'node'}-<ID>.${edgeAutoHttps?.base_domain} 并写入 CF 仅 DNS 解析、自动下发证书（可绕过 NAT 明文 HTTP 阻断）。`
+                  : '在「设置 → 从机自动 HTTPS」填一次 Cloudflare API Token 后即可一键开启，完全不影响主机反代。'
+              "
+            />
+            <p v-if="autoHttpsReady && (!edgeAutoHttps?.cert_valid || !edgeAutoHttps?.cert_matches_domain)" class="auto-https-hint warn">
+              提示：泛域名证书尚未申请，请先前往 <RouterLink to="/settings?section=edge-https">设置 → 从机自动 HTTPS</RouterLink> 点击「一键申请泛域名证书」。
+            </p>
+            <p v-else-if="!autoHttpsReady" class="auto-https-hint">
+              <RouterLink to="/settings?section=edge-https">前往配置 Cloudflare 从机自动 HTTPS →</RouterLink>
+            </p>
+          </div>
         </fieldset>
 
         <fieldset>
@@ -840,12 +875,16 @@ function speedPillTone(mbps: number): string {
             <UiField
               label="绑定域名"
               for="en-host"
-              help="留空则首次心跳自动上报公网 IP（http://IP:端口）。若填主机泛域名下的子域名（如 hk.example.com），可自动同步泛域名证书实现 HTTPS。"
+              :help="
+                form.auto_https
+                  ? `已开启自动 HTTPS：留空自动分配 ${edgeAutoHttps?.subdomain_prefix || 'node'}-<ID>.${edgeAutoHttps?.base_domain}；也可填写自定义一级子域名（如 usnat.${edgeAutoHttps?.base_domain}）。`
+                  : '留空则首次心跳自动上报公网 IP（http://IP:端口）。若填主机泛域名下的子域名（如 hk.example.com），可自动同步泛域名证书实现 HTTPS。'
+              "
             >
-              <input id="en-host" v-model="form.public_host" class="input mono" autocapitalize="none" spellcheck="false" placeholder="可选，例如 hk.example.com" />
+              <input id="en-host" v-model="form.public_host" class="input mono" autocapitalize="none" spellcheck="false" :placeholder="form.auto_https ? `留空自动分配 *.${edgeAutoHttps?.base_domain || 'example.com'}` : '可选，例如 hk.example.com'" />
             </UiField>
 
-            <UiField v-if="form.public_host.trim()" label="TLS 模式" for="en-tls">
+            <UiField v-if="!form.auto_https && form.public_host.trim()" label="TLS 模式" for="en-tls">
               <select id="en-tls" v-model="form.tls_mode" class="select">
                 <option value="auto">自动同步主机泛域名证书（推荐，支持任意端口 HTTPS）</option>
                 <option value="external">外部反代 HTTPS（Nginx / Caddy 等）</option>
@@ -966,7 +1005,13 @@ function speedPillTone(mbps: number): string {
 .status-pill.muted { color: var(--text-3); }
 .tag { display: inline-flex; align-items: center; height: 21px; padding: 0 8px; border-radius: 999px; font-size: 11px; background: var(--surface-2); color: var(--text-2); font-family: var(--mono); }
 .tag.good { color: var(--good); background: var(--good-soft); font-family: inherit; font-weight: 600; }
+.tag.warn { color: var(--warn); background: var(--warn-soft); font-family: inherit; font-weight: 600; }
 .tag.master-tag { color: var(--accent); background: var(--accent-soft); font-family: inherit; font-weight: 600; }
+.auto-https-box { padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+.auto-https-hint { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+.auto-https-hint.warn { color: var(--warn); }
+.auto-https-hint a { color: var(--accent); text-decoration: none; font-weight: 500; }
+.auto-https-hint a:hover { text-decoration: underline; }
 .addr-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; flex-wrap: wrap; }
 .mono { font-family: var(--mono); color: var(--text-2); word-break: break-all; }
 .faint { color: var(--text-3); }
