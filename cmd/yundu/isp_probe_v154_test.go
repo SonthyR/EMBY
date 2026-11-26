@@ -209,3 +209,116 @@ func TestISPProbeCircuitBreakerAutoFailoverAndRecovery(t *testing.T) {
 		t.Fatalf("unexpected default ISP probe settings: %+v", cfg)
 	}
 }
+
+func TestEdgeNodeAutoCircuitBreakerCanMonitorWithoutFailover(t *testing.T) {
+	app, edges, _ := setupWaterfallBalanceTestApp(t)
+	nodeID, token := insertTestEdgeNode(t, edges, "monitor node", "203.0.113.41", 19090)
+	fallbackID, _ := insertTestEdgeNode(t, edges, "fallback node", "203.0.113.42", 19090)
+
+	if _, err := app.db.db.Exec(`ALTER TABLE edge_nodes DROP COLUMN auto_circuit_breaker`); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.migrate(); err != nil {
+		t.Fatalf("migrate existing edge nodes: %v", err)
+	}
+	route := fmt.Sprintf(`{"group":"ct","nodes":[{"node_id":%d,"enabled":true},{"node_id":%d,"enabled":true},{"node_id":0,"enabled":false}]}`,
+		nodeID, fallbackID)
+	rec := httptest.NewRecorder()
+	app.handleISPRoutes(rec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(route)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save routes: %d %s", rec.Code, rec.Body.String())
+	}
+
+	assertCircuitSetting := func(id int64, want bool) EdgeNode {
+		t.Helper()
+		view, ok := app.buildEdgeNodeView(id, "", false)
+		if !ok || view.AutoCircuitBreaker == nil || *view.AutoCircuitBreaker != want {
+			t.Fatalf("node %d circuit setting = %v, want %t", id, view.AutoCircuitBreaker, want)
+		}
+		return view
+	}
+	assertRoute := func(want int64) {
+		t.Helper()
+		if g := edges.selectNodeForIP("1.2.3.4").NodeID; g != want {
+			t.Fatalf("route chose node %d, want %d", g, want)
+		}
+	}
+	sendFailure := func(seq uint64, wantInterval int) {
+		t.Helper()
+		payload, err := json.Marshal(agentHeartbeatRequest{
+			Version: "v1.5.5", ListenPort: 19090, ISPProbeSeq: seq,
+			ISPProbeResults: map[string]agentISPProbeResult{ispGroupCT: {LatencyMs: -1, TotalCount: 3}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/agent/heartbeat", bytes.NewReader(payload))
+		req.Header.Set("X-Yundu-Node-ID", fmt.Sprint(nodeID))
+		req.Header.Set("X-Yundu-Node-Token", token)
+		rec := httptest.NewRecorder()
+		app.handleAgentHeartbeat(rec, req)
+		var reply agentHeartbeatResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil || rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat %d: status=%d %s; err=%v", seq, rec.Code, rec.Body.String(), err)
+		}
+		if reply.ISPProbeConfig == nil || !reply.ISPProbeConfig.Enabled || reply.ISPProbeConfig.IntervalSec != wantInterval {
+			t.Fatalf("heartbeat %d probe config = %+v, want enabled with interval %d", seq, reply.ISPProbeConfig, wantInterval)
+		}
+	}
+	update := func(extraJSON string) {
+		t.Helper()
+		body := `{"name":"monitor node","public_port":19090,"public_ip":"203.0.113.41","tls_mode":"http"` + extraJSON + "}"
+		rec := httptest.NewRecorder()
+		app.handleEdgeNodeByID(rec, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/edge-nodes/%d", nodeID), strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update node: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	assertCircuitSetting(nodeID, true)
+	sendFailure(1, defaultISPProbeIntervalSec)
+	sendFailure(2, defaultISPProbeIntervalSec)
+	sendFailure(3, defaultISPProbeRecoveryIntervalSec)
+	assertRoute(fallbackID)
+	if !assertCircuitSetting(nodeID, true).AnyCircuitTripped {
+		t.Fatal("expected node to be tripped before disabling the switch")
+	}
+	edges.mu.Lock()
+	edges.queueISPAlertsLocked(fallbackID, []string{"another node alert"})
+	edges.mu.Unlock()
+
+	update(`,"auto_circuit_breaker":false`)
+	if alerts := edges.collectAlerts(time.Now()); len(alerts) != 1 || alerts[0] != "another node alert" {
+		t.Fatalf("disabling a circuit should drop only its pending probe alerts: %v", alerts)
+	}
+	assertRoute(nodeID)
+	view := assertCircuitSetting(nodeID, false)
+	if view.AnyCircuitTripped || len(view.ISPHealth) != 1 || view.ISPHealth[0].Tripped || view.ISPHealth[0].TotalCount != 3 {
+		t.Fatalf("disabling should clear the circuit and preserve the last sample: %+v", view.ISPHealth)
+	}
+	update("")
+	assertCircuitSetting(nodeID, false)
+	assertCircuitSetting(fallbackID, true)
+
+	for seq := uint64(4); seq <= 7; seq++ {
+		sendFailure(seq, defaultISPProbeIntervalSec)
+	}
+	assertRoute(nodeID)
+	view = assertCircuitSetting(nodeID, false)
+	if view.AnyCircuitTripped || len(view.ISPHealth) != 1 || view.ISPHealth[0].ReachableCount != 0 ||
+		view.ISPHealth[0].LastCheckedAt == "" || view.ISPHealth[0].ConsecFails != 0 {
+		t.Fatalf("monitor-only mode should show new failed samples without tripping: %+v", view.ISPHealth)
+	}
+	if alerts := edges.collectAlerts(time.Now()); len(alerts) != 0 {
+		t.Fatalf("monitor-only mode produced circuit alerts: %v", alerts)
+	}
+
+	update(`,"auto_circuit_breaker":true`)
+	assertCircuitSetting(nodeID, true)
+	sendFailure(7, defaultISPProbeIntervalSec)
+	sendFailure(8, defaultISPProbeIntervalSec)
+	sendFailure(9, defaultISPProbeIntervalSec)
+	assertRoute(nodeID)
+	sendFailure(10, defaultISPProbeRecoveryIntervalSec)
+	assertRoute(fallbackID)
+}

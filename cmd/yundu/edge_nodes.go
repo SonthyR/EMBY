@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS edge_nodes (
 	token_hash TEXT NOT NULL,
 	token_ciphertext TEXT NOT NULL DEFAULT '',
 	enabled INTEGER NOT NULL DEFAULT 1,
+	auto_circuit_breaker INTEGER NOT NULL DEFAULT 1,
 	traffic_quota INTEGER NOT NULL DEFAULT 0,
 	traffic_used INTEGER NOT NULL DEFAULT 0,
 	traffic_reset_day INTEGER NOT NULL DEFAULT 0,
@@ -112,6 +114,7 @@ func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
 		{"edge_nodes", "cf_dns_status", `ALTER TABLE edge_nodes ADD COLUMN cf_dns_status TEXT NOT NULL DEFAULT ''`},
 		{"edge_nodes", "sort_order", `ALTER TABLE edge_nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`},
 		{"edge_nodes", "max_balance_streams", `ALTER TABLE edge_nodes ADD COLUMN max_balance_streams INTEGER NOT NULL DEFAULT 2`},
+		{"edge_nodes", "auto_circuit_breaker", `ALTER TABLE edge_nodes ADD COLUMN auto_circuit_breaker INTEGER NOT NULL DEFAULT 1`},
 		{"isp_route_rules", "schedule_mode", `ALTER TABLE isp_route_rules ADD COLUMN schedule_mode TEXT NOT NULL DEFAULT 'always'`},
 		{"isp_route_rules", "schedule_start", `ALTER TABLE isp_route_rules ADD COLUMN schedule_start TEXT NOT NULL DEFAULT ''`},
 		{"isp_route_rules", "schedule_end", `ALTER TABLE isp_route_rules ADD COLUMN schedule_end TEXT NOT NULL DEFAULT ''`},
@@ -410,6 +413,7 @@ type EdgeNode struct {
 	CFDNSStatus       string                `json:"cf_dns_status,omitempty"`
 	CFRecordIP        string                `json:"cf_record_ip,omitempty"`
 	Enabled           bool                  `json:"enabled"`
+	AutoCircuitBreaker *bool                 `json:"auto_circuit_breaker,omitempty"`
 	TrafficQuota      int64                 `json:"traffic_quota"`
 	TrafficUsed       int64                 `json:"traffic_used"`
 	ResetDay          int                   `json:"traffic_reset_day"`
@@ -449,6 +453,7 @@ type EdgeNodeInput struct {
 	TLSMode      string `json:"tls_mode"`
 	AutoHTTPS    bool   `json:"auto_https"`
 	Enabled      *bool  `json:"enabled"`
+	AutoCircuitBreaker *bool  `json:"auto_circuit_breaker"`
 	TrafficQuota      int64  `json:"traffic_quota"`
 	ResetDay          int    `json:"traffic_reset_day"`
 	MaxBalanceStreams int    `json:"max_balance_streams"`
@@ -472,6 +477,7 @@ type edgeNodeLiveState struct {
 	tokenHash           string
 	tokenPlain          string
 	enabled             bool
+	monitorISPOnly      bool
 	quota               int64
 	persistedUsed       int64
 	resetDay            int
@@ -596,7 +602,7 @@ func (n *edgeNodeLiveState) routableAt(now time.Time) bool {
 }
 
 func (n *edgeNodeLiveState) isISPTripped(group string) bool {
-	if n == nil {
+	if n == nil || n.monitorISPOnly {
 		return false
 	}
 	return isISPTrippedInMap(n.ispHealth, group)
@@ -667,8 +673,9 @@ type edgeNodeRuntime struct {
 	rrCounters       map[string]*atomic.Uint64
 	blockNonMainland bool
 	ispProbe         ISPProbeSettings
-	pendingISPAlerts []string
+	pendingISPAlerts []ispProbeAlert
 	flushMu          sync.Mutex
+	reloadMu         sync.Mutex
 	speedReloadMu    sync.Mutex
 }
 
@@ -701,7 +708,10 @@ func (rt *edgeNodeRuntime) reload() error {
 	if rt == nil || rt.db == nil {
 		return nil
 	}
-	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, auto_https, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, max_balance_streams, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY sort_order ASC, id ASC`)
+	// Serialize database snapshots with their runtime publication.
+	rt.reloadMu.Lock()
+	defer rt.reloadMu.Unlock()
+	rows, err := rt.db.db.Query(`SELECT id, name, public_port, listen_port, public_host, public_ip, detected_ip, tls_mode, auto_https, cf_record_id, cf_record_type, cf_record_ip, cf_dns_status, token_hash, token_ciphertext, enabled, auto_circuit_breaker, traffic_quota, traffic_used, traffic_reset_day, traffic_reset_period, max_balance_streams, note, agent_version, last_seen_at, total_bytes_in, total_bytes_out FROM edge_nodes ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return err
 	}
@@ -716,17 +726,18 @@ func (rt *edgeNodeRuntime) reload() error {
 		cfRecordIP, cfDNSStatus                      string
 		tokenHash, tokenCipher                       string
 		resetPeriod, note, version, seen             string
-		enabled                                      bool
+		enabled, autoCircuitBreaker                  bool
 	}
 	var list []loadedNode
 	for rows.Next() {
 		var item loadedNode
-		var enabled, autoHTTPSInt int
-		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &autoHTTPSInt, &item.cfRecordID, &item.cfRecordType, &item.cfRecordIP, &item.cfDNSStatus, &item.tokenHash, &item.tokenCipher, &enabled, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.maxBalance, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
+		var enabled, autoHTTPSInt, autoCircuitBreaker int
+		if err := rows.Scan(&item.id, &item.name, &item.publicPort, &item.listenPort, &item.publicHost, &item.publicIP, &item.detectedIP, &item.tlsMode, &autoHTTPSInt, &item.cfRecordID, &item.cfRecordType, &item.cfRecordIP, &item.cfDNSStatus, &item.tokenHash, &item.tokenCipher, &enabled, &autoCircuitBreaker, &item.quota, &item.used, &item.resetDay, &item.resetPeriod, &item.maxBalance, &item.note, &item.version, &item.seen, &item.totalIn, &item.totalOut); err != nil {
 			rows.Close()
 			return err
 		}
 		item.enabled = enabled != 0
+		item.autoCircuitBreaker = autoCircuitBreaker != 0
 		item.autoHTTPS = autoHTTPSInt != 0
 		list = append(list, item)
 	}
@@ -851,6 +862,16 @@ func (rt *edgeNodeRuntime) reload() error {
 			}
 		}
 		state.enabled = item.enabled
+		monitorOnly := !item.autoCircuitBreaker
+		if state.monitorISPOnly != monitorOnly {
+			resetISPCircuits(state.ispHealth)
+			state.monitorISPOnly = monitorOnly
+			if monitorOnly {
+				rt.pendingISPAlerts = slices.DeleteFunc(rt.pendingISPAlerts, func(alert ispProbeAlert) bool {
+					return alert.nodeID == item.id
+				})
+			}
+		}
 		state.quota = item.quota
 		state.persistedUsed = item.used
 		state.persistedTotalIn = item.totalIn
@@ -1628,6 +1649,7 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 		return EdgeNode{}, false
 	}
 	online := state.isOnline(now)
+	autoCircuitBreaker := !state.monitorISPOnly
 	view := EdgeNode{
 		ID:               state.id,
 		Name:             state.name,
@@ -1641,6 +1663,7 @@ func (a *App) buildEdgeNodeView(id int64, origin string, includeCommand bool) (E
 		CFDNSStatus:      state.cfDNSStatus,
 		CFRecordIP:       state.cfRecordIP,
 		Enabled:          state.enabled,
+		AutoCircuitBreaker: &autoCircuitBreaker,
 		TrafficQuota:      state.quota,
 		TrafficUsed:       state.totalUsed(),
 		ResetDay:          state.resetDay,
@@ -1847,8 +1870,8 @@ func (a *App) handleEdgeNodes(w http.ResponseWriter, r *http.Request) {
 		var maxNodeOrder int
 		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM edge_nodes`).Scan(&maxNodeOrder)
 		maxBalance := normalizeMaxBalanceStreams(input.MaxBalanceStreams)
-		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, traffic_quota, traffic_reset_day, traffic_reset_period, max_balance_streams, note, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, maxBalance, input.Note, maxNodeOrder+1)
+		res, err := tx.Exec(`INSERT INTO edge_nodes(name, public_port, listen_port, public_host, public_ip, tls_mode, auto_https, cf_dns_status, token_hash, token_ciphertext, enabled, auto_circuit_breaker, traffic_quota, traffic_reset_day, traffic_reset_period, max_balance_streams, note, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,COALESCE(?,1),?,?,?,?,?,?)`,
+			input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), initialDNSStatus, edgeNodeTokenHash(token), tokenCipher, sqliteBool(enabled), input.AutoCircuitBreaker, input.TrafficQuota, input.ResetDay, resetPeriod, maxBalance, input.Note, maxNodeOrder+1)
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "创建从机失败")
 			return
@@ -2054,13 +2077,14 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			resetPeriod, _ := shareResetPeriod(time.Now().In(a.db.shareLocation()), input.ResetDay)
-			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, auto_https=?, cf_record_id=?, cf_record_type=?, cf_record_ip=?, cf_dns_status=?, enabled=?, traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, max_balance_streams=CASE WHEN ? > 0 THEN ? ELSE max_balance_streams END, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), nextRecID, nextRecType, nextRecIP, nextDNSStatus, sqliteBool(enabled), input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.MaxBalanceStreams, input.MaxBalanceStreams, input.Note, id); err != nil {
+			if _, err := a.db.db.Exec(`UPDATE edge_nodes SET name=?, public_port=?, listen_port=?, public_host=?, public_ip=?, tls_mode=?, auto_https=?, cf_record_id=?, cf_record_type=?, cf_record_ip=?, cf_dns_status=?, enabled=?, auto_circuit_breaker=COALESCE(?,auto_circuit_breaker), traffic_quota=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, max_balance_streams=CASE WHEN ? > 0 THEN ? ELSE max_balance_streams END, note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				input.Name, input.PublicPort, input.ListenPort, input.PublicHost, input.PublicIP, input.TLSMode, sqliteBool(input.AutoHTTPS), nextRecID, nextRecType, nextRecIP, nextDNSStatus, sqliteBool(enabled), input.AutoCircuitBreaker, input.TrafficQuota, input.ResetDay, resetPeriod, input.ResetDay, input.MaxBalanceStreams, input.MaxBalanceStreams, input.Note, id); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存失败")
 				return
 			}
+			var reloadErr error
 			if a.pm != nil && a.pm.edges != nil {
-				_ = a.pm.edges.reload()
+				reloadErr = a.pm.edges.reload()
 			}
 			if staleRecordToDelete != "" && a.edgeAutoHTTPS != nil {
 				a.edgeAutoHTTPS.deleteRecordAsync(staleRecordToDelete)
@@ -2084,6 +2108,11 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 					_ = a.edgeAutoHTTPS.syncNodeDNS(syncCtx, id)
 					cancel()
 				}
+			}
+			if reloadErr != nil && input.AutoCircuitBreaker != nil {
+				log.Printf("edge node %d settings saved but runtime reload failed: %v", id, reloadErr)
+				a.jsonErr(w, http.StatusInternalServerError, "配置已保存，但节点运行状态刷新失败，请重试保存")
+				return
 			}
 			view, _ := a.buildEdgeNodeView(id, origin, true)
 			a.jsonOK(w, view)
@@ -2218,16 +2247,7 @@ func (a *App) handleEdgeNodeByID(w http.ResponseWriter, r *http.Request) {
 		if a.pm != nil && a.pm.edges != nil {
 			a.pm.edges.mu.Lock()
 			if state := a.pm.edges.nodes[id]; state != nil {
-				for _, st := range state.ispHealth {
-					if st == nil {
-						continue
-					}
-					st.tripped = false
-					st.trippedAt = time.Time{}
-					st.consecFails = 0
-					st.consecSuccesses = 0
-					st.alertNotified = false
-				}
+				resetISPCircuits(state.ispHealth)
 			}
 			a.pm.edges.mu.Unlock()
 		}
@@ -2938,13 +2958,11 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		node.upstreamLatencies = lat
 	}
 	if req.ISPProbeSeq > 0 && len(req.ISPProbeResults) > 0 {
-		alerts := a.pm.edges.applyISPProbeReportLocked(node.name, false, &node.ispProbeSeq, &node.ispHealth, req.ISPProbeSeq, req.ISPProbeResults, now)
-		if len(alerts) > 0 {
-			a.pm.edges.pendingISPAlerts = append(a.pm.edges.pendingISPAlerts, alerts...)
-		}
+		alerts := a.pm.edges.applyISPProbeReportLocked(node.name, false, node.monitorISPOnly, &node.ispProbeSeq, &node.ispHealth, req.ISPProbeSeq, req.ISPProbeResults, now)
+		a.pm.edges.queueISPAlertsLocked(nodeID, alerts)
 	}
 	ispProbeInterval := a.pm.edges.ispProbe.IntervalSec
-	if anyISPTrippedInMap(node.ispHealth) {
+	if !node.monitorISPOnly && anyISPTrippedInMap(node.ispHealth) {
 		ispProbeInterval = a.pm.edges.ispProbe.RecoveryIntervalSec
 	}
 	ispProbeCfg := &agentISPProbeConfig{

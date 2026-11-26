@@ -50,6 +50,7 @@ const form = reactive({
   tls_mode: 'auto' as 'auto' | 'external' | 'http',
   auto_https: false,
   enabled: true,
+  auto_circuit_breaker: true,
   quota_gb: '',
   traffic_reset_day: 0,
   max_balance_streams: '2',
@@ -402,6 +403,7 @@ function openCreate() {
     tls_mode: 'auto',
     auto_https: autoHttpsReady.value,
     enabled: true,
+    auto_circuit_breaker: true,
     quota_gb: '',
     traffic_reset_day: 0,
     max_balance_streams: '2',
@@ -434,6 +436,7 @@ function openEdit(node: EdgeNode) {
     tls_mode: (node.tls_mode === 'external' || node.tls_mode === 'http' ? node.tls_mode : 'auto') as 'auto' | 'external' | 'http',
     auto_https: !!node.auto_https,
     enabled: node.enabled,
+    auto_circuit_breaker: node.auto_circuit_breaker !== false,
     quota_gb: node.traffic_quota > 0 ? String(Math.round((node.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: node.traffic_reset_day || 0,
     max_balance_streams: String(node.max_balance_streams || 2),
@@ -487,6 +490,7 @@ async function saveForm() {
     tls_mode: form.auto_https ? 'auto' : form.public_host.trim() ? form.tls_mode : 'http',
     auto_https: form.auto_https,
     enabled: form.enabled,
+    auto_circuit_breaker: form.auto_circuit_breaker,
     traffic_quota: quotaBytes,
     traffic_reset_day: quotaBytes > 0 ? Number(form.traffic_reset_day) || 0 : 0,
     max_balance_streams: maxBalance,
@@ -646,7 +650,7 @@ function ispHealthTone(h: { tripped: boolean; latency_ms: number; consec_fails: 
 function ispHealthText(h: { isp_label: string; tripped: boolean; latency_ms: number; consec_fails: number }): string {
   if (h.tripped) return `${h.isp_label} 已熔断`
   if (h.latency_ms > 0) return `${h.isp_label} ${h.latency_ms}ms`
-  return `${h.isp_label} 不通(${h.consec_fails || 1})`
+  return h.consec_fails > 0 ? `${h.isp_label} 不通(${h.consec_fails})` : `${h.isp_label} 探测失败`
 }
 
 async function probeNodeISP(node: EdgeNode) {
@@ -814,7 +818,7 @@ async function resetNodeCircuit(node: EdgeNode) {
           </div>
 
           <div v-if="node.online && node.isp_health?.length" class="latency-row">
-            <span class="faint lat-label">三网连通</span>
+            <span class="faint lat-label">三网连通{{ node.auto_circuit_breaker === false ? ' · 仅探测' : '' }}</span>
             <span
               v-for="ih in node.isp_health"
               :key="ih.isp_group"
@@ -866,7 +870,7 @@ async function resetNodeCircuit(node: EdgeNode) {
           </template>
           <template v-else>
             <UiButton
-              v-if="node.any_circuit_tripped && node.online"
+              v-if="node.online && (node.any_circuit_tripped || (node.auto_circuit_breaker === false && node.isp_health?.some(h => h.reachable_count === 0)))"
               size="sm"
               variant="accent"
               :loading="probingIspNodeId === node.id"
@@ -1029,6 +1033,11 @@ async function resetNodeCircuit(node: EdgeNode) {
               <RouterLink to="/settings?section=edge-https">前往配置 Cloudflare 从机自动 HTTPS →</RouterLink>
             </p>
           </div>
+          <UiSwitch
+            v-model="form.auto_circuit_breaker"
+            label="自动熔断"
+            description="关闭后继续记录三网探测结果，节点仍按在线状态、配额和时段参与分流。"
+          />
         </fieldset>
 
         <fieldset>

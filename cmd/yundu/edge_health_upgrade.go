@@ -431,10 +431,10 @@ func (rt *edgeNodeRuntime) collectAlerts(now time.Time) []string {
 
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if len(rt.pendingISPAlerts) > 0 {
-		messages = append(messages, rt.pendingISPAlerts...)
-		rt.pendingISPAlerts = nil
+	for _, alert := range rt.pendingISPAlerts {
+		messages = append(messages, alert.text)
 	}
+	rt.pendingISPAlerts = nil
 	for _, node := range rt.nodes {
 		if !node.enabled {
 			continue

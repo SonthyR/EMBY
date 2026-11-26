@@ -6,6 +6,7 @@ import type { EdgeNode } from '@/api'
 const edgeApi = vi.hoisted(() => ({
   list: vi.fn(),
   get: vi.fn(),
+  update: vi.fn(),
   upgrade: vi.fn(),
 }))
 
@@ -204,6 +205,37 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
       note: '',
     })
     expect(wrapper.find('article.card.master h3').text()).toBe('美国主机')
+  })
+
+  it('为单台从机关闭自动熔断后显示仅探测状态', async () => {
+    const node = makeNode({ id: 7, auto_circuit_breaker: true })
+    const monitorOnly = {
+      ...node,
+      auto_circuit_breaker: false,
+      isp_health: [{
+        isp_group: 'ct', isp_label: '电信', latency_ms: -1, reachable_count: 0,
+        total_count: 3, consec_fails: 0, tripped: false,
+      }],
+    }
+    edgeApi.list.mockResolvedValueOnce([node]).mockResolvedValue([monitorOnly])
+    edgeApi.update.mockResolvedValue(monitorOnly)
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true, RouterLink: true } } })
+    await flushPromises()
+
+    const edit = wrapper.findAll('article.card:not(.master) button').find(button => button.text() === '编辑')
+    await edit!.trigger('click')
+    const field = wrapper.findAll('.switch').find(label => label.text().startsWith('自动熔断'))
+    const input = field!.get<HTMLInputElement>('input')
+    expect(input.element.checked).toBe(true)
+    await input.setValue(false)
+    const save = wrapper.findAll('button').find(button => button.text() === '保存更改')
+    await save!.trigger('click')
+    await flushPromises()
+
+    expect(edgeApi.update).toHaveBeenCalledWith(7, expect.objectContaining({ auto_circuit_breaker: false }))
+    expect(wrapper.text()).toContain('三网连通 · 仅探测')
+    expect(wrapper.text()).toContain('电信 探测失败')
+    expect(wrapper.text()).not.toContain('解除熔断')
   })
 
   it('安装命令弹窗展示卸载命令并支持一键复制卸载命令', async () => {

@@ -188,6 +188,7 @@ export interface EdgeNode {
   cf_dns_status?: string
   cf_record_ip?: string
   enabled: boolean
+  auto_circuit_breaker?: boolean
   traffic_quota: number
   traffic_used: number
   traffic_reset_day: number
@@ -236,6 +237,7 @@ export interface EdgeNodeInput {
   tls_mode?: EdgeNodeTLSMode | string
   auto_https?: boolean
   enabled?: boolean
+  auto_circuit_breaker?: boolean
   traffic_quota?: number
   traffic_reset_day?: number
   max_balance_streams?: number

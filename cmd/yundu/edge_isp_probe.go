@@ -306,6 +306,17 @@ type ispHealthState struct {
 	alertNotified   bool
 }
 
+type ispProbeAlert struct {
+	nodeID int64
+	text   string
+}
+
+func (rt *edgeNodeRuntime) queueISPAlertsLocked(nodeID int64, messages []string) {
+	for _, message := range messages {
+		rt.pendingISPAlerts = append(rt.pendingISPAlerts, ispProbeAlert{nodeID: nodeID, text: message})
+	}
+}
+
 type edgeISPHealthView struct {
 	ISPGroup       string `json:"isp_group"`
 	ISPLabel       string `json:"isp_label"`
@@ -386,12 +397,26 @@ func anyISPTrippedInMap(health map[string]*ispHealthState) bool {
 	return false
 }
 
+func resetISPCircuits(health map[string]*ispHealthState) {
+	for _, st := range health {
+		if st == nil {
+			continue
+		}
+		st.tripped = false
+		st.trippedAt = time.Time{}
+		st.consecFails = 0
+		st.consecSuccesses = 0
+		st.alertNotified = false
+	}
+}
+
 // applyISPProbeReportLocked updates per-ISP circuit breaker state for a node
 // (or Master when isMaster=true) from a new probe sequence and returns any
 // state-transition Telegram alert messages to dispatch.
 func (rt *edgeNodeRuntime) applyISPProbeReportLocked(
 	nodeName string,
 	isMaster bool,
+	monitorOnly bool,
 	lastSeq *uint64,
 	healthMap *map[string]*ispHealthState,
 	seq uint64,
@@ -438,8 +463,15 @@ func (rt *edgeNodeRuntime) applyISPProbeReportLocked(
 			st.lastCheckedAt = now
 		}
 
+		st.latencyMs = -1
 		if res.ReachableCount > 0 {
 			st.latencyMs = res.LatencyMs
+		}
+		if monitorOnly {
+			continue
+		}
+
+		if res.ReachableCount > 0 {
 			st.consecFails = 0
 			if st.tripped {
 				st.consecSuccesses++
@@ -456,7 +488,6 @@ func (rt *edgeNodeRuntime) applyISPProbeReportLocked(
 				st.consecSuccesses = 0
 			}
 		} else {
-			st.latencyMs = -1
 			st.consecSuccesses = 0
 			st.consecFails++
 			if !st.tripped && st.consecFails >= failThresh {
@@ -720,10 +751,8 @@ func (rt *edgeNodeRuntime) probeMasterISPOnce(ctx context.Context) {
 	now := time.Now()
 	rt.mu.Lock()
 	nextSeq := rt.master.ispProbeSeq + 1
-	alerts := rt.applyISPProbeReportLocked(rt.masterDisplayNameLocked(), true, &rt.master.ispProbeSeq, &rt.master.ispHealth, nextSeq, results, now)
-	if len(alerts) > 0 {
-		rt.pendingISPAlerts = append(rt.pendingISPAlerts, alerts...)
-	}
+	alerts := rt.applyISPProbeReportLocked(rt.masterDisplayNameLocked(), true, false, &rt.master.ispProbeSeq, &rt.master.ispHealth, nextSeq, results, now)
+	rt.queueISPAlertsLocked(0, alerts)
 	rt.mu.Unlock()
 }
 
@@ -825,21 +854,9 @@ func (a *App) handleISPProbeSettings(w http.ResponseWriter, r *http.Request) {
 		if !normalized.Enabled {
 			// Clear tripped states immediately when probing is turned off so no node stays blocked.
 			for _, node := range a.pm.edges.nodes {
-				for _, st := range node.ispHealth {
-					st.tripped = false
-					st.trippedAt = time.Time{}
-					st.consecFails = 0
-					st.consecSuccesses = 0
-					st.alertNotified = false
-				}
+				resetISPCircuits(node.ispHealth)
 			}
-			for _, st := range a.pm.edges.master.ispHealth {
-				st.tripped = false
-				st.trippedAt = time.Time{}
-				st.consecFails = 0
-				st.consecSuccesses = 0
-				st.alertNotified = false
-			}
+			resetISPCircuits(a.pm.edges.master.ispHealth)
 		}
 		a.pm.edges.mu.Unlock()
 		a.jsonOK(w, normalized)
