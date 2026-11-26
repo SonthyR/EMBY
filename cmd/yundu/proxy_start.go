@@ -150,8 +150,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
 	proxyTransport := http.DefaultTransport.(*http.Transport).Clone()
 	proxyTransport.TLSClientConfig = secureTLSConfig("")
+	// Force HTTP/1.1 on upstream proxy transport so concurrent media streams
+	// each use an isolated TCP connection instead of sharing one HTTP/2 window.
+	proxyTransport.ForceAttemptHTTP2 = false
+	proxyTransport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
-	proxyTransport.MaxIdleConnsPerHost = 32
+	proxyTransport.MaxIdleConnsPerHost = 64
+	proxyTransport.ReadBufferSize = 128 << 10
+	proxyTransport.WriteBufferSize = 128 << 10
 	inst.transport = proxyTransport
 	egressTransport := http.RoundTripper(&edgeEgressTransport{base: proxyTransport})
 	inst.shareLogout = newShareLogoutFunc(egressTransport, target, policy, configuredHeaders)

@@ -32,7 +32,7 @@ const (
 	edgeAgentInstanceHeader    = "X-Yundu-Agent-Instance"
 	edgeAgentProbeClaimHeader  = "X-Yundu-Agent-Probe-Claim"
 	edgeAgentMaxRedirects      = 10
-	edgeAgentCopyBufSize       = 64 << 10
+	edgeAgentCopyBufSize       = 128 << 10
 )
 
 type edgeAgentConfig struct {
@@ -156,6 +156,9 @@ func runEdgeAgentCommand(args []string) error {
 		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+		// Serve media streams over HTTP/1.1 so multi-range players and WebSocket
+		// egress avoid HTTP/2 per-connection flow-control stalls.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
 	go agent.heartbeatLoop(ctx)
@@ -230,7 +233,7 @@ func (l *autoTLSListener) Accept() (net.Conn, error) {
 			tlsCfg := &tls.Config{
 				MinVersion:     tls.VersionTLS12,
 				GetCertificate: l.getCert,
-				NextProtos:     []string{"h2", "http/1.1"},
+				NextProtos:     []string{"http/1.1"},
 			}
 			return tls.Server(wrapped, tlsCfg), nil
 		}
@@ -336,11 +339,21 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 
 	upstreamTransport := http.DefaultTransport.(*http.Transport).Clone()
 	upstreamTransport.TLSClientConfig = secureTLSConfig("")
+	// Force HTTP/1.1 for upstream media fetching so concurrent 4K streams never share
+	// one HTTP/2 TCP connection/flow-control window (prevents cross-stream starvation
+	// and mid-stream RST_STREAM/GOAWAY drops behind Cloudflare/HTTPS Emby origins).
+	upstreamTransport.ForceAttemptHTTP2 = false
+	upstreamTransport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	upstreamTransport.DisableCompression = true
 	upstreamTransport.ResponseHeaderTimeout = 30 * time.Second
 	upstreamTransport.MaxIdleConnsPerHost = 64
 	upstreamTransport.IdleConnTimeout = 90 * time.Second
+	upstreamTransport.ReadBufferSize = 128 << 10
+	upstreamTransport.WriteBufferSize = 128 << 10
 
 	egressTransport := upstreamTransport.Clone()
+	egressTransport.ForceAttemptHTTP2 = false
+	egressTransport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	egressTransport.DisableCompression = true
 
 	var instanceID [16]byte
@@ -1240,6 +1253,9 @@ func (a *edgeAgent) handler() http.Handler {
 				}
 			}
 			if readErr != nil {
+				if readErr != io.EOF && r.Context().Err() == nil && !errors.Is(readErr, context.Canceled) {
+					log.Printf("edge agent upstream stream interrupted (site #%d): %v", ticket.SiteID, readErr)
+				}
 				break
 			}
 		}
