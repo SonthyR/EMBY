@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +29,8 @@ import (
 
 const (
 	edgeAgentHeartbeatInterval = 5 * time.Second
+	edgeAgentInstanceHeader    = "X-Yundu-Agent-Instance"
+	edgeAgentProbeClaimHeader  = "X-Yundu-Agent-Probe-Claim"
 	edgeAgentMaxRedirects      = 10
 	edgeAgentCopyBufSize       = 64 << 10
 )
@@ -252,6 +257,7 @@ type agentTrafficAccum struct {
 type edgeAgent struct {
 	cfg            edgeAgentConfig
 	startedAt      time.Time
+	instanceID     string
 	masterClient   *http.Client
 	upstreamClient *http.Client
 	egressClient   *http.Client
@@ -284,6 +290,7 @@ type edgeAgent struct {
 	ispProbeTargets     map[string][]string
 	ispProbeLastForceID string
 	ispProbeSeq         uint64
+	ispProbeClaim       string
 	ispProbeResults     map[string]agentISPProbeResult
 	ispProbeTriggerCh   chan bool
 
@@ -336,9 +343,12 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 	egressTransport := upstreamTransport.Clone()
 	egressTransport.DisableCompression = true
 
+	var instanceID [16]byte
+	_, _ = rand.Read(instanceID[:])
 	agent := &edgeAgent{
-		cfg:       cfg,
-		startedAt: time.Now(),
+		cfg:        cfg,
+		startedAt:  time.Now(),
+		instanceID: hex.EncodeToString(instanceID[:]),
 		masterClient: &http.Client{
 			Transport: masterTransport,
 			Timeout:   10 * time.Second,
@@ -663,7 +673,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 
 	stProgress := a.snapshotSpeedtestProgress()
 	upgradeReqID, upgradeStatus := a.getUpgradeState()
-	ispSeq, ispResults := a.snapshotISPProbe()
+	ispSeq, ispResults, probeClaim := a.snapshotISPProbe()
 	payload := agentHeartbeatRequest{
 		Version:           appVersion,
 		ListenPort:        a.cfg.Port,
@@ -696,6 +706,10 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Yundu-Node-ID", strconv.FormatInt(a.cfg.NodeID, 10))
 	req.Header.Set("X-Yundu-Node-Token", a.cfg.Token)
+	req.Header.Set(edgeAgentInstanceHeader, a.instanceID)
+	if probeClaim != "" {
+		req.Header.Set(edgeAgentProbeClaimHeader, probeClaim)
+	}
 	req.Header.Set("X-Yundu-Direct-Popup", "1")
 	req.Header.Set("X-Yundu-Egress-Capable", "1")
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
@@ -758,6 +772,11 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	}
 	a.ackSpeedtestProgress(stProgress, reply.AckSpeedtestID)
 	a.setProbeTargets(reply.ProbeTargets)
+	a.ispProbeMu.Lock()
+	if claim := resp.Header.Get(edgeAgentProbeClaimHeader); len(claim) == hex.EncodedLen(sha256.Size) && a.ispProbeClaim == probeClaim {
+		a.ispProbeClaim = claim
+	}
+	a.ispProbeMu.Unlock()
 	a.applyISPProbeConfig(reply.ISPProbeConfig)
 	a.handleSpeedtestDirective(ctx, reply.SpeedtestTask, reply.CancelSpeedtestID)
 	if reply.UpgradeToVersion != "" && reply.UpgradeRequestID != "" {

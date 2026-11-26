@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -397,6 +401,59 @@ func anyISPTrippedInMap(health map[string]*ispHealthState) bool {
 	return false
 }
 
+// authorizeISPProbeLocked changes the reporting process only after a round trip
+// with the current master. A delayed request alone cannot claim ownership.
+func (rt *edgeNodeRuntime) authorizeISPProbeLocked(n *edgeNodeLiveState, raw, claim string, now time.Time) (bool, string) {
+	var instance, zero [16]byte
+	if raw == "" {
+		if n.ispProbeInstance != zero {
+			// Give a downgraded agent a way to report again once the current
+			// version has stopped heartbeating.
+			if now.Sub(n.ispProbeSeenAt) <= edgeNodeOfflineAfter {
+				return false, ""
+			}
+			n.switchISPProbeInstanceLocked(zero, now)
+		}
+		return true, ""
+	}
+	if len(raw) != hex.EncodedLen(len(instance)) {
+		return false, ""
+	}
+	if _, err := hex.Decode(instance[:], []byte(raw)); err != nil || instance == zero {
+		return false, ""
+	}
+	if instance == n.ispProbeInstance {
+		n.ispProbeSeenAt = now
+		return true, ""
+	}
+
+	var scope [2 * binary.MaxVarintLen64]byte
+	binding := binary.AppendVarint(scope[:0], n.id)
+	binding = binary.AppendUvarint(binding, n.ispProbeGeneration)
+	mac := hmac.New(sha256.New, rt.ispProbeClaimKey[:])
+	mac.Write(binding)
+	mac.Write(instance[:])
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(claim), []byte(expected)) {
+		return false, expected
+	}
+	n.switchISPProbeInstanceLocked(instance, now)
+	return true, ""
+}
+
+func (n *edgeNodeLiveState) switchISPProbeInstanceLocked(instance [16]byte, now time.Time) {
+	n.ispProbeInstance = instance
+	n.ispProbeGeneration++
+	n.ispProbeSeenAt = now
+	n.ispProbeSeq = 0
+	for _, health := range n.ispHealth {
+		if health != nil {
+			health.consecFails = 0
+			health.consecSuccesses = 0
+		}
+	}
+}
+
 func resetISPCircuits(health map[string]*ispHealthState) {
 	for _, st := range health {
 		if st == nil {
@@ -651,20 +708,20 @@ func (a *edgeAgent) applyISPProbeConfig(cfg *agentISPProbeConfig) {
 	}
 }
 
-func (a *edgeAgent) snapshotISPProbe() (uint64, map[string]agentISPProbeResult) {
+func (a *edgeAgent) snapshotISPProbe() (uint64, map[string]agentISPProbeResult, string) {
 	if a == nil {
-		return 0, nil
+		return 0, nil, ""
 	}
 	a.ispProbeMu.RLock()
 	defer a.ispProbeMu.RUnlock()
 	if a.ispProbeSeq == 0 || len(a.ispProbeResults) == 0 {
-		return 0, nil
+		return 0, nil, a.ispProbeClaim
 	}
 	cp := make(map[string]agentISPProbeResult, len(a.ispProbeResults))
 	for k, v := range a.ispProbeResults {
 		cp[k] = v
 	}
-	return a.ispProbeSeq, cp
+	return a.ispProbeSeq, cp, a.ispProbeClaim
 }
 
 func (a *edgeAgent) ispProbeLoop(ctx context.Context) {

@@ -505,6 +505,9 @@ type edgeNodeLiveState struct {
 	ispHealth           map[string]*ispHealthState
 	ispProbeSeq         uint64
 	ispForceProbeID     string
+	ispProbeInstance    [16]byte
+	ispProbeGeneration  uint64
+	ispProbeSeenAt      time.Time
 
 	pending           atomic.Int64
 	persistedTotalIn  int64
@@ -673,6 +676,7 @@ type edgeNodeRuntime struct {
 	rrCounters       map[string]*atomic.Uint64
 	blockNonMainland bool
 	ispProbe         ISPProbeSettings
+	ispProbeClaimKey [32]byte
 	pendingISPAlerts []ispProbeAlert
 	flushMu          sync.Mutex
 	reloadMu         sync.Mutex
@@ -696,6 +700,7 @@ func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNo
 		rrCounters:   counters,
 		ispProbe:     defaultISPProbeSettings(),
 	}
+	_, _ = rand.Read(rt.ispProbeClaimKey[:])
 	if db != nil {
 		if err := rt.reload(); err != nil {
 			log.Printf("edge nodes: initial load failed: %v", err)
@@ -2957,7 +2962,10 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		node.upstreamLatencies = lat
 	}
-	if req.ISPProbeSeq > 0 && len(req.ISPProbeResults) > 0 {
+	probeAccepted, probeClaim := a.pm.edges.authorizeISPProbeLocked(
+		node, r.Header.Get(edgeAgentInstanceHeader), r.Header.Get(edgeAgentProbeClaimHeader), time.Now(),
+	)
+	if probeAccepted && req.ISPProbeSeq > 0 && len(req.ISPProbeResults) > 0 {
 		alerts := a.pm.edges.applyISPProbeReportLocked(node.name, false, node.monitorISPOnly, &node.ispProbeSeq, &node.ispHealth, req.ISPProbeSeq, req.ISPProbeResults, now)
 		a.pm.edges.queueISPAlertsLocked(nodeID, alerts)
 	}
@@ -2968,10 +2976,12 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	ispProbeCfg := &agentISPProbeConfig{
 		Enabled:      a.pm.edges.ispProbe.Enabled,
 		IntervalSec:  ispProbeInterval,
-		ForceProbeID: node.ispForceProbeID,
-		Targets:      cloneISPProbeTargets(a.pm.edges.ispProbe.Targets),
+		Targets:     cloneISPProbeTargets(a.pm.edges.ispProbe.Targets),
 	}
-	node.ispForceProbeID = ""
+	if probeAccepted {
+		ispProbeCfg.ForceProbeID = node.ispForceProbeID
+		node.ispForceProbeID = ""
+	}
 	if node.upgradeTarget != "" {
 		if req.Version == node.upgradeTarget {
 			node.upgradeTarget = ""
@@ -3045,6 +3055,9 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 				resp.TLSKeyPEM = keyPEM
 			}
 		}
+	}
+	if probeClaim != "" {
+		w.Header().Set(edgeAgentProbeClaimHeader, probeClaim)
 	}
 	a.jsonOK(w, resp)
 }
