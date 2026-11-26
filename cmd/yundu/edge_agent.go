@@ -289,6 +289,7 @@ type edgeAgent struct {
 
 	ispProbeMu          sync.RWMutex
 	ispProbeEnabled     bool
+	ispProbeMode        string
 	ispProbeIntervalSec int
 	ispProbeTargets     map[string][]string
 	ispProbeLastForceID string
@@ -386,6 +387,7 @@ func newEdgeAgent(cfg edgeAgentConfig) *edgeAgent {
 		flushCh:           make(chan struct{}, 1),
 		latencies:           make(map[int64]int),
 		probeNowCh:          make(chan struct{}, 1),
+		ispProbeMode:        edgeProbeModeTCP,
 		ispProbeIntervalSec: defaultISPProbeIntervalSec,
 		ispProbeTriggerCh:   make(chan bool, 1),
 		speedtestNotifyCh:   make(chan struct{}, 1),

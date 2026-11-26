@@ -81,4 +81,64 @@ describe('IspProbeDrawer 三网阻断探测与熔断设置 (v1.5.4)', () => {
       },
     })
   })
+
+  it('支持加载并保存三网 ICMP Ping 目标 (v1.5.9)', async () => {
+    mockProbeApi.get.mockResolvedValueOnce({
+      enabled: true,
+      interval_sec: 30,
+      recovery_interval_sec: 180,
+      fail_threshold: 3,
+      recover_threshold: 2,
+      targets: {
+        ct: ['bj-ct-v4.ip.zstaticcdn.com:80'],
+        cu: ['bj-cu-v4.ip.zstaticcdn.com:80'],
+        cm: ['bj-cm-v4.ip.zstaticcdn.com:80'],
+      },
+      icmp_targets: {
+        ct: ['36.110.147.20', '202.96.209.133', '202.96.128.86'],
+        cu: ['123.125.81.6', '210.22.97.1', '221.5.88.88'],
+        cm: ['221.179.155.161', '211.136.112.200', '211.136.192.6'],
+      },
+    })
+    mockProbeApi.update.mockResolvedValue({
+      enabled: true,
+      interval_sec: 30,
+      recovery_interval_sec: 180,
+      fail_threshold: 3,
+      recover_threshold: 2,
+      targets: {
+        ct: ['bj-ct-v4.ip.zstaticcdn.com:80'],
+        cu: ['bj-cu-v4.ip.zstaticcdn.com:80'],
+        cm: ['bj-cm-v4.ip.zstaticcdn.com:80'],
+      },
+      icmp_targets: {
+        ct: ['202.96.209.133'],
+        cu: ['210.22.97.1'],
+        cm: ['211.136.112.200'],
+      },
+    })
+
+    const wrapper = mount(IspProbeDrawer, {
+      props: { open: true },
+      global: { stubs: { Teleport: true } },
+    })
+    await flushPromises()
+
+    expect((wrapper.find('#ip-icmp-ct').element as HTMLTextAreaElement).value).toContain('202.96.209.133')
+    await wrapper.find('#ip-icmp-ct').setValue('202.96.209.133')
+    await wrapper.find('#ip-icmp-cu').setValue('210.22.97.1')
+    await wrapper.find('#ip-icmp-cm').setValue('211.136.112.200')
+
+    const saveBtn = wrapper.findAll('button').find(b => b.text().includes('保存配置'))
+    await saveBtn!.trigger('click')
+    await flushPromises()
+
+    expect(mockProbeApi.update).toHaveBeenCalledWith(expect.objectContaining({
+      icmp_targets: {
+        ct: ['202.96.209.133'],
+        cu: ['210.22.97.1'],
+        cm: ['211.136.112.200'],
+      },
+    }))
+  })
 })

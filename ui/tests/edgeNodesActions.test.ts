@@ -267,4 +267,58 @@ describe('EdgeNodesView 节点总览、批量升级与卸载命令复制', () =>
       'bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent --uninstall',
     )
   })
+
+  it('支持按节点切换 ICMP Ping / 关闭探测，并分三行展示北上广悬浮延迟明细 (v1.5.9)', async () => {
+    const node = makeNode({
+      id: 10,
+      name: 'RFC-JPCO',
+      probe_mode: 'icmp',
+      auto_circuit_breaker: true,
+      isp_health: [
+        {
+          isp_group: 'cu',
+          isp_label: '联通',
+          latency_ms: 31,
+          reachable_count: 2,
+          total_count: 3,
+          consec_fails: 0,
+          tripped: false,
+          targets: [
+            { target: '123.125.81.6', label: '北京', reachable: true, latency_ms: 52 },
+            { target: '210.22.97.1', label: '上海', reachable: true, latency_ms: 31 },
+            { target: '221.5.88.88', label: '广东', reachable: false, latency_ms: -1 },
+          ],
+        },
+      ],
+    })
+    const offNode = { ...node, probe_mode: 'off', isp_health: [] }
+    edgeApi.list.mockResolvedValueOnce([node]).mockResolvedValue([offNode])
+    edgeApi.update.mockResolvedValue(offNode)
+
+    const wrapper = mount(EdgeNodesView, { global: { stubs: { Teleport: true, SpeedtestDrawer: true, RouterLink: true } } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('三网连通 · ICMP')
+    const popRows = wrapper.findAll('.isp-popover .isp-pop-row')
+    expect(popRows.length).toBe(3)
+    expect(popRows[0].text()).toContain('北京')
+    expect(popRows[0].text()).toContain('52ms')
+    expect(popRows[1].text()).toContain('上海')
+    expect(popRows[1].text()).toContain('31ms')
+    expect(popRows[2].text()).toContain('广东')
+    expect(popRows[2].text()).toContain('不通')
+
+    const edit = wrapper.findAll('article.card:not(.master) button').find(button => button.text() === '编辑')
+    await edit!.trigger('click')
+    await wrapper.find('#en-probe-mode').setValue('off')
+    // When probe_mode is off, auto_circuit_breaker switch is hidden.
+    expect(wrapper.findAll('.switch').find(label => label.text().startsWith('自动熔断'))).toBeUndefined()
+
+    const save = wrapper.findAll('button').find(button => button.text() === '保存更改')
+    await save!.trigger('click')
+    await flushPromises()
+
+    expect(edgeApi.update).toHaveBeenCalledWith(10, expect.objectContaining({ probe_mode: 'off' }))
+    expect(wrapper.text()).toContain('已关闭主动探测')
+  })
 })

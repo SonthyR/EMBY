@@ -154,6 +154,15 @@ export interface EdgeSiteLatency {
   latency_ms: number
 }
 
+export type EdgeNodeProbeMode = 'tcp' | 'icmp' | 'off'
+
+export interface EdgeISPProbeTarget {
+  target: string
+  label?: string
+  reachable: boolean
+  latency_ms: number
+}
+
 export interface EdgeISPHealth {
   isp_group: 'ct' | 'cu' | 'cm' | string
   isp_label: string
@@ -164,6 +173,7 @@ export interface EdgeISPHealth {
   tripped: boolean
   tripped_at?: string
   last_checked_at?: string
+  targets?: EdgeISPProbeTarget[]
 }
 
 export interface ISPProbeSettings {
@@ -173,6 +183,7 @@ export interface ISPProbeSettings {
   fail_threshold: number
   recover_threshold: number
   targets: Record<string, string[]>
+  icmp_targets?: Record<string, string[]>
 }
 
 export interface EdgeNode {
@@ -189,6 +200,7 @@ export interface EdgeNode {
   cf_record_ip?: string
   enabled: boolean
   auto_circuit_breaker?: boolean
+  probe_mode?: EdgeNodeProbeMode | string
   traffic_quota: number
   traffic_used: number
   traffic_reset_day: number
@@ -238,6 +250,7 @@ export interface EdgeNodeInput {
   auto_https?: boolean
   enabled?: boolean
   auto_circuit_breaker?: boolean
+  probe_mode?: EdgeNodeProbeMode | string
   traffic_quota?: number
   traffic_reset_day?: number
   max_balance_streams?: number

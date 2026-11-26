@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.5.9
+
+发布日期：2026-11-26
+
+- **单节点三网探测方式（TCP 握手 / ICMP Ping / 关闭主动探测）**：
+  - 在「节点 → 编辑」抽屉新增单节点**三网探测方式**选项，默认保持 `TCP 握手`；针对 RFC 等屏蔽出站 TCP SYN 但放行 ICMP 的优化线路机，可按节点切换为 **`ICMP Ping`**（内置北/上/广三网实测可用的默认 ICMP 目标，并在「阻断熔断」抽屉支持自定义，默认保持开启自动熔断）；不需主动探活的机房可直接设为 **`关闭主动探测`**，卡片清爽显示「已关闭主动探测」不再出现假红。
+  - `install.sh` 为 systemd 下的 `meridian-agent` 同步授予 `CAP_NET_RAW` 能力，确保非 root 运行的 Debian/Ubuntu 从机原生支持 ICMP Ping 探测。
+- **三网连通胶囊三行明细悬浮提示**：
+  - 鼠标悬停在节点卡片的 `电信 / 联通 / 移动 XXms` 胶囊上时，分三行直观展示 **北京 / 上海 / 广东** 各自的实时延迟与通断状态（如 `北京 47ms`、`上海 24ms`、`广东 55ms` / `不通`），熔断时附带底部切流提示。
+- **从机一键卸载彻底无残留（兼容 Alpine 无 `bash` 环境）**：
+  - 新增纯 POSIX `sh` 编写的 `uninstall-agent.sh`，卸载命令改为 `curl -fsSL .../uninstall-agent.sh | sh`，兼容 Alpine BusyBox `ash` 与 Debian/Ubuntu/CentOS；
+  - `uninstall-agent.sh` 与 `install.sh agent --uninstall` 同步补全清理范围：自动删除 `/var/log/meridian-agent.log`、`/run/meridian-agent.pid`、`/tmp/meridian-agent*`、systemd 失效单元状态，并在纯从机（未安装主机）环境下自动移除 `meridian` 系统用户与用户组。
+
 ## v1.5.8
 
 发布日期：2026-11-26

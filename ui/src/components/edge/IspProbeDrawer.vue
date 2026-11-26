@@ -24,6 +24,9 @@ const form = reactive({
   ct_targets: '',
   cu_targets: '',
   cm_targets: '',
+  icmp_ct_targets: '',
+  icmp_cu_targets: '',
+  icmp_cm_targets: '',
 })
 
 const errors = reactive<Record<string, string>>({})
@@ -41,6 +44,9 @@ function applySettings(cfg: ISPProbeSettings) {
   form.ct_targets = (cfg.targets?.ct || []).join('\n')
   form.cu_targets = (cfg.targets?.cu || []).join('\n')
   form.cm_targets = (cfg.targets?.cm || []).join('\n')
+  form.icmp_ct_targets = (cfg.icmp_targets?.ct || []).join('\n')
+  form.icmp_cu_targets = (cfg.icmp_targets?.cu || []).join('\n')
+  form.icmp_cm_targets = (cfg.icmp_targets?.cm || []).join('\n')
 }
 
 async function load() {
@@ -94,23 +100,36 @@ async function save() {
   const ct = parseLines(form.ct_targets)
   const cu = parseLines(form.cu_targets)
   const cm = parseLines(form.cm_targets)
+  const icmpCt = parseLines(form.icmp_ct_targets)
+  const icmpCu = parseLines(form.icmp_cu_targets)
+  const icmpCm = parseLines(form.icmp_cm_targets)
+  const hasAnyIcmpInput = icmpCt.length > 0 || icmpCu.length > 0 || icmpCm.length > 0
   if (form.enabled) {
     if (!ct.length) errors.ct_targets = '请至少填写 1 个电信探测目标'
     if (!cu.length) errors.cu_targets = '请至少填写 1 个联通探测目标'
     if (!cm.length) errors.cm_targets = '请至少填写 1 个移动探测目标'
+    if (hasAnyIcmpInput) {
+      if (!icmpCt.length) errors.icmp_ct_targets = '请至少填写 1 个电信 ICMP 目标'
+      if (!icmpCu.length) errors.icmp_cu_targets = '请至少填写 1 个联通 ICMP 目标'
+      if (!icmpCm.length) errors.icmp_cm_targets = '请至少填写 1 个移动 ICMP 目标'
+    }
   }
   if (Object.keys(errors).length) return
 
   saving.value = true
   try {
-    const saved = await ispProbeApi.update({
+    const payload: Partial<ISPProbeSettings> = {
       enabled: form.enabled,
       interval_sec: intervalSec,
       recovery_interval_sec: recoveryIntervalSec,
       fail_threshold: failThreshold,
       recover_threshold: recoverThreshold,
       targets: { ct, cu, cm },
-    })
+    }
+    if (hasAnyIcmpInput) {
+      payload.icmp_targets = { ct: icmpCt, cu: icmpCu, cm: icmpCm }
+    }
+    const saved = await ispProbeApi.update(payload)
     applySettings(saved)
     toast.success('阻断探测与自动熔断配置已保存')
     emit('saved')
@@ -190,6 +209,19 @@ async function resetDefaults() {
         </UiField>
         <UiField label="移动目标" for="ip-cm" :error="errors.cm_targets">
           <textarea id="ip-cm" v-model="form.cm_targets" class="textarea mono" rows="3" spellcheck="false" />
+        </UiField>
+      </fieldset>
+
+      <fieldset>
+        <legend>三网 ICMP Ping 目标（设为 ICMP 模式的节点使用，每行一个 IP 或域名）</legend>
+        <UiField label="电信 ICMP 目标" for="ip-icmp-ct" :error="errors.icmp_ct_targets">
+          <textarea id="ip-icmp-ct" v-model="form.icmp_ct_targets" class="textarea mono" rows="3" spellcheck="false" />
+        </UiField>
+        <UiField label="联通 ICMP 目标" for="ip-icmp-cu" :error="errors.icmp_cu_targets">
+          <textarea id="ip-icmp-cu" v-model="form.icmp_cu_targets" class="textarea mono" rows="3" spellcheck="false" />
+        </UiField>
+        <UiField label="移动 ICMP 目标" for="ip-icmp-cm" :error="errors.icmp_cm_targets">
+          <textarea id="ip-icmp-cm" v-model="form.icmp_cm_targets" class="textarea mono" rows="3" spellcheck="false" />
         </UiField>
       </fieldset>
 

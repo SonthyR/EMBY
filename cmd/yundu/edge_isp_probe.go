@@ -14,10 +14,15 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -33,16 +38,41 @@ const (
 	maxISPProbeThreshold               = 10
 	ispProbeDialTimeout                = 3 * time.Second
 	ispProbeMaxTargetsPerGroup         = 6
+
+	edgeProbeModeTCP  = "tcp"
+	edgeProbeModeICMP = "icmp"
+	edgeProbeModeOff  = "off"
 )
 
+func normalizeEdgeProbeMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", edgeProbeModeTCP:
+		return edgeProbeModeTCP, nil
+	case edgeProbeModeICMP:
+		return edgeProbeModeICMP, nil
+	case edgeProbeModeOff:
+		return edgeProbeModeOff, nil
+	default:
+		return "", fmt.Errorf("三网探测方式仅支持 tcp、icmp 或 off")
+	}
+}
+
 // probeableISPGroups are the three mainland Chinese ISP groups that run active
-// TCP handshake probing. When all three are tripped simultaneously, the node is
+// TCP/ICMP probing. When all three are tripped simultaneously, the node is
 // also treated as tripped in the "other" group.
 var probeableISPGroups = []string{ispGroupCT, ispGroupCU, ispGroupCM}
 
 // ispProbeAllowLoopbackInTests lets offline unit tests bind 127.0.0.1 TCP
 // listeners as deterministic probe targets. Production code keeps this false.
 var ispProbeAllowLoopbackInTests bool
+
+// ispICMPProbeHook allows unit tests to stub ICMP echo probing deterministically.
+var ispICMPProbeHook func(ctx context.Context, host string) int
+
+var (
+	icmpEchoIDCounter atomic.Int32
+	icmpPermWarnOnce  sync.Once
+)
 
 func defaultISPProbeTargets() map[string][]string {
 	return map[string][]string{
@@ -64,6 +94,47 @@ func defaultISPProbeTargets() map[string][]string {
 	}
 }
 
+func defaultISPICMPTargets() map[string][]string {
+	return map[string][]string{
+		ispGroupCT: {
+			"36.110.147.20",  // 北京电信
+			"202.96.209.133", // 上海电信
+			"202.96.128.86",  // 广东电信
+		},
+		ispGroupCU: {
+			"123.125.81.6", // 北京联通
+			"210.22.97.1",  // 上海联通
+			"221.5.88.88",  // 广东联通
+		},
+		ispGroupCM: {
+			"221.179.155.161", // 北京移动
+			"211.136.112.200", // 上海移动
+			"211.136.192.6",   // 广东移动
+		},
+	}
+}
+
+func inferISPProbeTargetLabel(target string) string {
+	host := strings.TrimSpace(target)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	switch {
+	case strings.HasPrefix(host, "bj-"), host == "36.110.147.20", host == "123.125.81.6", host == "221.179.155.161":
+		return "北京"
+	case strings.HasPrefix(host, "sh-"), host == "202.96.209.133", host == "210.22.97.1", host == "211.136.112.200":
+		return "上海"
+	case strings.HasPrefix(host, "gd-"), host == "202.96.128.86", host == "221.5.88.88", host == "211.136.192.6":
+		return "广东"
+	default:
+		if host != "" {
+			return host
+		}
+		return target
+	}
+}
+
 func cloneISPProbeTargets(src map[string][]string) map[string][]string {
 	out := make(map[string][]string, len(probeableISPGroups))
 	for _, g := range probeableISPGroups {
@@ -79,6 +150,7 @@ type ISPProbeSettings struct {
 	FailThreshold       int                 `json:"fail_threshold"`
 	RecoverThreshold    int                 `json:"recover_threshold"`
 	Targets             map[string][]string `json:"targets"`
+	ICMPTargets         map[string][]string `json:"icmp_targets"`
 }
 
 func defaultISPProbeSettings() ISPProbeSettings {
@@ -89,6 +161,7 @@ func defaultISPProbeSettings() ISPProbeSettings {
 		FailThreshold:       defaultISPProbeFailThreshold,
 		RecoverThreshold:    defaultISPProbeRecoverThreshold,
 		Targets:             defaultISPProbeTargets(),
+		ICMPTargets:         defaultISPICMPTargets(),
 	}
 }
 
@@ -101,14 +174,62 @@ CREATE TABLE IF NOT EXISTS isp_probe_settings (
 	fail_threshold INTEGER NOT NULL DEFAULT 3,
 	recover_threshold INTEGER NOT NULL DEFAULT 2,
 	targets_json TEXT NOT NULL DEFAULT '',
+	icmp_targets_json TEXT NOT NULL DEFAULT '',
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 INSERT OR IGNORE INTO isp_probe_settings (id) VALUES (1);
 `
 
 func ensureISPProbeSchema(ctx context.Context, conn *sql.Conn) error {
-	_, err := conn.ExecContext(ctx, ispProbeSchemaSQL)
-	return err
+	if _, err := conn.ExecContext(ctx, ispProbeSchemaSQL); err != nil {
+		return err
+	}
+	var exists int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('isp_probe_settings') WHERE name='icmp_targets_json'").Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE isp_probe_settings ADD COLUMN icmp_targets_json TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeISPICMPTarget(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "icmp://")
+	s = strings.TrimPrefix(s, "tcp://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "https://")
+	if slash := strings.IndexByte(s, '/'); slash >= 0 {
+		s = s[:slash]
+	}
+	if s == "" {
+		return "", nil
+	}
+	host := s
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSpace(strings.Trim(host, "[]")))
+	if host == "" || len(host) > 253 {
+		return "", fmt.Errorf("无效的 ICMP 探测目标：%s", raw)
+	}
+	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
+		addr = addr.Unmap()
+		if !ispProbeAllowLoopbackInTests && (addr.IsLoopback() || addr.IsUnspecified() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast()) {
+			return "", fmt.Errorf("ICMP 探测目标不能使用本机或保留地址：%s", raw)
+		}
+		return addr.String(), nil
+	}
+	if !ispProbeAllowLoopbackInTests && (host == "localhost" || strings.HasSuffix(host, ".localhost")) {
+		return "", fmt.Errorf("ICMP 探测目标不能使用本机地址：%s", raw)
+	}
+	if _, err := normalizePublicHost(host); err != nil {
+		return "", fmt.Errorf("ICMP 探测目标主机名无效：%s", raw)
+	}
+	return host, nil
 }
 
 func normalizeISPProbeTarget(raw string) (string, error) {
@@ -208,6 +329,36 @@ func normalizeISPProbeSettings(in ISPProbeSettings) (ISPProbeSettings, error) {
 		cleanTargets[g] = list
 	}
 	out.Targets = cleanTargets
+
+	icmpDefaults := defaultISPICMPTargets()
+	cleanICMPTargets := make(map[string][]string, len(probeableISPGroups))
+	for _, g := range probeableISPGroups {
+		rawList := out.ICMPTargets[g]
+		if out.ICMPTargets == nil {
+			rawList = icmpDefaults[g]
+		}
+		seen := make(map[string]bool, len(rawList))
+		list := make([]string, 0, len(rawList))
+		for _, item := range rawList {
+			norm, err := normalizeISPICMPTarget(item)
+			if err != nil {
+				return out, err
+			}
+			if norm == "" || seen[norm] {
+				continue
+			}
+			seen[norm] = true
+			list = append(list, norm)
+			if len(list) > ispProbeMaxTargetsPerGroup {
+				return out, fmt.Errorf("%s ICMP 探测目标不能超过 %d 个", ispGroupLabel(g), ispProbeMaxTargetsPerGroup)
+			}
+		}
+		if out.Enabled && len(list) == 0 {
+			return out, fmt.Errorf("启用探测时，%s至少需要配置 1 个 ICMP 探测目标", ispGroupLabel(g))
+		}
+		cleanICMPTargets[g] = list
+	}
+	out.ICMPTargets = cleanICMPTargets
 	return out, nil
 }
 
@@ -223,9 +374,10 @@ func (d *DB) loadISPProbeSettings() ISPProbeSettings {
 		failThreshold       int
 		recoverThreshold    int
 		targetsJSON         string
+		icmpTargetsJSON     string
 	)
-	err := d.db.QueryRow(`SELECT enabled, interval_sec, recovery_interval_sec, fail_threshold, recover_threshold, targets_json FROM isp_probe_settings WHERE id=1`).
-		Scan(&enabledInt, &intervalSec, &recoveryIntervalSec, &failThreshold, &recoverThreshold, &targetsJSON)
+	err := d.db.QueryRow(`SELECT enabled, interval_sec, recovery_interval_sec, fail_threshold, recover_threshold, targets_json, icmp_targets_json FROM isp_probe_settings WHERE id=1`).
+		Scan(&enabledInt, &intervalSec, &recoveryIntervalSec, &failThreshold, &recoverThreshold, &targetsJSON, &icmpTargetsJSON)
 	if err != nil {
 		return def
 	}
@@ -236,6 +388,7 @@ func (d *DB) loadISPProbeSettings() ISPProbeSettings {
 		FailThreshold:       failThreshold,
 		RecoverThreshold:    recoverThreshold,
 		Targets:             defaultISPProbeTargets(),
+		ICMPTargets:         defaultISPICMPTargets(),
 	}
 	if strings.TrimSpace(targetsJSON) != "" {
 		var parsed map[string][]string
@@ -243,6 +396,16 @@ func (d *DB) loadISPProbeSettings() ISPProbeSettings {
 			for _, g := range probeableISPGroups {
 				if list, ok := parsed[g]; ok {
 					s.Targets[g] = list
+				}
+			}
+		}
+	}
+	if strings.TrimSpace(icmpTargetsJSON) != "" {
+		var parsed map[string][]string
+		if err := json.Unmarshal([]byte(icmpTargetsJSON), &parsed); err == nil && len(parsed) > 0 {
+			for _, g := range probeableISPGroups {
+				if list, ok := parsed[g]; ok {
+					s.ICMPTargets[g] = list
 				}
 			}
 		}
@@ -262,9 +425,13 @@ func (d *DB) saveISPProbeSettings(s ISPProbeSettings) error {
 	if err != nil {
 		return err
 	}
+	icmpTargetsBytes, err := json.Marshal(s.ICMPTargets)
+	if err != nil {
+		return err
+	}
 	_, err = d.db.Exec(
-		`INSERT INTO isp_probe_settings(id, enabled, interval_sec, recovery_interval_sec, fail_threshold, recover_threshold, targets_json, updated_at)
-		 VALUES(1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`INSERT INTO isp_probe_settings(id, enabled, interval_sec, recovery_interval_sec, fail_threshold, recover_threshold, targets_json, icmp_targets_json, updated_at)
+		 VALUES(1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(id) DO UPDATE SET
 		   enabled=excluded.enabled,
 		   interval_sec=excluded.interval_sec,
@@ -272,8 +439,9 @@ func (d *DB) saveISPProbeSettings(s ISPProbeSettings) error {
 		   fail_threshold=excluded.fail_threshold,
 		   recover_threshold=excluded.recover_threshold,
 		   targets_json=excluded.targets_json,
+		   icmp_targets_json=excluded.icmp_targets_json,
 		   updated_at=CURRENT_TIMESTAMP`,
-		sqliteBool(s.Enabled), s.IntervalSec, s.RecoveryIntervalSec, s.FailThreshold, s.RecoverThreshold, string(targetsBytes),
+		sqliteBool(s.Enabled), s.IntervalSec, s.RecoveryIntervalSec, s.FailThreshold, s.RecoverThreshold, string(targetsBytes), string(icmpTargetsBytes),
 	)
 	return err
 }
@@ -283,16 +451,25 @@ func (d *DB) saveISPProbeSettings(s ISPProbeSettings) error {
 
 type agentISPProbeConfig struct {
 	Enabled      bool                `json:"enabled"`
+	Mode         string              `json:"mode,omitempty"`
 	IntervalSec  int                 `json:"interval_sec"`
 	ForceProbeID string              `json:"force_probe_id,omitempty"`
 	Targets      map[string][]string `json:"targets,omitempty"`
 }
 
+type agentISPProbeTargetResult struct {
+	Target    string `json:"target"`
+	Label     string `json:"label,omitempty"`
+	Reachable bool   `json:"reachable"`
+	LatencyMs int    `json:"latency_ms"`
+}
+
 type agentISPProbeResult struct {
-	LatencyMs      int   `json:"latency_ms"` // best ms among reachable targets, -1 if all unreachable
-	ReachableCount int   `json:"reachable_count"`
-	TotalCount     int   `json:"total_count"`
-	CheckedAtUnix  int64 `json:"checked_at_unix,omitempty"`
+	LatencyMs      int                         `json:"latency_ms"` // best ms among reachable targets, -1 if all unreachable
+	ReachableCount int                         `json:"reachable_count"`
+	TotalCount     int                         `json:"total_count"`
+	CheckedAtUnix  int64                       `json:"checked_at_unix,omitempty"`
+	Targets        []agentISPProbeTargetResult `json:"targets,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +485,7 @@ type ispHealthState struct {
 	trippedAt       time.Time
 	lastCheckedAt   time.Time
 	alertNotified   bool
+	targets         []agentISPProbeTargetResult
 }
 
 type ispProbeAlert struct {
@@ -322,15 +500,16 @@ func (rt *edgeNodeRuntime) queueISPAlertsLocked(nodeID int64, messages []string)
 }
 
 type edgeISPHealthView struct {
-	ISPGroup       string `json:"isp_group"`
-	ISPLabel       string `json:"isp_label"`
-	LatencyMs      int    `json:"latency_ms"`
-	ReachableCount int    `json:"reachable_count"`
-	TotalCount     int    `json:"total_count"`
-	ConsecFails    int    `json:"consec_fails"`
-	Tripped        bool   `json:"tripped"`
-	TrippedAt      string `json:"tripped_at,omitempty"`
-	LastCheckedAt  string `json:"last_checked_at,omitempty"`
+	ISPGroup       string                      `json:"isp_group"`
+	ISPLabel       string                      `json:"isp_label"`
+	LatencyMs      int                         `json:"latency_ms"`
+	ReachableCount int                         `json:"reachable_count"`
+	TotalCount     int                         `json:"total_count"`
+	ConsecFails    int                         `json:"consec_fails"`
+	Tripped        bool                        `json:"tripped"`
+	TrippedAt      string                      `json:"tripped_at,omitempty"`
+	LastCheckedAt  string                      `json:"last_checked_at,omitempty"`
+	Targets        []agentISPProbeTargetResult `json:"targets,omitempty"`
 }
 
 func buildISPHealthViews(health map[string]*ispHealthState) ([]edgeISPHealthView, bool) {
@@ -352,6 +531,9 @@ func buildISPHealthViews(health map[string]*ispHealthState) ([]edgeISPHealthView
 			TotalCount:     st.totalCount,
 			ConsecFails:    st.consecFails,
 			Tripped:        st.tripped,
+		}
+		if len(st.targets) > 0 {
+			v.Targets = append([]agentISPProbeTargetResult(nil), st.targets...)
 		}
 		if st.tripped {
 			anyTripped = true
@@ -524,6 +706,18 @@ func (rt *edgeNodeRuntime) applyISPProbeReportLocked(
 		if res.ReachableCount > 0 {
 			st.latencyMs = res.LatencyMs
 		}
+		if len(res.Targets) > 0 {
+			targets := make([]agentISPProbeTargetResult, len(res.Targets))
+			for i, t := range res.Targets {
+				if strings.TrimSpace(t.Label) == "" {
+					t.Label = inferISPProbeTargetLabel(t.Target)
+				}
+				targets[i] = t
+			}
+			st.targets = targets
+		} else {
+			st.targets = nil
+		}
 		if monitorOnly {
 			continue
 		}
@@ -582,7 +776,7 @@ func (rt *edgeNodeRuntime) applyISPProbeReportLocked(
 }
 
 // ---------------------------------------------------------------------------
-// Shared concurrent TCP handshake prober (used by both Edge Agent & Master)
+// Shared concurrent TCP / ICMP prober (used by both Edge Agent & Master)
 
 func probeTCPAddressMs(ctx context.Context, dialer *net.Dialer, addr string) int {
 	start := time.Now()
@@ -598,9 +792,128 @@ func probeTCPAddressMs(ctx context.Context, dialer *net.Dialer, addr string) int
 	return ms
 }
 
+func resolveIPv4ForICMP(ctx context.Context, raw string) (net.IP, error) {
+	host := strings.TrimSpace(raw)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, nil
+		}
+		return nil, errors.New("ipv6 icmp unsupported")
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+	if err != nil || len(addrs) == 0 {
+		return nil, errors.New("dns lookup failed")
+	}
+	ip4 := addrs[0].Unmap().As4()
+	return net.IP(ip4[:]), nil
+}
+
+func probeICMPAddressMs(ctx context.Context, rawTarget string) int {
+	if hook := ispICMPProbeHook; hook != nil {
+		return hook(ctx, rawTarget)
+	}
+	targetIP, err := resolveIPv4ForICMP(ctx, rawTarget)
+	if err != nil {
+		return -1
+	}
+	// Prefer unprivileged datagram ICMP socket when permitted, then raw IPv4 ICMP.
+	unprivileged := true
+	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
+	if err != nil {
+		unprivileged = false
+		conn, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		if err != nil {
+			if errors.Is(err, os.ErrPermission) || strings.Contains(strings.ToLower(err.Error()), "operation not permitted") || strings.Contains(strings.ToLower(err.Error()), "permission denied") {
+				icmpPermWarnOnce.Do(func() {
+					log.Printf("edge agent: ICMP probe requires CAP_NET_RAW or net.ipv4.ping_group_range; re-run install command to grant CAP_NET_RAW (%v)", err)
+				})
+			}
+			return -1
+		}
+	}
+	defer conn.Close()
+
+	id := (os.Getpid() ^ int(icmpEchoIDCounter.Add(1))) & 0xffff
+	if id == 0 {
+		id = 1
+	}
+	seq := 1
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Code: 0,
+		Body: &icmp.Echo{
+			ID:   id,
+			Seq:  seq,
+			Data: []byte("yundu-isp-probe"),
+		},
+	}
+	wire, err := msg.Marshal(nil)
+	if err != nil {
+		return -1
+	}
+
+	deadline := time.Now().Add(ispProbeDialTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+
+	var dst net.Addr
+	if unprivileged {
+		dst = &net.UDPAddr{IP: targetIP}
+	} else {
+		dst = &net.IPAddr{IP: targetIP}
+	}
+
+	start := time.Now()
+	if _, err := conn.WriteTo(wire, dst); err != nil {
+		return -1
+	}
+
+	buf := make([]byte, 1500)
+	for {
+		if ctx.Err() != nil {
+			return -1
+		}
+		n, peer, err := conn.ReadFrom(buf)
+		if err != nil {
+			return -1
+		}
+		rm, err := icmp.ParseMessage(1, buf[:n])
+		if err != nil || rm.Type != ipv4.ICMPTypeEchoReply {
+			continue
+		}
+		echo, ok := rm.Body.(*icmp.Echo)
+		if !ok || echo.Seq != seq {
+			continue
+		}
+		if !unprivileged {
+			if echo.ID != id {
+				continue
+			}
+			if ipAddr, ok := peer.(*net.IPAddr); ok && !ipAddr.IP.Equal(targetIP) {
+				continue
+			}
+		}
+		ms := int(time.Since(start).Milliseconds())
+		if ms < 1 {
+			ms = 1
+		}
+		return ms
+	}
+}
+
 func runISPProbeTargets(ctx context.Context, targets map[string][]string) map[string]agentISPProbeResult {
+	return runISPProbeTargetsWithMode(ctx, edgeProbeModeTCP, targets)
+}
+
+func runISPProbeTargetsWithMode(ctx context.Context, mode string, targets map[string][]string) map[string]agentISPProbeResult {
 	out := make(map[string]agentISPProbeResult, len(probeableISPGroups))
-	if len(targets) == 0 {
+	if len(targets) == 0 || mode == edgeProbeModeOff {
 		return out
 	}
 	dialer := &net.Dialer{Timeout: ispProbeDialTimeout}
@@ -615,22 +928,33 @@ func runISPProbeTargets(ctx context.Context, targets map[string][]string) map[st
 		go func(group string, list []string) {
 			defer wg.Done()
 			var innerWG sync.WaitGroup
-			latencies := make([]int, len(list))
+			details := make([]agentISPProbeTargetResult, len(list))
 			for i, addr := range list {
 				innerWG.Add(1)
 				go func(idx int, target string) {
 					defer innerWG.Done()
-					latencies[idx] = probeTCPAddressMs(ctx, dialer, target)
+					var ms int
+					if mode == edgeProbeModeICMP {
+						ms = probeICMPAddressMs(ctx, target)
+					} else {
+						ms = probeTCPAddressMs(ctx, dialer, target)
+					}
+					details[idx] = agentISPProbeTargetResult{
+						Target:    target,
+						Label:     inferISPProbeTargetLabel(target),
+						Reachable: ms > 0,
+						LatencyMs: ms,
+					}
 				}(i, addr)
 			}
 			innerWG.Wait()
 			reachable := 0
 			bestMs := -1
-			for _, ms := range latencies {
-				if ms > 0 {
+			for _, d := range details {
+				if d.Reachable && d.LatencyMs > 0 {
 					reachable++
-					if bestMs < 0 || ms < bestMs {
-						bestMs = ms
+					if bestMs < 0 || d.LatencyMs < bestMs {
+						bestMs = d.LatencyMs
 					}
 				}
 			}
@@ -640,6 +964,7 @@ func runISPProbeTargets(ctx context.Context, targets map[string][]string) map[st
 				ReachableCount: reachable,
 				TotalCount:     len(list),
 				CheckedAtUnix:  time.Now().Unix(),
+				Targets:        details,
 			}
 			mu.Unlock()
 		}(g, append([]string(nil), addrs...))
@@ -656,14 +981,25 @@ func (a *edgeAgent) applyISPProbeConfig(cfg *agentISPProbeConfig) {
 		return
 	}
 	triggerNow := false
+	mode, err := normalizeEdgeProbeMode(cfg.Mode)
+	if err != nil {
+		mode = edgeProbeModeTCP
+	}
+	effectiveEnabled := cfg.Enabled && mode != edgeProbeModeOff
+
 	a.ispProbeMu.Lock()
 	prevEnabled := a.ispProbeEnabled
+	prevMode := a.ispProbeMode
 	prevInterval := a.ispProbeIntervalSec
-	a.ispProbeEnabled = cfg.Enabled
+	a.ispProbeEnabled = effectiveEnabled
+	a.ispProbeMode = mode
 	if cfg.IntervalSec >= minISPProbeIntervalSec {
 		a.ispProbeIntervalSec = cfg.IntervalSec
 	} else {
 		a.ispProbeIntervalSec = defaultISPProbeIntervalSec
+	}
+	if !effectiveEnabled {
+		a.ispProbeResults = nil
 	}
 	targetsChanged := false
 	if cfg.Targets != nil {
@@ -692,9 +1028,11 @@ func (a *edgeAgent) applyISPProbeConfig(cfg *agentISPProbeConfig) {
 	}
 	if cfg.ForceProbeID != "" && cfg.ForceProbeID != a.ispProbeLastForceID {
 		a.ispProbeLastForceID = cfg.ForceProbeID
-		triggerNow = true
+		if effectiveEnabled {
+			triggerNow = true
+		}
 	}
-	if cfg.Enabled && (!prevEnabled || targetsChanged) {
+	if effectiveEnabled && (!prevEnabled || prevMode != mode || targetsChanged) {
 		triggerNow = true
 	}
 	intervalChanged := prevInterval != a.ispProbeIntervalSec
@@ -714,11 +1052,14 @@ func (a *edgeAgent) snapshotISPProbe() (uint64, map[string]agentISPProbeResult, 
 	}
 	a.ispProbeMu.RLock()
 	defer a.ispProbeMu.RUnlock()
-	if a.ispProbeSeq == 0 || len(a.ispProbeResults) == 0 {
+	if !a.ispProbeEnabled || a.ispProbeSeq == 0 || len(a.ispProbeResults) == 0 {
 		return 0, nil, a.ispProbeClaim
 	}
 	cp := make(map[string]agentISPProbeResult, len(a.ispProbeResults))
 	for k, v := range a.ispProbeResults {
+		if len(v.Targets) > 0 {
+			v.Targets = append([]agentISPProbeTargetResult(nil), v.Targets...)
+		}
 		cp[k] = v
 	}
 	return a.ispProbeSeq, cp, a.ispProbeClaim
@@ -767,13 +1108,14 @@ func (a *edgeAgent) ispProbeLoop(ctx context.Context) {
 func (a *edgeAgent) runISPProbeOnce(ctx context.Context) {
 	a.ispProbeMu.RLock()
 	enabled := a.ispProbeEnabled
+	mode := a.ispProbeMode
 	targets := cloneISPProbeTargets(a.ispProbeTargets)
 	a.ispProbeMu.RUnlock()
-	if !enabled {
+	if !enabled || mode == edgeProbeModeOff {
 		return
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	results := runISPProbeTargets(probeCtx, targets)
+	results := runISPProbeTargetsWithMode(probeCtx, mode, targets)
 	cancel()
 	if len(results) == 0 {
 		return
@@ -853,6 +1195,7 @@ func (a *App) handleISPProbeSettings(w http.ResponseWriter, r *http.Request) {
 		a.pm.edges.mu.RLock()
 		cfg := a.pm.edges.ispProbe
 		cfg.Targets = cloneISPProbeTargets(cfg.Targets)
+		cfg.ICMPTargets = cloneISPProbeTargets(cfg.ICMPTargets)
 		a.pm.edges.mu.RUnlock()
 		a.jsonOK(w, cfg)
 	case http.MethodPut:
@@ -863,6 +1206,7 @@ func (a *App) handleISPProbeSettings(w http.ResponseWriter, r *http.Request) {
 			FailThreshold       int                 `json:"fail_threshold"`
 			RecoverThreshold    int                 `json:"recover_threshold"`
 			Targets             map[string][]string `json:"targets"`
+			ICMPTargets         map[string][]string `json:"icmp_targets"`
 			ResetDefaults       bool                `json:"reset_defaults"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
@@ -894,6 +1238,9 @@ func (a *App) handleISPProbeSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.Targets != nil {
 				next.Targets = req.Targets
+			}
+			if req.ICMPTargets != nil {
+				next.ICMPTargets = req.ICMPTargets
 			}
 		}
 		normalized, err := normalizeISPProbeSettings(next)

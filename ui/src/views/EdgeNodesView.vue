@@ -51,6 +51,7 @@ const form = reactive({
   auto_https: false,
   enabled: true,
   auto_circuit_breaker: true,
+  probe_mode: 'tcp' as 'tcp' | 'icmp' | 'off',
   quota_gb: '',
   traffic_reset_day: 0,
   max_balance_streams: '2',
@@ -62,7 +63,7 @@ const installOpen = ref(false)
 const installNode = ref<EdgeNode | null>(null)
 const upgradingId = ref<number | null>(null)
 const upgradingAll = ref(false)
-const DEFAULT_UNINSTALL_COMMAND = 'bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent --uninstall'
+const DEFAULT_UNINSTALL_COMMAND = 'curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/uninstall-agent.sh | sh'
 const uninstallCommand = computed(() => installNode.value?.uninstall_command || DEFAULT_UNINSTALL_COMMAND)
 
 const STATUS_LABEL: Record<EdgeNodeStatus, string> = {
@@ -404,6 +405,7 @@ function openCreate() {
     auto_https: autoHttpsReady.value,
     enabled: true,
     auto_circuit_breaker: true,
+    probe_mode: 'tcp',
     quota_gb: '',
     traffic_reset_day: 0,
     max_balance_streams: '2',
@@ -437,6 +439,7 @@ function openEdit(node: EdgeNode) {
     auto_https: !!node.auto_https,
     enabled: node.enabled,
     auto_circuit_breaker: node.auto_circuit_breaker !== false,
+    probe_mode: (node.probe_mode === 'icmp' || node.probe_mode === 'off' ? node.probe_mode : 'tcp') as 'tcp' | 'icmp' | 'off',
     quota_gb: node.traffic_quota > 0 ? String(Math.round((node.traffic_quota / GB) * 100) / 100) : '',
     traffic_reset_day: node.traffic_reset_day || 0,
     max_balance_streams: String(node.max_balance_streams || 2),
@@ -491,6 +494,7 @@ async function saveForm() {
     auto_https: form.auto_https,
     enabled: form.enabled,
     auto_circuit_breaker: form.auto_circuit_breaker,
+    probe_mode: form.probe_mode,
     traffic_quota: quotaBytes,
     traffic_reset_day: quotaBytes > 0 ? Number(form.traffic_reset_day) || 0 : 0,
     max_balance_streams: maxBalance,
@@ -554,6 +558,8 @@ async function toggleEnabled(node: EdgeNode) {
       tls_mode: node.tls_mode,
       auto_https: !!node.auto_https,
       enabled: !node.enabled,
+      auto_circuit_breaker: node.auto_circuit_breaker !== false,
+      probe_mode: node.probe_mode || 'tcp',
       traffic_quota: node.traffic_quota,
       traffic_reset_day: node.traffic_reset_day,
       note: node.note,
@@ -817,16 +823,37 @@ async function resetNodeCircuit(node: EdgeNode) {
             </span>
           </div>
 
-          <div v-if="node.online && node.isp_health?.length" class="latency-row">
-            <span class="faint lat-label">三网连通{{ node.auto_circuit_breaker === false ? ' · 仅探测' : '' }}</span>
+          <div v-if="node.online && !node.is_master && node.probe_mode === 'off'" class="latency-row">
+            <span class="faint lat-label">三网连通</span>
+            <span class="lat-pill muted">已关闭主动探测</span>
+          </div>
+
+          <div v-else-if="node.online && node.isp_health?.length" class="latency-row">
+            <span class="faint lat-label">三网连通{{ !node.is_master && node.probe_mode === 'icmp' ? ' · ICMP' : '' }}{{ !node.is_master && node.auto_circuit_breaker === false ? ' · 仅探测' : '' }}</span>
             <span
               v-for="ih in node.isp_health"
               :key="ih.isp_group"
-              class="lat-pill"
-              :class="ispHealthTone(ih)"
-              :title="`${ih.isp_label} 北上广 TCP 探活 ${ih.reachable_count}/${ih.total_count} 通${ih.tripped ? ' · 已自动熔断切流' : ''}`"
+              class="isp-pill-wrap"
+              tabindex="0"
             >
-              {{ ispHealthText(ih) }}
+              <span class="lat-pill" :class="ispHealthTone(ih)">
+                {{ ispHealthText(ih) }}
+              </span>
+              <div class="isp-popover" role="tooltip">
+                <template v-if="ih.targets?.length">
+                  <div v-for="t in ih.targets" :key="t.target" class="isp-pop-row">
+                    <span class="isp-pop-city">{{ t.label || t.target }}</span>
+                    <span class="isp-pop-ms" :class="t.reachable && t.latency_ms > 0 ? latencyTone(t.latency_ms) : 'bad'">
+                      {{ t.reachable && t.latency_ms > 0 ? `${t.latency_ms}ms` : '不通' }}
+                    </span>
+                  </div>
+                </template>
+                <div v-else class="isp-pop-row">
+                  <span class="isp-pop-city">{{ ih.isp_label }}探活</span>
+                  <span class="isp-pop-ms">{{ ih.reachable_count }}/{{ ih.total_count }} 通</span>
+                </div>
+                <div v-if="ih.tripped" class="isp-pop-foot bad">已自动熔断切流</div>
+              </div>
             </span>
           </div>
 
@@ -870,11 +897,11 @@ async function resetNodeCircuit(node: EdgeNode) {
           </template>
           <template v-else>
             <UiButton
-              v-if="node.online && (node.any_circuit_tripped || (node.auto_circuit_breaker === false && node.isp_health?.some(h => h.reachable_count === 0)))"
+              v-if="node.online && node.probe_mode !== 'off' && (node.any_circuit_tripped || (node.auto_circuit_breaker === false && node.isp_health?.some(h => h.reachable_count === 0)))"
               size="sm"
               variant="accent"
               :loading="probingIspNodeId === node.id"
-              title="立即重新探测北上广三网 TCP 连通性"
+              :title="node.probe_mode === 'icmp' ? '立即重新探测北上广三网 ICMP Ping' : '立即重新探测北上广三网 TCP 连通性'"
               @click="probeNodeISP(node)"
             >
               <RefreshCw />立即复测
@@ -1033,7 +1060,19 @@ async function resetNodeCircuit(node: EdgeNode) {
               <RouterLink to="/settings?section=edge-https">前往配置 Cloudflare 从机自动 HTTPS →</RouterLink>
             </p>
           </div>
+          <UiField
+            label="三网探测方式"
+            for="en-probe-mode"
+            help="RFC 等屏蔽出站 TCP 的优化线路机建议选 ICMP Ping；不需主动探活的机房可关闭。"
+          >
+            <select id="en-probe-mode" v-model="form.probe_mode" class="select">
+              <option value="tcp">TCP 握手（默认 · 精准检测端口阻断）</option>
+              <option value="icmp">ICMP Ping（适合屏蔽出站 TCP 的优化线路机）</option>
+              <option value="off">关闭主动探测（仅按在线心跳、配额与时段分流）</option>
+            </select>
+          </UiField>
           <UiSwitch
+            v-if="form.probe_mode !== 'off'"
             v-model="form.auto_circuit_breaker"
             label="自动熔断"
             description="关闭后继续记录三网探测结果，节点仍按在线状态、配额和时段参与分流。"
@@ -1230,6 +1269,40 @@ async function resetNodeCircuit(node: EdgeNode) {
 .lat-pill.good { color: var(--good); background: var(--good-soft); }
 .lat-pill.warn { color: var(--warn); background: var(--warn-soft); }
 .lat-pill.bad { color: var(--bad); background: var(--bad-soft); }
+.lat-pill.muted { color: var(--text-3); background: var(--surface-2); font-family: inherit; }
+.isp-pill-wrap { position: relative; display: inline-flex; outline: none; cursor: default; }
+.isp-popover {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 7px);
+  transform: translateX(-50%) translateY(3px);
+  min-width: 118px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 40;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms var(--ease), transform 140ms var(--ease);
+}
+.isp-pill-wrap:hover .isp-popover,
+.isp-pill-wrap:focus-within .isp-popover {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.isp-pop-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; font-size: 12px; line-height: 1.35; white-space: nowrap; }
+.isp-pop-city { color: var(--text-2); font-weight: 500; }
+.isp-pop-ms { font-family: var(--mono); font-weight: 600; color: var(--text); }
+.isp-pop-ms.good { color: var(--good); }
+.isp-pop-ms.warn { color: var(--warn); }
+.isp-pop-ms.bad { color: var(--bad); }
+.isp-pop-foot { margin-top: 2px; padding-top: 4px; border-top: 1px solid var(--border); font-size: 11px; font-weight: 600; text-align: center; white-space: nowrap; }
+.isp-pop-foot.bad { color: var(--bad); }
 .upgrade-note { margin: 8px 0 0; font-size: 12px; }
 .upgrade-note.warn { color: var(--warn); }
 .upgrade-note.good { color: var(--good); }

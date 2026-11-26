@@ -1139,8 +1139,8 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 ReadWritePaths=${DATA_DIR}
 LimitNOFILE=65536
 
@@ -2941,8 +2941,8 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 LimitNOFILE=65536
 
 [Install]
@@ -3004,8 +3004,9 @@ do_agent() (
         if is_systemd && [ -f "$AGENT_SERVICE_FILE" ]; then
             as_root systemctl stop "$AGENT_SERVICE_NAME" 2>/dev/null || true
             as_root systemctl disable "$AGENT_SERVICE_NAME" 2>/dev/null || true
-            as_root rm -f -- "$AGENT_SERVICE_FILE"
-            as_root systemctl daemon-reload
+            as_root rm -f -- "$AGENT_SERVICE_FILE" "/etc/systemd/system/multi-user.target.wants/${AGENT_SERVICE_NAME}.service"
+            as_root systemctl daemon-reload 2>/dev/null || true
+            as_root systemctl reset-failed "$AGENT_SERVICE_NAME" 2>/dev/null || true
         fi
         if is_openrc && [ -f "/etc/init.d/${AGENT_SERVICE_NAME}" ]; then
             as_root rc-service "$AGENT_SERVICE_NAME" stop 2>/dev/null || true
@@ -3015,7 +3016,27 @@ do_agent() (
             as_root rm -f -- "/etc/init.d/${AGENT_SERVICE_NAME}"
         fi
         as_root rm -rf -- "$AGENT_CONFIG_DIR" "$AGENT_BIN_DIR"
-        ok "Meridian Edge Agent 已卸载"
+        as_root rm -f -- "/var/log/${AGENT_SERVICE_NAME}.log" "/run/${AGENT_SERVICE_NAME}.pid"
+        for leftover in /tmp/"${AGENT_SERVICE_NAME}"*; do
+            [ -e "$leftover" ] && as_root rm -rf -- "$leftover"
+        done
+        if [ ! -f "$SERVICE_FILE" ] && [ ! -x "${INSTALL_DIR}/${BIN_NAME}" ] && [ ! -d "$DATA_DIR" ]; then
+            if id "$SERVICE_USER" >/dev/null 2>&1; then
+                if command -v userdel >/dev/null 2>&1; then
+                    as_root userdel "$SERVICE_USER" 2>/dev/null || true
+                elif command -v deluser >/dev/null 2>&1; then
+                    as_root deluser "$SERVICE_USER" 2>/dev/null || true
+                fi
+            fi
+            if grep -q "^${SERVICE_GROUP}:" /etc/group 2>/dev/null; then
+                if command -v groupdel >/dev/null 2>&1; then
+                    as_root groupdel "$SERVICE_GROUP" 2>/dev/null || true
+                elif command -v delgroup >/dev/null 2>&1; then
+                    as_root delgroup "$SERVICE_GROUP" 2>/dev/null || true
+                fi
+            fi
+        fi
+        ok "Meridian Edge Agent 已彻底卸载清理完毕"
         exit 0
     fi
 
@@ -3059,7 +3080,7 @@ ENVEOF
         if as_root systemctl is-active --quiet "$AGENT_SERVICE_NAME"; then
             ok "从机 Agent 已启动（节点 #${AGENT_NODE_ID}，监听 ${AGENT_BIND}:${AGENT_PORT}）"
             info "查看日志: journalctl -u ${AGENT_SERVICE_NAME} -f"
-            info "卸载从机: bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/master/install.sh) agent --uninstall"
+            info "卸载从机: curl -fsSL https://raw.githubusercontent.com/${REPO}/master/uninstall-agent.sh | sh"
         else
             as_root systemctl status "$AGENT_SERVICE_NAME" --no-pager || true
             fail "从机 Agent 启动失败，请检查上述日志"
@@ -3071,7 +3092,7 @@ ENVEOF
         if as_root rc-service "$AGENT_SERVICE_NAME" status >/dev/null 2>&1; then
             ok "从机 Agent 已通过 OpenRC 启动（节点 #${AGENT_NODE_ID}，监听 ${AGENT_BIND}:${AGENT_PORT}）"
             info "查看日志: tail -f /var/log/${AGENT_SERVICE_NAME}.log"
-            info "卸载从机: bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/master/install.sh) agent --uninstall"
+            info "卸载从机: curl -fsSL https://raw.githubusercontent.com/${REPO}/master/uninstall-agent.sh | sh"
         else
             fail "从机 Agent 启动失败，请检查 /var/log/${AGENT_SERVICE_NAME}.log"
         fi
