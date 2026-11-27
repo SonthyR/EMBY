@@ -1,52 +1,149 @@
-# 云渡 Yundu
+<div align="center">
 
-**把 Emby 源站安全地分享给朋友：支持主从机三网智能分流与专属固定入口，看片全程经你的服务器就近中转，源站账号密码从不外泄。**
+<img src="web/static/favicon.svg" alt="云渡 Yundu" width="68" height="68" />
 
-云渡是一个单文件的 Emby 多站点反代与主从机分流面板，基于 [Meridian](https://github.com/snnabb/Meridian) v1.14.2 二次开发，采用纯 Go（零 CGO）+ Vue 3 + 嵌入式 SQLite 架构。
+# 云渡 · Yundu
 
-## 主要功能
+**单文件 Emby 多站点反代 & 主从机三网智能分流面板**
 
-- **分享账号与专属固定入口**：在面板里给朋友发账号，服务器用你保存的源站账号代为登录。
-  - **专属固定后缀**（如 `https://你的域名/ws`）：朋友在 Emby 客户端只需填这一个固定地址，无需为每个服务器单独添加地址
-  - **自助页拖拽切服 & 观影不中断切换**：朋友登录网页即可把想看的服务器拖到首位切换；正在看片时不会立即切断，看完关闭视频后自动切换
-  - **自助页网络自检 & 单设备踢人**：朋友可实时看到自己的地区/运营商、目标播放节点，若误开海外代理/VPN 会收到醒目提醒；管理员与朋友均支持按单台设备精确踢下线
-  - **仪表盘实时在线与观影监控**：一眼查看当前谁在看、用什么设备/归属地、走主机还是哪台从机
-  - **兑换码 / 卡密自助开号与续期**：后台批量生成续期码或开号兑换码；朋友在自助页输入续期码自动续期，或在登录页输入开号码自助注册并自动分配专属 `/后缀`
-  - **多源站账号自动负载均衡 & 故障切换**：同站点保存多个源站号时，自动挑活跃会话最少的号登录，遇 `401/403/429` 自动切换备用号
-  - **客户端访问限制 & 分享账号 TG 预警**：支持黑/白名单拦截异常下载器与刮削脚本（内置播放器预设）；分享账号临期、到期与流量达阈值自动推送 Telegram 告警
-  - 到期时间、续期、停用、删除；流量额度与每月固定日期自动清零
-  - 同时在线设备数上限（超出自动踢掉最久未用设备）、按账号合计限速
-  - 一键复制分享文案；被停用、过期、超额或踢下线的凭证立即本地拉黑并在源站注销
-  - **专属弹幕服务与按用户灵活分配**：管理端「站点 → 弹幕服务」可添加多个上游弹幕 API 并绑定指定从机出口（强绑定防泄露，从机离线自动拒绝绝不回落主机 IP）；弹幕源与 Emby 站点完全解耦，可在「分享账号」中按用户灵活分配任意弹幕源（跨站通用，看其他 Emby 服也能用）；每位用户拥有独立 `/dm/{id}/{token}` 链接，隐藏上游地址与密钥，未分配或账号到期、停用、超额时实时返回 `403` 自动失效，并支持单用户重置凭证；分享用户自助页提供独立「弹幕服务」卡片、一键复制与主流播放器填写指引
-- **主从机架构与轻量 Agent（兼容普通 VPS 与 NAT 小鸡）**：
-  - 同一个二进制内置 `meridian agent` 从机模式，无数据库、无面板，内存仅占约 15–25 MB，支持 systemd 与 Alpine OpenRC
-  - 添加从机默认只需填**名称 + 对外端口**，无需域名，首次心跳自动上报公网 IP 接入；支持 NAT 内外端口独立映射
-  - **健康监控、面板一键远程升级与 TG 告警**：从机实时上报内存、运行时长与各站点回源 TCP 延迟；面板可一键下发升级指令（SHA-256 校验原子替换自动重启）；从机离线、恢复与流量达到 80%/100% 自动推送 Telegram 告警
-  - 可选绑定主机泛域名下的子域名，从机通过心跳自动同步主机泛域名证书，在任意端口同端口支持 HTTP/HTTPS
-  - 控制面（登录、浏览、海报）默认留在主机，视频/音频播放流通过 AES-256-GCM 无状态票据 `307` 卸载至最优从机，流量、限速与封禁策略自动回传与同步；每个站点可按需设为**仅走主机**或**同源单 IP 全链路**（登录、接口、WebSocket、视频播放与注销全走同一最佳节点 IP，适合限制多 IP/跨区的严格 Emby 站）
-- **三网智能分流与地区访问控制**：
-  - 按**电信 / 联通 / 移动 / 其他**四个运营商分组拖拽调整主机与从机优先级，首位在线节点生效，离线或超额自动降级
-  - **禁止海外 / 非中国大陆 IP 连接 Emby**：一键拦截来自海外及港澳台（常见代理/梯子节点）的 Emby 客户端请求（返回 `403`），避免朋友忘关代理消耗双份流量，同时国内广电/教育网等小宽带不受误伤
-  - 四个运营商分组各自支持独立**禁止连接**开关；管理面板网页、朋友自助页、从机心跳及本机/局域网 IP 永远放行
-- **离线 IP 地区库（ip2region）**：
-  - 纯 Go 零外部依赖读取 `ip2region_v4.xdb` 与 `ip2region_v6.xdb`（IPv6 仅占 512 KB 索引内存），纯本地查询，不向第三方发送访客 IP
-  - 面板一键下载、多镜像源在线热更新（无需重启）与删除，内置 **IP 路由测试** 与请求日志归属地/运营商展示
-- **多站点反代与完善运维能力**：
-  - 路径、独立端口、子域名入口；主备线路自动切换；自动发现（支持 302/HLS/DASH）、手动回源、直连三种播放模式
-  - 账号备忘与到期提醒、流量统计与限速、请求日志、TLS 证书（含 Cloudflare 泛域名自动续期）、加密备份、Telegram Bot 管理、面板内一键更新
-  - 单个 Go 程序，内嵌 Vue 3 前端与 SQLite，无外部依赖
+把多台 Emby 源站与手里闲置的线路鸡 / NAT 小鸡整合成丝滑的观影网络：<br/>
+**源站账号永不外泄 · 电信/联通/移动智能分流 · 同源单 IP 防封 · 账号联动弹幕反代**
 
-## 一键安装（Linux）
+[![Release](https://img.shields.io/github/v/release/SonthyR/EMBY?style=flat-square&color=f95725&label=Release)](https://github.com/SonthyR/EMBY/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/SonthyR/EMBY/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/SonthyR/EMBY/actions/workflows/ci.yml)
+[![Docker](https://img.shields.io/badge/GHCR-yundu-2496ed?style=flat-square&logo=docker&logoColor=white)](https://github.com/SonthyR/EMBY/pkgs/container/yundu)
+[![Go](https://img.shields.io/badge/Go-1.26+-00add8?style=flat-square&logo=go&logoColor=white)](go.mod)
+[![License](https://img.shields.io/github/license/SonthyR/EMBY?style=flat-square&color=16a34a)](LICENSE)
 
-### 安装主机（管理面板 + 反代）
+[核心亮点](#核心亮点) · [界面预览](#界面预览) · [架构与分流](#架构与流量路径) · [快速部署](#快速部署) · [从机接入](#添加轻量从机vps--nat-小鸡) · [更新记录](CHANGELOG.md)
+
+</div>
+
+---
+
+## 为什么做云渡？
+
+- **手里有多台线路鸡 / NAT 小鸡，想按三网就近加速 Emby**：一台主控统一管理，从机仅一个轻量 Go Agent（内存约 `15–25 MB`，支持 Debian / Ubuntu / Alpine / NAT 端口映射），电信 / 联通 / 移动各自按优先级、负载均衡与分时避峰自动调度。
+- **想把 Emby 安全分享给亲友，不想暴露源站密码，也不想折腾多套地址**：给朋友发独立账号 + 专属固定后缀（如 `/alice`），源站由云渡代登；朋友在自助页拖拽即可无感切服（正在播放不中断，看完自动切），还能防朋友忘关海外代理烧双倍流量。
+- **遇到限 IP 的严格源站或赠送弹幕 API**：支持**同源单 IP 全链路**与**指定从机出口弹幕反代**（Fail-Closed 强绑定，从机离线直接拒绝，绝不回落主机 IP 泄露），且弹幕与分享账号有效期实时联动。
+
+---
+
+## 界面预览
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/isp-routes.png" alt="三网智能分流" />
+      <p align="center"><b>三网智能分流 & 禁止海外代理 IP</b><br/><sub>电信 / 联通 / 移动独立排序、负载均衡、分时避峰与阻断熔断</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/sites-danmaku.png" alt="站点与弹幕服务管理" />
+      <p align="center"><b>多站点反代 & 弹幕服务管理</b><br/><sub>弹幕源可绑定指定从机出口（强绑定防泄露），支持一键测通</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/share-users.png" alt="分享账号与按用户分配弹幕" />
+      <p align="center"><b>分享账号管理 & 按用户灵活分配弹幕</b><br/><sub>拖拽调整首选 Emby 服，弹幕源与站点解耦、跨站按人分配</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/share-self.png" alt="朋友自助页" />
+      <p align="center"><b>朋友自助页（/me）</b><br/><sub>客户端固定地址、拖拽切服、专属弹幕地址与播放器填写指引</sub></p>
+    </td>
+  </tr>
+</table>
+
+---
+
+## 核心亮点
+
+### 1. 主从机架构 & 三网智能分流（兼容普通 VPS 与 NAT 小鸡）
+- **极简轻量从机**：同一个单文件二进制内置 `meridian agent` 从机模式，无数据库、无面板，内存仅占约 `15–25 MB`，支持 `systemd` 与 Alpine `OpenRC`。
+- **NAT 友好 & 自动泛域名 HTTPS**：添加从机只需填**名称 + 对外端口**，首次心跳自动上报公网 IP 接入；可选绑定主机泛域名子域名，从机自动同步主控证书，任意端口同端口兼容 HTTP/HTTPS。
+- **三网独立调度**：按**电信 / 联通 / 移动 / 其他**四个运营商分组拖拽排序，支持**手动优先级**、**按排序阶梯填满的负载均衡**与**分时避峰策略**；内置基于纯 Go 零依赖离线 `ip2region`（IPv4 + IPv6）的本地路由识别，不向任何第三方上传访客 IP。
+- **三网主动阻断探测与自动熔断**：支持按单节点切换 **TCP 握手 / ICMP Ping / 关闭主动探测**（适配禁出站 TCP 的优化线路机），三地目标连续失败自动熔断切流并推送 Telegram 告警，恢复后自动复活。
+- **防误开代理烧流量**：一键**禁止海外 / 非中国大陆 IP 连接 Emby**（返回 `403`），避免亲友忘关 VPN/代理消耗双倍流量，同时面板网页、朋友自助页与从机心跳永远放行。
+- **高码率 4K 稳定转发**：主从机回源统一采用独立 **HTTP/1.1** 连接与 `128 KB` 转发缓冲，彻底避免多路 4K 并发挤占同一 HTTP/2 连接导致的卡顿与意外退出播放。
+
+### 2. 严格源站保护 & 弹幕服务反代
+- **同源单 IP 全链路模式**：针对限制多 IP / 跨区登录的严格 Emby 站，可将站点设为「同源单 IP 全链路」——登录、API、WebSocket、视频播放与注销全程经同一从机加密隧道（`/_yundu/egress` AES-256-GCM）出站，从机离线时 **Fail-Closed** 拒绝回落，绝不泄露主机 IP。
+- **多源站账号负载均衡与故障切换**：同一站点保存多个源站号时，自动选择活跃会话最少的账号代登，遇 `401 / 403 / 429` 自动切换备用号。
+- **专属弹幕服务（v1.5.10 新增）**：
+  - 管理端可配置多个上游弹幕 API（隐藏上游地址与密钥）并绑定指定从机出口（同样 Fail-Closed 防泄露，支持一键连通性测试）；
+  - **与 Emby 站点完全解耦**：在「分享账号」中可按用户灵活分配任意弹幕源（看其他 Emby 站点也能共用同一弹幕源）；
+  - 每位用户拥有独立 `/dm/{id}/{token}` 链接，**实时联动账号生命周期**——未分配、账号过期、停用或流量耗尽立即返回 `403`，支持单用户一键重置凭证；
+  - 分享用户自助页提供独立「弹幕服务」卡片、一键复制与 **SenPlayer / Forward / Hills / Yamby** 填写指引。
+
+### 3. 亲友分享账号 & 自助体验
+- **专属固定入口 + 无感切服**：为朋友分配专属后缀（如 `https://emby.example.com/alice`），客户端只需填这一个地址；朋友登录网页拖拽即可切换 Emby 服，**正在看片时不会中断，关闭视频后自动生效**。
+- **精细配额与风控**：有效期（含续期）、流量额度与每月固定重置日、同时在线设备上限、全局限速、客户端黑/白名单（防下载器与刮削脚本）、单设备精确踢下线、过期/超额自动本地拉黑并向源站注销。
+- **兑换码 / 卡密自助**：支持批量生成**续期码**与**开号兑换码**，朋友在自助页自助续期或在登录页凭码注册并自动分配专属后缀。
+- **完善运维**：仪表盘实时观影监控、内置单线程回国测速、从机面板一键远程升级（SHA-256 校验原子替换）、Cloudflare 泛域名证书自动续期、加密备份/还原、Telegram Bot 管理与告警。
+
+---
+
+## 架构与流量路径
+
+```mermaid
+flowchart LR
+    Client["Emby 客户端 / 播放器<br/>(SenPlayer / Forward / Hills / Yamby)"]
+    Master["云渡主控 Master<br/>面板 · 分享账号鉴权 · 三网路由决策"]
+    Edge["轻量从机 Agent (VPS / NAT)<br/>仅 ~20MB 内存 · 零数据库"]
+    Emby["上游 Emby 源站"]
+    Danmaku["上游弹幕 API<br/>(可限特定节点 IP)"]
+
+    Client -- "登录 / 海报 / 弹幕(/dm/...)" --> Master
+    Client -. "视频播放流 307 跳转直连<br/>(AES-256-GCM 票据)" .-> Edge
+    Master -- "全链路 / 弹幕加密出口隧道<br/>(Fail-Closed 防泄露)" --> Edge
+    Edge -- "独立 HTTP/1.1 回源" --> Emby
+    Edge -- "指定出口 IP 访问" --> Danmaku
+```
+
+---
+
+## 快速部署
+
+### 方式一：Docker Compose（推荐）
+
+首次启动时容器会自动生成 5 个独立随机密钥并持久化保存在 `./data/.meridian-secrets`，无需手动拼接复杂环境变量：
+
+```yaml
+services:
+  yundu:
+    image: ghcr.io/sonthyr/yundu:latest
+    container_name: yundu
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+```
+
+启动并查看首次初始化令牌（`SETUP_TOKEN`）：
+
+```bash
+docker compose up -d
+docker compose logs yundu
+```
+
+打开 `http://<服务器IP>:9090`，使用日志中打印的 `SETUP_TOKEN` 创建管理员账号即可开始使用（生产环境建议在前端反代 HTTPS 或在面板内直接配置域名与 TLS 证书）。
+
+> **升级镜像**：执行 `docker compose pull && docker compose up -d` 即可平滑升级，数据库与配置自动迁移保留。
+
+### 方式二：Linux 一键安装脚本（裸机 systemd）
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh)
 ```
 
-### 安装从机（轻量媒体中转节点）
+---
 
-在主机面板进入 **节点 → 添加从机**，填写名称和对外端口后直接复制生成的一键命令到目标 VPS / NAT 机器执行即可，命令格式如下：
+## 添加轻量从机（VPS / NAT 小鸡）
+
+在主控面板进入 **节点 → 添加从机**，填写**节点名称**与**对外端口**（NAT 机填外网映射端口，并按需指定监听端口），点击创建后直接复制面板生成的一键安装命令到目标服务器执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent \
@@ -56,34 +153,33 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.
   --port 19090
 ```
 
-卸载从机（不影响主机）：
+彻底卸载从机（兼容 Debian / Ubuntu / CentOS 与 Alpine `ash`，不影响主机）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh) agent --uninstall
+curl -fsSL https://raw.githubusercontent.com/SonthyR/EMBY/master/uninstall-agent.sh | sh
 ```
 
-需要先在 [Releases](https://github.com/SonthyR/EMBY/releases) 发布对应版本的程序。安装后的服务名、程序名和目录沿用 `meridian`（与上游一致，便于迁移）。Docker 镜像：`ghcr.io/sonthyr/yundu`。
+---
 
-## 从源码构建与运行
+## 从源码构建
 
-需要 Go 1.26.11 或更高版本。
+需要 Go `1.26.11+` 与 Node.js `22+`（如需修改前端 UI）：
 
 ```bash
-go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
+# 如修改了 ui/ 前端代码，先构建内嵌静态资源
+cd ui && npm ci && npx vite build && cd ..
+
+# 编译单文件二进制（零 CGO）
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 ```
 
-运行前需要设置独立密钥（只在首次部署时生成一次）：`JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY`、`MERIDIAN_SECRET_KEY`、`SETUP_TOKEN`，然后：
+裸跑二进制前请设置 5 个互不相同的 32+ 字节密钥：`JWT_SECRET`、`UPSTREAM_HEADER_KEY`、`DYNAMIC_ROUTE_KEY`、`MERIDIAN_SECRET_KEY`、`SETUP_TOKEN`，然后运行 `./yundu --port 9090 --db ./data/yundu.db`。更多说明见 [docs/wiki](docs/wiki)。
 
-```bash
-./yundu --port 9090 --db ./data/yundu.db
-```
+---
 
-打开 `http://127.0.0.1:9090`，用 `SETUP_TOKEN` 创建管理员。详细说明见 [docs/wiki](docs/wiki)（沿用上游文档，后续逐步改写）。
+## 版本与开源致谢
 
-## 版本
-
-最新发布：`v1.5.10` · [更新记录](CHANGELOG.md)
-
-## 许可与致谢
-
-MIT License。云渡基于 snnabb 的 Meridian（MIT）开发，保留原作者版权声明，见 [LICENSE](LICENSE)。上游原始说明见 [docs/MERIDIAN-README.md](docs/MERIDIAN-README.md)。
+- **最新发布**：[`v1.5.10`](https://github.com/SonthyR/EMBY/releases/tag/v1.5.10) · [完整更新记录](CHANGELOG.md)
+- **开源协议**：[MIT License](LICENSE)
+- **致谢上游**：云渡基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) `v1.14.2`（MIT）二次开发，完整保留原作者版权声明；上游原始说明见 [docs/MERIDIAN-README.md](docs/MERIDIAN-README.md)。
+- **定位说明**：本项目面向个人多线路 Emby 体验优化与亲友小范围分享，请遵守所在地区法律法规及上游媒体服务器的使用条款。
