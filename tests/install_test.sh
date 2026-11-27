@@ -978,6 +978,13 @@ exit 1
 MOCKBIN
 chmod 0755 "$failing_binary"
 if (
+    as_root() {
+        if [ "$1" = systemctl ]; then
+            systemctl "${@:2}"
+            return $?
+        fi
+        "${ROOT_PREFIX[@]}" "$@"
+    }
     is_systemd() { return 0; }
     service_is_active() { return 0; }
     systemctl() {
@@ -1310,6 +1317,13 @@ exit 1
 MOCKBIN
 chmod 0755 "$retry_failing_binary"
 if (
+    as_root() {
+        if [ "$1" = systemctl ]; then
+            systemctl "${@:2}"
+            return $?
+        fi
+        "${ROOT_PREFIX[@]}" "$@"
+    }
     is_systemd() { return 0; }
     service_is_active() { return 0; }
     systemctl() { return 0; }
@@ -1563,6 +1577,7 @@ BADCOSIGN
     UPDATE_SNAPSHOT_RESTORED=0
     UPDATE_BINARY_CHANGED=0
     UPDATE_SERVICE_CHANGED=0
+    as_root() { "$@"; }
     is_systemd() { return 0; }
     systemctl() {
         case "$*" in

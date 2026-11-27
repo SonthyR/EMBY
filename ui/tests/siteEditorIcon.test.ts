@@ -70,7 +70,7 @@ describe('SiteEditor 站点图标 CSP 转换与账号头像预览确认 (v1.8.0)
     })
 
     // Stub Image + Canvas so jsdom can complete data: URL decoding deterministically.
-    let resolveImgLoad: (() => void) | null = null
+    const imgLoaders: Array<() => void> = []
     const seenImageSrcs: string[] = []
     class FakeImage {
       naturalWidth = 512
@@ -79,7 +79,7 @@ describe('SiteEditor 站点图标 CSP 转换与账号头像预览确认 (v1.8.0)
       onerror: (() => void) | null = null
       set src(v: string) {
         seenImageSrcs.push(v)
-        resolveImgLoad = () => this.onload?.()
+        imgLoaders.push(() => this.onload?.())
       }
     }
     vi.stubGlobal('Image', FakeImage as unknown as typeof Image)
@@ -120,7 +120,7 @@ describe('SiteEditor 站点图标 CSP 转换与账号头像预览确认 (v1.8.0)
       // Switch drawer to Site B BEFORE Site A's async conversion/upload completes.
       await wrapper.setProps({ site: baseSiteB })
       await flushPromises()
-      resolveImgLoad?.()
+      imgLoaders[0]?.()
       await flushPromises()
 
       // Upload MUST still target Site A (11), NOT Site B (22), and Site B stays at default icon!

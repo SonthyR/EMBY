@@ -1309,11 +1309,13 @@ release_update_lock() {
 }
 
 stop_service_and_wait() {
-    local timeout="${1:-30}" i=0 props active_state main_pid
+    local timeout="${1:-30}" i=0 stop_rc=0 props active_state main_pid
     if ! is_systemd; then
         return 0
     fi
-    if ! as_root systemctl stop "$SERVICE_NAME"; then
+    as_root systemctl stop "$SERVICE_NAME" || stop_rc=$?
+    # Exit code 5 means the unit is not loaded; still verify ActiveState/MainPID below.
+    if [ "$stop_rc" -ne 0 ] && [ "$stop_rc" -ne 5 ]; then
         return 1
     fi
     while [ "$i" -lt "$timeout" ]; do
