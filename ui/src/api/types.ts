@@ -4,6 +4,7 @@ export interface AuthCheck {
   username?: string
   jwt_secret_ephemeral?: boolean
   mode?: string
+  app_version?: string
 }
 
 export interface Site {

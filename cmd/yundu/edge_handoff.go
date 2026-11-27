@@ -176,6 +176,57 @@ func rewriteEmbyRequestToken(r *http.Request, oldToken, newToken string) {
 	}
 }
 
+const defaultShareHandoffUserAgent = "Emby/4.8.10"
+
+type shareHandoffClientHeadersKey struct{}
+
+type shareHandoffClientHeaders struct {
+	UserAgent     string
+	ClientVersion string
+}
+
+func extractShareHandoffClientHeaders(r *http.Request) shareHandoffClientHeaders {
+	if r == nil {
+		return shareHandoffClientHeaders{}
+	}
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	ver := strings.TrimSpace(r.Header.Get("X-Emby-Client-Version"))
+	if ver == "" {
+		ver = strings.TrimSpace(embyRequestAuthorizationAttribute(r, "Version"))
+	}
+	return shareHandoffClientHeaders{
+		UserAgent:     ua,
+		ClientVersion: ver,
+	}
+}
+
+func withShareHandoffClientHeaders(ctx context.Context, r *http.Request) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hdrs := extractShareHandoffClientHeaders(r)
+	if hdrs.UserAgent == "" && hdrs.ClientVersion == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, shareHandoffClientHeadersKey{}, hdrs)
+}
+
+func shareHandoffClientHeadersFromContext(ctx context.Context) shareHandoffClientHeaders {
+	if ctx == nil {
+		return shareHandoffClientHeaders{}
+	}
+	hdrs, _ := ctx.Value(shareHandoffClientHeadersKey{}).(shareHandoffClientHeaders)
+	return hdrs
+}
+
+func sanitizeShareHandoffUserAgent(ua string) string {
+	ua = strings.TrimSpace(strings.NewReplacer("\r", "", "\n", "").Replace(ua))
+	if ua == "" || strings.HasPrefix(strings.ToLower(ua), "go-http-client/") {
+		return defaultShareHandoffUserAgent
+	}
+	return ua
+}
+
 func quoteEmbyAuthValue(v, fallback string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -210,15 +261,18 @@ func newShareLoginFunc(
 		if err != nil {
 			return "", "", 0, err
 		}
+		clientHdrs := shareHandoffClientHeadersFromContext(ctx)
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", "application/json")
 		request.Header.Set("Accept-Encoding", "identity")
+		request.Header.Set("User-Agent", sanitizeShareHandoffUserAgent(clientHdrs.UserAgent))
 		authClient := quoteEmbyAuthValue(clientName, "Yundu")
 		authDevice := quoteEmbyAuthValue(deviceName, "Yundu")
 		authDeviceID := quoteEmbyAuthValue(deviceID, "yundu-share-handoff")
+		authVersion := quoteEmbyAuthValue(clientHdrs.ClientVersion, "4.8.10")
 		request.Header.Set("X-Emby-Authorization", fmt.Sprintf(
 			`MediaBrowser Client="%s", Device="%s", DeviceId="%s", Version="%s"`,
-			authClient, authDevice, authDeviceID, appVersion,
+			authClient, authDevice, authDeviceID, authVersion,
 		))
 		applyUAHeaderPolicy(request.Header, policy)
 		headers.apply(request.Header, &endpoint)
@@ -416,7 +470,7 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	// Step 1: Cleanly log out the old upstream token from the old node first so
 	// the upstream Emby server never sees two IPs active simultaneously.
 	if eval.currentRoutable && inst.shareLogout != nil && entry.upstreamToken != "" {
-		logoutCtx, logoutCancel := context.WithTimeout(context.Background(), shareLogoutTimeout)
+		logoutCtx, logoutCancel := context.WithTimeout(withShareHandoffClientHeaders(context.Background(), r), shareLogoutTimeout)
 		if oldNodeID > 0 {
 			if oldDecision, ok := rt.pm.edges.nodeDecisionByID(oldNodeID); ok {
 				logoutCtx = withEdgeEgressTarget(logoutCtx, edgeEgressTarget{
@@ -434,7 +488,7 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	}
 
 	// Step 2: Re-authenticate with the exact same upstream account via the new node.
-	loginCtx, loginCancel := context.WithTimeout(ctx, shareHandoffLoginTimeout)
+	loginCtx, loginCancel := context.WithTimeout(withShareHandoffClientHeaders(ctx, r), shareHandoffLoginTimeout)
 	if eval.targetLockedID > 0 {
 		loginCtx = withEdgeEgressTarget(loginCtx, edgeEgressTarget{
 			NodeID:    eval.targetDecision.NodeID,

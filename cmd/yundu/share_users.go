@@ -916,7 +916,7 @@ func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Reques
 			_ = rt.revokeByHash(hash)
 			return 0, http.StatusServiceUnavailable, "暂无可用服务器"
 		}
-		if status, msg := rt.handoffPersonalRouteSite(r.Context(), hash, activeSite, clientIP); status != 0 {
+		if status, msg := rt.handoffPersonalRouteSite(withShareHandoffClientHeaders(r.Context(), r), hash, activeSite, clientIP); status != 0 {
 			return 0, status, msg
 		}
 		return activeSite, 0, ""
@@ -2318,8 +2318,11 @@ func newShareLogoutFunc(transport http.RoundTripper, target *url.URL, policy UAH
 		if err != nil {
 			return err
 		}
+		clientHdrs := shareHandoffClientHeadersFromContext(ctx)
+		request.Header.Set("User-Agent", sanitizeShareHandoffUserAgent(clientHdrs.UserAgent))
 		request.Header.Set("X-Emby-Token", token)
-		request.Header.Set("X-Emby-Authorization", fmt.Sprintf(`MediaBrowser Client="Yundu", Device="Yundu", DeviceId="yundu-share", Version="%s", Token="%s"`, appVersion, token))
+		authVersion := quoteEmbyAuthValue(clientHdrs.ClientVersion, "4.8.10")
+		request.Header.Set("X-Emby-Authorization", fmt.Sprintf(`MediaBrowser Client="Yundu", Device="Yundu", DeviceId="yundu-share", Version="%s", Token="%s"`, authVersion, token))
 		applyUAHeaderPolicy(request.Header, policy)
 		headers.apply(request.Header, &endpoint)
 		response, err := (&http.Client{Transport: transport, Timeout: shareLogoutTimeout}).Do(request)

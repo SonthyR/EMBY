@@ -1452,10 +1452,11 @@ func TestStaticHandlerDisablesCaching(t *testing.T) {
 func TestSourceVersionMetadataIsConsistent(t *testing.T) {
 	cacheVersion := strings.TrimPrefix(appVersion, "v")
 	for path, expected := range map[string]string{
-		"CHANGELOG.md":          "## " + appVersion,
-		"Dockerfile":            "ARG VERSION=" + appVersion,
-		"README.md":             "最新发布：`" + appVersion + "`",
-		"web/static/index.html": `id="sidebar-version">` + appVersion,
+		"CHANGELOG.md":             "## " + appVersion,
+		"Dockerfile":               "ARG VERSION=" + appVersion,
+		"README.md":                "最新发布：`" + appVersion + "`",
+		"web/static/index.html":    `id="sidebar-version">` + appVersion,
+		"ui/src/stores/session.ts": "appVersion: '" + appVersion + "'",
 	} {
 		content, err := os.ReadFile(repositoryFilePath(t, path))
 		if err != nil {

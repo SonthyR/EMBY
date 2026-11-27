@@ -484,3 +484,149 @@ func TestShareMaxConcurrentStreamsLimit(t *testing.T) {
 		t.Fatalf("Device 2 stream after Device 1 stopped = %d, want 200", dev2RetryRes.StatusCode)
 	}
 }
+
+func TestSeamlessSiteSwitchPassthroughForwardsClientUserAgent(t *testing.T) {
+	app := newTestApp(t)
+	var mu sync.Mutex
+	var loginUA, loginAuth, logoutUA string
+
+	embyA := newFakeSeamlessEmby(t, "alpha", "uid-alpha-1", "srv-alpha", "tok-alpha", false)
+	embyB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ua := r.Header.Get("User-Agent")
+		// Simulate strict nginx/WAF upstreams (such as rfc.uhdnow.com) that return
+		// 403 Forbidden whenever a request carries Go's default HTTP client UA.
+		if ua == "" || strings.HasPrefix(strings.ToLower(ua), "go-http-client/") {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+		p := strings.ToLower(strings.TrimRight(r.URL.Path, "/"))
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/users/authenticatebyname"):
+			mu.Lock()
+			loginUA = ua
+			loginAuth = r.Header.Get("X-Emby-Authorization")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"AccessToken": "tok-beta-strict",
+				"ServerId":    "srv-beta-strict",
+				"User":        map[string]any{"Id": "uid-beta-strict", "Name": "real-beta"},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/sessions/logout"):
+			mu.Lock()
+			logoutUA = ua
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			if r.Header.Get("X-Emby-Token") != "tok-beta-strict" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"server": "beta-strict", "ua": ua})
+		}
+	}))
+	t.Cleanup(embyB.Close)
+
+	siteA := startTaggedShareSite(t, app, "Alpha", "alpha", embyA.server.URL)
+	portB := freePort(t)
+	releasePort(portB)
+	siteB, err := app.db.CreateSiteRecord(Site{
+		Name:         "StrictBeta",
+		ListenPort:   portB,
+		IngressMode:  ingressModePort,
+		TargetURL:    embyB.URL,
+		PlaybackMode: "direct",
+		StreamHosts:  "[]",
+		UAMode:       "passthrough",
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateSiteRecord(StrictBeta): %v", err)
+	}
+	if _, err := app.db.saveSiteAccount(siteB.ID, 0, SiteAccountInput{
+		Username: "real-beta",
+		Password: "pass-beta",
+	}); err != nil {
+		t.Fatalf("saveSiteAccount(StrictBeta): %v", err)
+	}
+	if err := app.pm.StartSite(*siteB); err != nil {
+		t.Fatalf("StartSite(StrictBeta): %v", err)
+	}
+	t.Cleanup(func() { _ = app.pm.StopSite(siteB.ID) })
+
+	input, err := app.normalizeShareUserInput(ShareUserInput{
+		Username:    "bob",
+		Password:    "pass1234",
+		RoutePrefix: "bob",
+		Sites:       []ShareUserSiteInput{{SiteID: siteA.ID}, {SiteID: siteB.ID}},
+	}, 0, true)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	userID, err := app.saveShareUser(0, input)
+	if err != nil {
+		t.Fatalf("saveShareUser: %v", err)
+	}
+	app.reloadShareUsers()
+	panel := newPersonalSharePanelServer(t, app)
+
+	// 1. Login on Site A.
+	resp, _ := doShareLogin(t, panel.URL+"/bob", "bob", "pass1234")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial login = %d", resp.StatusCode)
+	}
+
+	// 2. Switch primary site to Site B (passthrough + strict WAF).
+	if _, err := app.db.db.Exec(`UPDATE share_user_sites SET sort_order=1 WHERE share_user_id=? AND site_id=?`, userID, siteB.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE share_user_sites SET sort_order=2 WHERE share_user_id=? AND site_id=?`, userID, siteA.ID); err != nil {
+		t.Fatal(err)
+	}
+	app.reloadShareUsers()
+	app.pm.shares.reconcileSiteSwitch(userID, false)
+
+	// 3. Refresh from a real player UA (Hills Windows/1.7.2): must pass WAF and succeed.
+	const playerUA = "Hills Windows/1.7.2 (windows; 19041.vb_release.191206-1406)"
+	req, _ := http.NewRequest(http.MethodGet, panel.URL+"/bob/Users/uid-alpha-1/Views", nil)
+	req.Header.Set("User-Agent", playerUA)
+	req.Header.Set("X-Emby-Token", "tok-alpha")
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Hills", Device="PC", DeviceId="dev-hills", Version="1.7.2", Token="tok-alpha"`)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("seamless switch to strict site: %v", err)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("seamless switch to strict passthrough site failed: %d %s", res.StatusCode, string(raw))
+	}
+	mu.Lock()
+	gotLoginUA := loginUA
+	gotLoginAuth := loginAuth
+	mu.Unlock()
+	if gotLoginUA != playerUA {
+		t.Fatalf("silent login User-Agent = %q, want %q", gotLoginUA, playerUA)
+	}
+	if !strings.Contains(gotLoginAuth, `Version="1.7.2"`) {
+		t.Fatalf("silent login X-Emby-Authorization = %q, want Version=\"1.7.2\"", gotLoginAuth)
+	}
+
+	// 4. Verify background logout from Site B never leaks Go-http-client UA either.
+	app.pm.shares.logoutUpstream(siteB.ID, "tok-beta-strict", 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := logoutUA
+		mu.Unlock()
+		if got != "" {
+			if strings.HasPrefix(strings.ToLower(got), "go-http-client/") {
+				t.Fatalf("logout leaked Go-http-client UA: %q", got)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("expected Site B upstream logout request to pass WAF with non-Go User-Agent")
+}

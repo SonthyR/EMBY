@@ -584,6 +584,7 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 		"setup_token_required": needsSetup,
 		"authenticated":        authenticated,
 		"username":             username,
+		"app_version":          appVersion,
 	})
 }
 

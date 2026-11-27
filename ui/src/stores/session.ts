@@ -9,6 +9,7 @@ export const session = reactive({
   role: 'admin' as Role,
   username: '',
   ephemeralSecret: false,
+  appVersion: 'v1.6.1',
 })
 
 export async function checkSession() {
@@ -16,6 +17,7 @@ export async function checkSession() {
   try {
     const status = await authApi.check()
     session.ephemeralSecret = !!status.jwt_secret_ephemeral
+    if (status.app_version) session.appVersion = status.app_version
     if (status.needs_setup) {
       session.phase = 'setup'
       return
