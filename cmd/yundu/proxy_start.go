@@ -237,6 +237,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					}
 				}
 			}
+			if _, isPersonalRoute := shareRouteUserFromContext(proxyReq.In.Context()); isPersonalRoute && proxyReq.In.URL != nil {
+				if isEmbySystemInfoPath(proxyReq.In.URL.Path) || isEmbyUserIdentityPath(proxyReq.In.URL.Path) {
+					proxyReq.Out.Header.Set("Accept-Encoding", "identity")
+				}
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// A direct playback redirect must retain its external URL. Applying
@@ -244,6 +249,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if site.MainVideoStreamMode == mainVideoStreamModeDirect && resp.Request != nil && mainVideoDirectFallbackTarget(resp.Request.Context()) != nil {
 				stripPanelSessionSetCookies(resp.Header)
 				return nil
+			}
+			if resp.Request != nil && pm.shares != nil {
+				if routeUserID, isPersonalRoute := shareRouteUserFromContext(resp.Request.Context()); isPersonalRoute {
+					virtualServerID := pm.shares.personalVirtualServerID(routeUserID)
+					edgeCtx := edgeRequestContextFrom(resp.Request.Context())
+					clientUID, upstreamUID := pm.shares.sessionUIDPair(edgeCtx.shareTokenHash)
+					if err := rewritePersonalShareMetadataResponse(resp, target.Path, virtualServerID, clientUID, upstreamUID); err != nil {
+						return err
+					}
+				}
 			}
 			dynamicResponse := responseIsDynamic(resp)
 			expectedSource := dynamicResponseExpectedStructuredSource(resp)
@@ -455,6 +470,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 		if shareSessionHash != "" && pm.shares != nil {
 			pm.shares.applyUpstreamToken(r, shareSessionHash)
+			pm.shares.applyUpstreamUserID(r, shareSessionHash)
 			if isShareClientLogoutRequest(r) {
 				defer pm.shares.dropLocalSession(shareSessionHash)
 			}

@@ -153,8 +153,10 @@ export interface ShareUser {
   traffic_used: number
   status: ShareStatus
   session_count: number
+  active_streams?: number
   draining_sessions?: number
   max_devices: number
+  max_concurrent_streams?: number
   speed_limit: number
   traffic_reset_day: number
   next_reset_at?: string
@@ -177,6 +179,7 @@ export interface ShareUserInput {
   expires_at: string
   traffic_quota: number
   max_devices: number
+  max_concurrent_streams: number
   speed_limit: number
   traffic_reset_day: number
   sites: { site_id: number; site_account_id: number }[]

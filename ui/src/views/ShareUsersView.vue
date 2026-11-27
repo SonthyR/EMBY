@@ -311,7 +311,10 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
                 <UiProgress v-if="user.traffic_quota" :value="user.traffic_used" :max="user.traffic_quota" />
               </span>
               <span class="num expiry" role="cell" :class="expiryText(user).tone">{{ expiryText(user).text }}</span>
-              <span class="num devices" role="cell">{{ user.session_count }}<span class="faint">{{ user.max_devices ? ` / ${user.max_devices}` : '' }}</span></span>
+              <span class="num devices" role="cell">
+                <span>{{ user.session_count }}<span class="faint">{{ user.max_devices ? ` / ${user.max_devices}` : '' }}</span></span>
+                <small v-if="user.max_concurrent_streams || user.active_streams" class="streams-sub">{{ user.active_streams || 0 }}{{ user.max_concurrent_streams ? `/${user.max_concurrent_streams}` : '' }} 播</small>
+              </span>
               <span class="act" role="cell">
                 <UiButton variant="ghost" size="sm" icon aria-label="复制分享信息" title="复制分享信息" @click.stop="copyShare(user)"><Copy /></UiButton>
               </span>
@@ -493,6 +496,8 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
 
 .traffic { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .expiry, .devices { font-size: 13px; font-weight: 500; }
+.devices { display: flex; flex-direction: column; gap: 2px; line-height: 1.25; }
+.streams-sub { font-size: 11px; color: var(--good); font-weight: 600; }
 .expiry.warn { color: var(--warn); }
 .expiry.bad { color: var(--bad); }
 .act { opacity: 0.45; transition: opacity var(--dur) var(--ease); }

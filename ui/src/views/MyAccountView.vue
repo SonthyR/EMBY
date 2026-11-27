@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ArrowUpToLine, Copy, GripVertical, LogOut, MessageSquareText, MonitorSmartphone, Moon, ShieldBan, Sun, SunMoon, Wifi, X } from '@lucide/vue'
+import { ArrowUpToLine, Copy, GripVertical, LogOut, MessageSquareText, MonitorSmartphone, Moon, RefreshCw, ShieldBan, Sun, SunMoon, Wifi, X } from '@lucide/vue'
 import logo from '@/assets/logo.svg'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
@@ -21,6 +21,7 @@ const draggingId = ref<number | null>(null)
 const dragOverId = ref<number | null>(null)
 const dragOrderBefore = ref<number[]>([])
 const savingOrder = ref(false)
+const switchedNotice = ref<{ siteName: string; draining: boolean } | null>(null)
 const kickingSessionId = ref('')
 let touchDragActive = false
 
@@ -97,11 +98,14 @@ async function commitOrder(previousIds: number[], previousActiveId?: number) {
     const res = await meApi.reorderSites(nextIds)
     me.value = res
     const activeName = res.active_site_name || res.servers.find(s => s.active)?.name || ''
+    const activeChanged = !!res.active_site_id && res.active_site_id !== previousActiveId
     if (res.draining > 0 && activeName) {
-      toast.success(`已将「${activeName}」设为首选，当前视频关闭后自动生效`)
+      switchedNotice.value = { siteName: activeName, draining: true }
+      toast.success(`已将「${activeName}」设为首选，当前视频播完后回首页下拉刷新即可切换`)
+    } else if (hasPersonalRoute.value && (activeChanged || (res.seamless || 0) > 0) && activeName) {
+      switchedNotice.value = { siteName: activeName, draining: false }
+      toast.success(`已切换为「${activeName}」，回客户端首页下拉刷新即可生效（无需重登）`)
     } else if (res.revoked > 0 && activeName) {
-      toast.success(`已切换为「${activeName}」，回客户端重新登录即可`)
-    } else if (hasPersonalRoute.value && res.active_site_id && res.active_site_id !== previousActiveId && activeName) {
       toast.success(`已切换为「${activeName}」，回客户端重新登录即可`)
     } else {
       toast.success('服务器顺序已更新')
@@ -288,7 +292,8 @@ async function changePassword() {
 
           <dl class="pass-facts">
             <div><dt>有效期</dt><dd>{{ expiry.main }}<small v-if="expiry.sub">{{ expiry.sub }}</small></dd></div>
-            <div><dt>在线设备</dt><dd class="num">{{ me.session_count }}<small>{{ me.max_devices ? `最多 ${me.max_devices} 台` : '不限台数' }}</small></dd></div>
+            <div><dt>登录设备</dt><dd class="num">{{ me.session_count }}<small>{{ me.max_devices ? `最多 ${me.max_devices} 台` : '不限台数' }}</small></dd></div>
+            <div><dt>同时播放</dt><dd class="num">{{ me.active_streams || 0 }}<small>{{ me.max_concurrent_streams ? `最多 ${me.max_concurrent_streams} 路` : '不限路数' }}</small></dd></div>
             <div><dt>速率限制</dt><dd>{{ me.speed_limit ? `${me.speed_limit} Mbps` : '不限速' }}</dd></div>
           </dl>
         </section>
@@ -323,20 +328,37 @@ async function changePassword() {
         <template v-if="hasPersonalRoute">
           <section class="bento-section">
             <h2>客户端固定地址</h2>
-            <p class="faint hint">在 Emby 客户端里只需填写这一个地址，用你的账号密码登录。想换 Emby 服时直接把想看的服拖到下方第 1 位即可。</p>
+            <p class="faint hint">在 Emby 客户端里只需填写这一个地址，用你的账号密码登录。想换 Emby 服时把想看的服拖到下方第 1 位，回播放器首页下拉刷新即可无感生效，无需重新登录。</p>
             <div class="fixed-addr">
               <span class="mono">{{ fixedAddress }}</span>
               <UiButton variant="primary" size="sm" @click="copy(fixedAddress)"><Copy />复制地址</UiButton>
             </div>
-            <p v-if="me.draining_sessions" class="drain-note">
-              有设备正在播放视频，不会立即切断；关闭视频后将自动切换为「{{ me.active_site_name || '新服务器' }}」，届时在客户端重新登录即可。
+            <div v-if="switchedNotice" class="switch-guide" role="status">
+              <RefreshCw class="switch-ico" />
+              <div class="switch-body">
+                <strong>
+                  {{ switchedNotice.draining ? `已预约切换至「${switchedNotice.siteName}」` : `已将「${switchedNotice.siteName}」设为首选` }}
+                </strong>
+                <p>
+                  <template v-if="switchedNotice.draining">
+                    当前正在播放的视频不会中断；播完退出后回到播放器首页下拉刷新，即可自动进入新片库（无需重新登录）。
+                  </template>
+                  <template v-else>
+                    直接切回播放器，退回首页下拉刷新即可看到新片库，无需重新登录。若当前停留在旧片详情页，请先返回首页再刷新。
+                  </template>
+                </p>
+              </div>
+              <button type="button" class="switch-close" aria-label="关闭提示" @click="switchedNotice = null"><X /></button>
+            </div>
+            <p v-else-if="me.draining_sessions" class="drain-note">
+              有设备正在播放视频，不会立即切断；关闭视频后回首页下拉刷新即可自动切换为「{{ me.active_site_name || '新服务器' }}」，无需重新登录。
             </p>
           </section>
 
           <section class="bento-section">
             <div class="block-head">
               <h2>我的 Emby 服务器</h2>
-              <span v-if="canReorder" class="drag-hint">按住拖拽 · 第 1 位为首选生效</span>
+              <span v-if="canReorder" class="drag-hint">拖拽排序 · 第 1 位免重登无感生效</span>
             </div>
             <p v-if="!me.servers?.length" class="faint none">暂无可用服务器</p>
             <TransitionGroup v-else name="list" tag="ul" class="sortable-servers">
@@ -375,7 +397,7 @@ async function changePassword() {
                   <span class="server-name">{{ server.name }}</span>
                   <small v-if="server.active" class="server-state good"><span class="dot good" />当前生效中</small>
                   <small v-else-if="!server.enabled" class="faint">暂不可用</small>
-                  <small v-else class="faint">拖到第 1 位即可切换</small>
+                  <small v-else class="faint">拖到第 1 位即可无感切换</small>
                 </div>
                 <UiButton
                   v-if="index > 0 && server.enabled"
@@ -578,7 +600,7 @@ async function changePassword() {
 
 .pass-facts {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin: 18px 0 0;
 }
@@ -669,6 +691,25 @@ h2 { margin: 0; font-size: 15.5px; font-weight: 700; letter-spacing: -0.015em; }
 .dm-guide summary::before { content: '▸ '; color: var(--accent); }
 .dm-guide[open] summary::before { content: '▾ '; }
 .dm-guide ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; line-height: 1.55; }
+.switch-guide {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--good) 36%, var(--border));
+  background: var(--good-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.switch-ico { width: 15px; height: 15px; color: var(--good); flex: 0 0 15px; margin-top: 2px; }
+.switch-body { flex: 1; min-width: 0; }
+.switch-body strong { display: block; color: var(--good); font-size: 13px; margin-bottom: 2px; }
+.switch-body p { margin: 0; color: var(--text-2); }
+.switch-close { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; flex: 0 0 22px; }
+.switch-close:hover { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--text); }
+.switch-close svg { width: 13px; height: 13px; }
 .drain-note {
   margin: 10px 0 0;
   padding: 10px 12px;

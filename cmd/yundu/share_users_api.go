@@ -36,11 +36,13 @@ type ShareUser struct {
 	ExpiresAt        string               `json:"expires_at"`
 	TrafficQuota     int64                `json:"traffic_quota"`
 	TrafficUsed      int64                `json:"traffic_used"`
-	Status           string               `json:"status"`
-	SessionCount     int                  `json:"session_count"`
-	DrainingSessions int                  `json:"draining_sessions,omitempty"`
-	MaxDevices       int                  `json:"max_devices"`
-	SpeedLimit       int                  `json:"speed_limit"`
+	Status               string               `json:"status"`
+	SessionCount         int                  `json:"session_count"`
+	ActiveStreams        int                  `json:"active_streams"`
+	DrainingSessions     int                  `json:"draining_sessions,omitempty"`
+	MaxDevices           int                  `json:"max_devices"`
+	MaxConcurrentStreams int                  `json:"max_concurrent_streams"`
+	SpeedLimit           int                  `json:"speed_limit"`
 	ResetDay         int                  `json:"traffic_reset_day"`
 	NextResetAt      string               `json:"next_reset_at,omitempty"`
 	ActiveSiteID     int64                `json:"active_site_id,omitempty"`
@@ -65,9 +67,10 @@ type ShareUserInput struct {
 	Note         string               `json:"note"`
 	Enabled      *bool                `json:"enabled"`
 	ExpiresAt    string               `json:"expires_at"`
-	TrafficQuota int64                `json:"traffic_quota"`
-	MaxDevices   int                  `json:"max_devices"`
-	SpeedLimit   int                  `json:"speed_limit"`
+	TrafficQuota         int64                `json:"traffic_quota"`
+	MaxDevices           int                  `json:"max_devices"`
+	MaxConcurrentStreams int                  `json:"max_concurrent_streams"`
+	SpeedLimit           int                  `json:"speed_limit"`
 	ResetDay         int                  `json:"traffic_reset_day"`
 	Sites            []ShareUserSiteInput `json:"sites"`
 	DanmakuSourceIDs *[]int64             `json:"danmaku_source_ids"`
@@ -87,8 +90,8 @@ func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
-	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, danmaku_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
-		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.danmakuToken, &item.CreatedAt, &item.UpdatedAt)
+	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, max_concurrent_streams, traffic_reset_day, speed_limit, portal_token, danmaku_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
+		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.MaxConcurrentStreams, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.danmakuToken, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +223,9 @@ func (a *App) normalizeShareUserInput(input ShareUserInput, excludeID int64, cre
 	if input.MaxDevices < 0 || input.MaxDevices > 100 {
 		return input, errors.New("同时在线设备数应为 0–100，0 表示不限")
 	}
+	if input.MaxConcurrentStreams < 0 || input.MaxConcurrentStreams > 100 {
+		return input, errors.New("最大同时播放路数应为 0–100，0 表示不限")
+	}
 	if input.SpeedLimit < 0 || input.SpeedLimit > 100000 {
 		return input, errors.New("限速应为 0–100000 Mbps，0 表示不限")
 	}
@@ -303,8 +309,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		}
 		var maxOrder int
 		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM share_users`).Scan(&maxOrder)
-		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, danmaku_token, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken, danmakuToken, maxOrder+1)
+		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, max_concurrent_streams, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, danmaku_token, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.MaxConcurrentStreams, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken, danmakuToken, maxOrder+1)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				if strings.Contains(err.Error(), "route_prefix") {
@@ -326,8 +332,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 			}
 			enabled = current != 0
 		}
-		result, err := tx.Exec(`UPDATE share_users SET username=?, route_prefix=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, speed_limit=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-			input.Username, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, input.ResetDay, id)
+		result, err := tx.Exec(`UPDATE share_users SET username=?, route_prefix=?, note=?, enabled=?, expires_at=?, traffic_quota=?, max_devices=?, max_concurrent_streams=?, speed_limit=?, traffic_reset_period=CASE WHEN traffic_reset_day<>? THEN ? ELSE traffic_reset_period END, traffic_reset_day=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+			input.Username, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.MaxConcurrentStreams, input.SpeedLimit, input.ResetDay, resetPeriod, input.ResetDay, id)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				if strings.Contains(err.Error(), "route_prefix") {
@@ -386,6 +392,7 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin s
 			view.TrafficUsed = used
 		}
 		view.SessionCount = a.pm.shares.deviceCount(item.ID)
+		view.ActiveStreams = a.pm.shares.activeStreamCountForUser(item.ID, "", time.Now())
 		view.DrainingSessions = a.pm.shares.drainingCount(item.ID)
 	}
 	if view.ResetDay > 0 {
@@ -491,7 +498,10 @@ func (a *App) shareUserText(item *storedShareUser, origin string) (string, error
 		builder.WriteString("流量额度：" + quota + "\n")
 	}
 	if view.MaxDevices > 0 {
-		builder.WriteString(fmt.Sprintf("同时在线设备：最多 %d 台\n", view.MaxDevices))
+		builder.WriteString(fmt.Sprintf("登录设备上限：最多 %d 台\n", view.MaxDevices))
+	}
+	if view.MaxConcurrentStreams > 0 {
+		builder.WriteString(fmt.Sprintf("同时播放限制：最多 %d 路\n", view.MaxConcurrentStreams))
 	}
 	if view.SpeedLimit > 0 {
 		builder.WriteString(fmt.Sprintf("限速：%d Mbps\n", view.SpeedLimit))
@@ -777,7 +787,7 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 				if input.Password != "" || !updated.Enabled {
 					_, _ = shares.revokeSessions(id, 0, nil)
 				} else {
-					shares.reconcileSiteSwitch(id, false)
+					_, _, _ = shares.reconcileSiteSwitch(id, false)
 				}
 				shares.enforce(time.Now())
 				if input.MaxDevices > 0 {

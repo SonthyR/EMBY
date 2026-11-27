@@ -197,6 +197,7 @@ type shareSelfOrderResponse struct {
 	shareSelfView
 	Revoked  int `json:"revoked"`
 	Draining int `json:"draining"`
+	Seamless int `json:"seamless"`
 }
 
 func (a *App) buildShareSelfNetwork(r *http.Request) *shareSelfNetwork {
@@ -364,9 +365,9 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.reloadShareUsers()
-		revoked, draining := 0, 0
+		revoked, draining, seamless := 0, 0, 0
 		if a.pm != nil && a.pm.shares != nil {
-			revoked, draining = a.pm.shares.reconcileSiteSwitch(user.ID, false)
+			revoked, draining, seamless = a.pm.shares.reconcileSiteSwitch(user.ID, false)
 		}
 		updated, err := a.db.getShareUser(user.ID)
 		if err != nil {
@@ -376,6 +377,7 @@ func (a *App) handleShareSelf(w http.ResponseWriter, r *http.Request) {
 			shareSelfView: a.buildShareSelfView(updated, r),
 			Revoked:       revoked,
 			Draining:      draining,
+			Seamless:      seamless,
 		})
 	case "kick":
 		if r.Method != http.MethodPost {

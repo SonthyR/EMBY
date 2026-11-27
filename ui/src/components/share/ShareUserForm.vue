@@ -27,6 +27,7 @@ const form = reactive({
   quotaGB: '' as string | number,
   resetDay: 0,
   maxDevices: '' as string | number,
+  maxConcurrentStreams: '' as string | number,
   speed: '' as string | number,
 })
 const selected = reactive<Record<number, { on: boolean; account: number }>>({})
@@ -184,6 +185,7 @@ watch(
       quotaGB: user && user.traffic_quota > 0 ? +(user.traffic_quota / GB).toFixed(2) : '',
       resetDay: user?.traffic_reset_day || 0,
       maxDevices: user?.max_devices || '',
+      maxConcurrentStreams: user?.max_concurrent_streams || '',
       speed: user?.speed_limit || '',
     })
     for (const key of Object.keys(errors)) delete errors[key]
@@ -227,6 +229,8 @@ function validate(): ShareUserInput | null {
   if (!Number.isFinite(quota) || quota < 0) errors.quota = '请输入有效的数字'
   const devices = toInt(form.maxDevices)
   if (!Number.isInteger(devices) || devices < 0 || devices > 100) errors.devices = '0–100 的整数'
+  const streams = toInt(form.maxConcurrentStreams)
+  if (!Number.isInteger(streams) || streams < 0 || streams > 100) errors.streams = '0–100 的整数'
   const speed = toInt(form.speed)
   if (!Number.isInteger(speed) || speed < 0 || speed > 100000) errors.speed = '0–100000 的整数'
   const sites = assignedSites.value.map(s => ({ site_id: s.id, site_account_id: selected[s.id].account || 0 }))
@@ -241,6 +245,7 @@ function validate(): ShareUserInput | null {
     expires_at: form.expires,
     traffic_quota: Math.round(quota * GB),
     max_devices: devices,
+    max_concurrent_streams: streams,
     speed_limit: speed,
     traffic_reset_day: Number(form.resetDay) || 0,
     sites,
@@ -281,7 +286,7 @@ async function save() {
           label="专属固定后缀"
           for="su-route"
           :error="errors.routePrefix"
-          :help="routePreview ? `固定地址：${routePreview}（朋友在网页把想看的服务器拖到第一位即可切换）` : '设置后朋友只需填这一个固定地址，留空则沿用各站点独立地址。'"
+          :help="routePreview ? `固定地址：${routePreview}（把想看的服务器拖到第 1 位后，回客户端下拉刷新即可无感切服，无需重登）` : '设置后朋友只需填这一个固定地址，支持免重登无感切服；留空则沿用各站点独立地址。'"
         >
           <div class="prefix-input">
             <span class="slash">/</span>
@@ -315,8 +320,11 @@ async function save() {
               <option v-for="day in 28" :key="day" :value="day">每月 {{ day }} 日</option>
             </select>
           </UiField>
-          <UiField label="同时在线" for="su-dev" :error="errors.devices" help="台；超出时踢掉最久没用的">
+          <UiField label="登录设备上限" for="su-dev" :error="errors.devices" help="台；超出时踢掉最久没用的设备">
             <input id="su-dev" v-model="form.maxDevices" class="input num" type="number" min="0" max="100" step="1" placeholder="不限" inputmode="numeric" />
+          </UiField>
+          <UiField label="同时播放路数" for="su-streams" :error="errors.streams" help="路；超限时拦截新播放，不踢出登录">
+            <input id="su-streams" v-model="form.maxConcurrentStreams" class="input num" type="number" min="0" max="100" step="1" placeholder="不限" inputmode="numeric" />
           </UiField>
           <UiField label="限速" for="su-speed" :error="errors.speed" help="Mbps，所有设备合计">
             <input id="su-speed" v-model="form.speed" class="input num" type="number" min="0" step="1" placeholder="不限" inputmode="numeric" />

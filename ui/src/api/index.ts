@@ -203,6 +203,7 @@ export interface MyAccount extends ShareUser {
 export interface MyAccountOrderResponse extends MyAccount {
   revoked: number
   draining: number
+  seamless?: number
 }
 
 export interface MyAccountRedeemResponse extends MyAccount {
@@ -298,6 +299,7 @@ export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput>
     expires_at: user.expires_at || '',
     traffic_quota: user.traffic_quota || 0,
     max_devices: user.max_devices || 0,
+    max_concurrent_streams: user.max_concurrent_streams || 0,
     speed_limit: user.speed_limit || 0,
     traffic_reset_day: user.traffic_reset_day || 0,
     sites: user.sites.map(site => ({ site_id: site.site_id, site_account_id: site.site_account_id || 0 })),

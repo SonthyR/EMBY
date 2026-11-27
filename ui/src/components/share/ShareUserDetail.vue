@@ -295,7 +295,8 @@ async function saveSites() {
     toast.error('首选生效 Emby 源站必须为已启用状态，请拖入已启用的源站到首位')
     return
   }
-  const ok = await run('sites', () => shareApi.update(u.id, shareUserToInput(u, { sites: draftSites.value })), '首选 Emby 服与源站分配已保存')
+  const msg = u.route_prefix ? '首选 Emby 服已保存（客户端回首页下拉刷新即可无感切换）' : '首选 Emby 服与源站分配已保存'
+  const ok = await run('sites', () => shareApi.update(u.id, shareUserToInput(u, { sites: draftSites.value })), msg)
   if (ok && detail.value?.id === u.id) {
     syncDraftSites(detail.value)
   }
@@ -339,7 +340,8 @@ async function saveSites() {
           <dd><span class="active-chip">{{ detail.active_site_name }}</span></dd>
         </div>
         <div><dt>到期时间</dt><dd>{{ expiry.text }}<span v-if="expiry.sub" class="faint"> · {{ expiry.sub }}</span></dd></div>
-        <div><dt>在线设备</dt><dd class="num">{{ detail.session_count }}{{ detail.max_devices ? ` / ${detail.max_devices} 台` : ' 台' }}</dd></div>
+        <div><dt>登录设备</dt><dd class="num">{{ detail.session_count }}{{ detail.max_devices ? ` / ${detail.max_devices} 台` : ' 台' }}</dd></div>
+        <div><dt>同时播放</dt><dd class="num">{{ detail.active_streams || 0 }}{{ detail.max_concurrent_streams ? ` / ${detail.max_concurrent_streams} 路` : ' 路（不限）' }}</dd></div>
         <div><dt>全局限速</dt><dd>{{ detail.speed_limit ? `${detail.speed_limit} Mbps` : '不限' }}</dd></div>
         <div>
           <dt>登录密码</dt>

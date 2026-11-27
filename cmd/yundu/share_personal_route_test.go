@@ -304,25 +304,28 @@ func TestSharePersonalRouteSwitchWhenIdle(t *testing.T) {
 		ActiveSiteID int64 `json:"active_site_id"`
 		Revoked      int   `json:"revoked"`
 		Draining     int   `json:"draining"`
+		Seamless     int   `json:"seamless"`
 	}
 	_ = json.NewDecoder(orderRes.Body).Decode(&orderBody)
 	_ = orderRes.Body.Close()
-	if orderRes.StatusCode != http.StatusOK || orderBody.ActiveSiteID != siteB.ID || orderBody.Revoked != 1 || orderBody.Draining != 0 {
+	if orderRes.StatusCode != http.StatusOK || orderBody.ActiveSiteID != siteB.ID || orderBody.Revoked != 0 || orderBody.Draining != 0 || orderBody.Seamless != 1 {
 		t.Fatalf("order response = %d %+v", orderRes.StatusCode, orderBody)
 	}
 
-	// 6. Old Site A token is immediately rejected, and re-login on /ws enters Site B.
-	staleReq, _ := http.NewRequest(http.MethodGet, panel.URL+"/ws/Items", nil)
-	staleReq.Header.Set("X-Emby-Token", "token-alpha")
-	staleRes, err := http.DefaultClient.Do(staleReq)
+	// 6. Existing client token seamlessly hands off to Site B without re-login!
+	nextReq, _ := http.NewRequest(http.MethodGet, panel.URL+"/ws/Items", nil)
+	nextReq.Header.Set("X-Emby-Token", "token-alpha")
+	nextRes, err := http.DefaultClient.Do(nextReq)
 	if err != nil {
-		t.Fatalf("stale GET /ws/Items: %v", err)
+		t.Fatalf("seamless GET /ws/Items: %v", err)
 	}
-	_ = staleRes.Body.Close()
-	if staleRes.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("stale token after idle switch = %d, want 401", staleRes.StatusCode)
+	nextBody, _ := io.ReadAll(nextRes.Body)
+	_ = nextRes.Body.Close()
+	if nextRes.StatusCode != http.StatusOK || !strings.Contains(string(nextBody), `"server":"beta"`) {
+		t.Fatalf("seamless token after idle switch = %d %s, want 200 beta", nextRes.StatusCode, string(nextBody))
 	}
 
+	// Fresh login on /ws also enters Site B directly.
 	respB, bodyB := doShareLogin(t, panel.URL+"/ws", "ws", "secret123")
 	if respB.StatusCode != http.StatusOK || !strings.Contains(string(bodyB), "token-beta") {
 		t.Fatalf("re-login on /ws after switch = %d %s", respB.StatusCode, string(bodyB))
@@ -374,9 +377,9 @@ func TestSharePersonalRouteDrainsActiveVideoUntilStopped(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.reloadShareUsers()
-	revoked, draining := app.pm.shares.reconcileSiteSwitch(userID, false)
-	if revoked != 0 || draining != 1 {
-		t.Fatalf("reconcile while playing = revoked:%d draining:%d, want 0, 1", revoked, draining)
+	revoked, draining, seamless := app.pm.shares.reconcileSiteSwitch(userID, false)
+	if revoked != 0 || draining != 1 || seamless != 0 {
+		t.Fatalf("reconcile while playing = revoked:%d draining:%d seamless:%d, want 0, 1, 0", revoked, draining, seamless)
 	}
 
 	// Video stream & progress continue routing to Site A uninterrupted!
@@ -410,19 +413,20 @@ func TestSharePersonalRouteDrainsActiveVideoUntilStopped(t *testing.T) {
 		t.Fatalf("Site A stoppedHits = %d, want 1", stoppedHits)
 	}
 
-	// Immediately after closing video, old Site A token is rejected.
+	// Immediately after closing video, next browse request seamlessly hands off to Site B!
 	afterReq, _ := http.NewRequest(http.MethodGet, panel.URL+"/viewer/Items", nil)
 	afterReq.Header.Set("X-Emby-Token", "token-alpha")
 	afterRes, err := http.DefaultClient.Do(afterReq)
 	if err != nil {
 		t.Fatalf("GET after stop: %v", err)
 	}
+	afterBody, _ := io.ReadAll(afterRes.Body)
 	_ = afterRes.Body.Close()
-	if afterRes.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("old token after video stopped = %d, want 401", afterRes.StatusCode)
+	if afterRes.StatusCode != http.StatusOK || !strings.Contains(string(afterBody), `"server":"beta"`) {
+		t.Fatalf("old token after video stopped = %d %s, want 200 beta", afterRes.StatusCode, string(afterBody))
 	}
 
-	// Re-login with same URL and credentials immediately enters Site B.
+	// Re-login with same URL and credentials also enters Site B.
 	loginB, bodyB := doShareLogin(t, panel.URL+"/viewer", "viewer", "secret123")
 	if loginB.StatusCode != http.StatusOK || !strings.Contains(string(bodyB), "token-beta") {
 		t.Fatalf("re-login after video stopped = %d %s", loginB.StatusCode, string(bodyB))
@@ -514,7 +518,7 @@ func TestSharePersonalRouteDrainsInFlightStreamOnAdminSwitchAndExpiresOnIdle(t *
 		t.Fatalf("in-flight stream interrupted: %q", result)
 	}
 
-	// After idle timeout with no Stopped call, the draining session is revoked automatically.
+	// After idle timeout with no Stopped call, draining finishes and next request seamlessly hands off to Site B.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if app.pm.shares.drainingCount(userID) == 0 {
@@ -523,17 +527,18 @@ func TestSharePersonalRouteDrainsInFlightStreamOnAdminSwitchAndExpiresOnIdle(t *
 		time.Sleep(25 * time.Millisecond)
 	}
 	if app.pm.shares.drainingCount(userID) != 0 {
-		t.Fatal("draining session was not revoked after stream idle timeout")
+		t.Fatal("draining session did not clear after stream idle timeout")
 	}
-	staleReq, _ := http.NewRequest(http.MethodGet, panel.URL+"/su/Items", nil)
-	staleReq.Header.Set("X-Emby-Token", "token-alpha")
-	staleRes, err := http.DefaultClient.Do(staleReq)
+	nextReq, _ := http.NewRequest(http.MethodGet, panel.URL+"/su/Items", nil)
+	nextReq.Header.Set("X-Emby-Token", "token-alpha")
+	nextRes, err := http.DefaultClient.Do(nextReq)
 	if err != nil {
 		t.Fatalf("GET after drain timeout: %v", err)
 	}
-	_ = staleRes.Body.Close()
-	if staleRes.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("stale token after idle drain timeout = %d, want 401", staleRes.StatusCode)
+	nextBody, _ := io.ReadAll(nextRes.Body)
+	_ = nextRes.Body.Close()
+	if nextRes.StatusCode != http.StatusOK || !strings.Contains(string(nextBody), `"server":"beta"`) {
+		t.Fatalf("token after idle drain timeout = %d %s, want 200 beta", nextRes.StatusCode, string(nextBody))
 	}
 }
 

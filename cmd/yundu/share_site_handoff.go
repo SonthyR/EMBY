@@ -1,0 +1,621 @@
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// sharePersonalVirtualServerID derives a stable 32-hex Emby-compatible ServerId
+// for a share user's personal route prefix. Keeping ServerId constant across
+// primary-site switches allows clients like Infuse and official Emby apps to
+// refresh the library without re-authenticating or throwing server-mismatch errors.
+func sharePersonalVirtualServerID(userID int64, routePrefix string) string {
+	mac := hmac.New(sha256.New, jwtSecret)
+	mac.Write([]byte("yundu-share-server-id:v1:"))
+	mac.Write([]byte(strconv.FormatInt(userID, 10)))
+	mac.Write([]byte(":"))
+	mac.Write([]byte(strings.ToLower(strings.TrimSpace(routePrefix))))
+	return hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+func (rt *shareUserRuntime) personalVirtualServerID(userID int64) string {
+	if rt == nil || userID <= 0 {
+		return ""
+	}
+	rt.mu.RLock()
+	state := rt.users[userID]
+	var prefix string
+	if state != nil {
+		prefix = state.routePrefix
+	}
+	rt.mu.RUnlock()
+	if prefix == "" {
+		return ""
+	}
+	return sharePersonalVirtualServerID(userID, prefix)
+}
+
+func rewriteEmbyAuthHeaderAttribute(value, attrName, oldVal, newVal string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || attrName == "" || oldVal == "" || newVal == "" || strings.EqualFold(oldVal, newVal) {
+		return value
+	}
+	offset := 0
+	for offset < len(trimmed) && isEmbyAuthToken(trimmed[offset]) {
+		offset++
+	}
+	scheme := trimmed[:offset]
+	if !strings.EqualFold(scheme, "MediaBrowser") && !strings.EqualFold(scheme, "Emby") {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value) + len(newVal))
+	pos := 0
+	i := offset
+	changed := false
+	for i < len(trimmed) {
+		for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t' || trimmed[i] == ',') {
+			i++
+		}
+		if i >= len(trimmed) {
+			break
+		}
+		keyStart := i
+		for i < len(trimmed) && isEmbyAuthToken(trimmed[i]) {
+			i++
+		}
+		key := trimmed[keyStart:i]
+		for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+			i++
+		}
+		if i >= len(trimmed) || trimmed[i] != '=' {
+			for i < len(trimmed) && trimmed[i] != ',' {
+				i++
+			}
+			continue
+		}
+		i++ // skip '='
+		for i < len(trimmed) && (trimmed[i] == ' ' || trimmed[i] == '\t') {
+			i++
+		}
+		if i >= len(trimmed) {
+			break
+		}
+		quoted := false
+		valStart := i
+		var valEnd int
+		var rawVal string
+		if trimmed[i] == '"' {
+			quoted = true
+			i++
+			valStart = i
+			for i < len(trimmed) {
+				if trimmed[i] == '\\' && i+1 < len(trimmed) {
+					i += 2
+					continue
+				}
+				if trimmed[i] == '"' {
+					break
+				}
+				i++
+			}
+			valEnd = i
+			rawVal = trimmed[valStart:valEnd]
+			if i < len(trimmed) && trimmed[i] == '"' {
+				i++
+			}
+		} else {
+			for i < len(trimmed) && trimmed[i] != ',' {
+				i++
+			}
+			valEnd = i
+			rawVal = strings.TrimSpace(trimmed[valStart:valEnd])
+		}
+		if strings.EqualFold(key, attrName) && strings.EqualFold(rawVal, oldVal) {
+			out.WriteString(trimmed[pos:valStart])
+			if quoted {
+				out.WriteString(strings.ReplaceAll(newVal, `"`, `\"`))
+			} else {
+				out.WriteString(newVal)
+			}
+			pos = valEnd
+			changed = true
+		}
+	}
+	if !changed {
+		return value
+	}
+	out.WriteString(trimmed[pos:])
+	return out.String()
+}
+
+// rewriteEmbyRequestUserID transparently maps a client's cached UserId (from
+// the site it originally signed in to) to the session's current upstream UserId
+// across URL path segments, query parameters, and Emby Authorization headers.
+func rewriteEmbyRequestUserID(r *http.Request, clientUID, upstreamUID string) {
+	if r == nil || clientUID == "" || upstreamUID == "" || strings.EqualFold(clientUID, upstreamUID) {
+		return
+	}
+	if r.URL != nil && r.URL.Path != "" {
+		segments := strings.Split(r.URL.Path, "/")
+		pathChanged := false
+		for i, seg := range segments {
+			if strings.EqualFold(seg, clientUID) {
+				segments[i] = upstreamUID
+				pathChanged = true
+			}
+		}
+		if pathChanged {
+			r.URL.Path = strings.Join(segments, "/")
+			r.URL.RawPath = ""
+		}
+	}
+	if r.URL != nil && r.URL.RawQuery != "" {
+		q := r.URL.Query()
+		queryChanged := false
+		for key, values := range q {
+			switch strings.ToLower(key) {
+			case "userid", "user_id":
+				for idx, v := range values {
+					if strings.EqualFold(strings.TrimSpace(v), clientUID) {
+						values[idx] = upstreamUID
+						queryChanged = true
+					}
+				}
+			}
+		}
+		if queryChanged {
+			r.URL.RawQuery = q.Encode()
+		}
+	}
+	for _, hdr := range []string{"X-Emby-Authorization", "Authorization"} {
+		if vals := r.Header.Values(hdr); len(vals) > 0 {
+			for idx, v := range vals {
+				vals[idx] = rewriteEmbyAuthHeaderAttribute(v, "UserId", clientUID, upstreamUID)
+			}
+		}
+	}
+}
+
+func (rt *shareUserRuntime) applyUpstreamUserID(r *http.Request, tokenHash string) {
+	if rt == nil || r == nil || tokenHash == "" {
+		return
+	}
+	rt.mu.RLock()
+	entry, ok := rt.sessions[tokenHash]
+	rt.mu.RUnlock()
+	if !ok || entry.clientUID == "" || entry.upstreamUID == "" || strings.EqualFold(entry.clientUID, entry.upstreamUID) {
+		return
+	}
+	rewriteEmbyRequestUserID(r, entry.clientUID, entry.upstreamUID)
+}
+
+func (rt *shareUserRuntime) sessionUIDPair(tokenHash string) (clientUID, upstreamUID string) {
+	if rt == nil || tokenHash == "" {
+		return "", ""
+	}
+	rt.mu.RLock()
+	entry, ok := rt.sessions[tokenHash]
+	rt.mu.RUnlock()
+	if !ok {
+		return "", ""
+	}
+	return entry.clientUID, entry.upstreamUID
+}
+
+func isEmbySystemInfoPath(pathValue string) bool {
+	p := strings.ToLower(strings.TrimRight(pathValue, "/"))
+	p = strings.TrimPrefix(p, "/emby")
+	p = strings.TrimPrefix(p, "/jellyfin")
+	return p == "/system/info" || p == "/system/info/public"
+}
+
+func isEmbyUserIdentityPath(pathValue string) bool {
+	p := strings.ToLower(strings.TrimRight(pathValue, "/"))
+	p = strings.TrimPrefix(p, "/emby")
+	p = strings.TrimPrefix(p, "/jellyfin")
+	if p == "/users/me" || p == "/sessions" {
+		return true
+	}
+	if strings.HasPrefix(p, "/users/") {
+		rest := strings.TrimPrefix(p, "/users/")
+		return rest != "" && !strings.Contains(rest, "/")
+	}
+	return false
+}
+
+func rewriteShareLoginResponseServerID(body []byte, virtualServerID string) []byte {
+	if len(body) == 0 || virtualServerID == "" {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	changed := false
+	if _, ok := payload["ServerId"]; ok {
+		payload["ServerId"] = virtualServerID
+		changed = true
+	}
+	if userObj, ok := payload["User"].(map[string]any); ok {
+		if _, has := userObj["ServerId"]; has {
+			userObj["ServerId"] = virtualServerID
+			changed = true
+		}
+	}
+	if sessObj, ok := payload["SessionInfo"].(map[string]any); ok {
+		if _, has := sessObj["ServerId"]; has {
+			sessObj["ServerId"] = virtualServerID
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
+// rewritePersonalShareMetadataResponse normalizes ServerId (on /System/Info*)
+// and maps upstream UserId back to the client's original UserId (on user/session
+// identity responses after a seamless cross-site handoff).
+func rewritePersonalShareMetadataResponse(resp *http.Response, upstreamBasePath, virtualServerID, clientUID, upstreamUID string) error {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil || resp.StatusCode != http.StatusOK || resp.Body == nil {
+		return nil
+	}
+	relPath := stripUpstreamBasePath(resp.Request.URL.Path, upstreamBasePath)
+	wantServerID := virtualServerID != "" && isEmbySystemInfoPath(relPath)
+	wantUIDMap := clientUID != "" && upstreamUID != "" && !strings.EqualFold(clientUID, upstreamUID) && isEmbyUserIdentityPath(relPath)
+	if !wantServerID && !wantUIDMap {
+		return nil
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(ct, "json") {
+		return nil
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, shareLoginResponseLimit))
+	_ = resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	decoded := raw
+	wasGzip := strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip")
+	if wasGzip {
+		gr, gerr := gzip.NewReader(bytes.NewReader(raw))
+		if gerr != nil {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return nil
+		}
+		unpacked, rerr := io.ReadAll(io.LimitReader(gr, shareLoginResponseLimit))
+		_ = gr.Close()
+		if rerr != nil {
+			resp.Body = io.NopCloser(bytes.NewReader(raw))
+			return nil
+		}
+		decoded = unpacked
+	}
+
+	var parsed any
+	if err := json.Unmarshal(decoded, &parsed); err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		return nil
+	}
+
+	changed := false
+	if obj, ok := parsed.(map[string]any); ok {
+		if wantServerID {
+			if _, has := obj["Id"]; has {
+				obj["Id"] = virtualServerID
+				changed = true
+			}
+			if _, has := obj["ServerId"]; has {
+				obj["ServerId"] = virtualServerID
+				changed = true
+			}
+		}
+		if wantUIDMap {
+			if idStr, ok := obj["Id"].(string); ok && strings.EqualFold(idStr, upstreamUID) {
+				obj["Id"] = clientUID
+				changed = true
+			}
+			if uidStr, ok := obj["UserId"].(string); ok && strings.EqualFold(uidStr, upstreamUID) {
+				obj["UserId"] = clientUID
+				changed = true
+			}
+			if virtualServerID != "" {
+				if _, has := obj["ServerId"]; has {
+					obj["ServerId"] = virtualServerID
+					changed = true
+				}
+			}
+		}
+	} else if arr, ok := parsed.([]any); ok && wantUIDMap {
+		for _, elem := range arr {
+			m, ok := elem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if uidStr, ok := m["UserId"].(string); ok && strings.EqualFold(uidStr, upstreamUID) {
+				m["UserId"] = clientUID
+				changed = true
+			}
+			if virtualServerID != "" {
+				if _, has := m["ServerId"]; has {
+					m["ServerId"] = virtualServerID
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		return nil
+	}
+	encoded, err := json.Marshal(parsed)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		return nil
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(encoded))
+	resp.ContentLength = int64(len(encoded))
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(encoded)))
+	return nil
+}
+
+// handoffPersonalRouteSite transparently migrates an active personal-route
+// share session from its old site to targetSiteID by silently signing in to
+// targetSiteID's upstream Emby account and persisting the new upstream token
+// and UserId while keeping the client's original token and UserId unchanged.
+func (rt *shareUserRuntime) handoffPersonalRouteSite(
+	ctx context.Context,
+	tokenHash string,
+	targetSiteID int64,
+	clientIP string,
+) (int, string) {
+	if rt == nil || rt.pm == nil || tokenHash == "" || targetSiteID <= 0 {
+		return http.StatusUnauthorized, "服务器已切换，请重新登录"
+	}
+
+	lock := rt.sessionHandoffLock(tokenHash)
+	lock.Lock()
+	defer lock.Unlock()
+
+	rt.mu.RLock()
+	entry, ok := rt.sessions[tokenHash]
+	if !ok {
+		rt.mu.RUnlock()
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
+	}
+	if entry.siteID == targetSiteID {
+		rt.mu.RUnlock()
+		return 0, ""
+	}
+	state := rt.users[entry.userID]
+	var preferredAccount int64
+	var assigned bool
+	if state != nil {
+		preferredAccount, assigned = state.sites[targetSiteID]
+	}
+	rt.mu.RUnlock()
+	if !assigned {
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, "分享账号无权访问目标服务器，请重新登录"
+	}
+
+	rt.pm.mu.RLock()
+	targetInst := rt.pm.proxies[targetSiteID]
+	rt.pm.mu.RUnlock()
+	if targetInst == nil || targetInst.shareLogin == nil {
+		return http.StatusServiceUnavailable, "目标服务器暂不可用"
+	}
+
+	candidates, err := rt.upstreamCredentialCandidates(targetSiteID, preferredAccount)
+	if err != nil || len(candidates) == 0 {
+		log.Printf("[%s] seamless site switch for user #%d: no upstream credentials: %v", targetInst.Site.Name, entry.userID, err)
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, "目标服务器未配置可用的源站账号，请重新登录"
+	}
+
+	var targetEgressNodeID int64
+	var targetEgressDecision edgeRouteDecision
+	if targetInst.Site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+		decision, lockedNodeID, edgeErr := resolveEdgeFullDecision(rt.pm, targetInst.Site, clientIP, 0, true)
+		if edgeErr != nil {
+			return http.StatusServiceUnavailable, "目标服务器绑定的从机离线或不可用，请稍后重试"
+		}
+		targetEgressNodeID = lockedNodeID
+		targetEgressDecision = decision
+	}
+
+	var newToken, newUID string
+	var chosenAccountID int64
+	var lastStatus int
+	var lastErr error
+	for _, cand := range candidates {
+		loginCtx, cancel := context.WithTimeout(ctx, shareHandoffLoginTimeout)
+		if targetEgressDecision.NodeID > 0 {
+			loginCtx = withEdgeEgressTarget(loginCtx, edgeEgressTarget{
+				NodeID:    targetEgressDecision.NodeID,
+				NodeName:  targetEgressDecision.NodeName,
+				PublicURL: targetEgressDecision.PublicURL,
+				Token:     targetEgressDecision.Token,
+			})
+		}
+		tok, uid, status, loginErr := targetInst.shareLogin(
+			loginCtx, cand.username, cand.password, entry.deviceID, entry.deviceName, entry.clientName,
+		)
+		cancel()
+		if loginErr == nil && status == http.StatusOK && tok != "" {
+			newToken = tok
+			newUID = uid
+			chosenAccountID = cand.accountID
+			break
+		}
+		lastStatus = status
+		lastErr = loginErr
+		if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests {
+			break
+		}
+	}
+	if newToken == "" {
+		log.Printf("[%s] seamless site switch login failed (status=%d): %v", targetInst.Site.Name, lastStatus, lastErr)
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, "切换到新服务器失败，请重新登录"
+	}
+
+	upCipher, encErr := encryptSiteAccountSecret(newToken)
+	if encErr != nil {
+		log.Printf("[%s] seamless site switch encrypt token: %v", targetInst.Site.Name, encErr)
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, "切换到新服务器失败，请重新登录"
+	}
+
+	oldSiteID := entry.siteID
+	oldUpstreamToken := entry.upstreamToken
+	oldEgressNodeID := entry.egressNodeID
+
+	clientUID := entry.clientUID
+	if clientUID == "" {
+		clientUID = entry.upstreamUID
+	}
+	effectiveIP := clientIP
+	if effectiveIP == "" {
+		effectiveIP = entry.clientIP
+	}
+	ispGroup := entry.ispGroup
+	if rt.pm.edges != nil && effectiveIP != "" {
+		ispGroup = rt.pm.edges.lookupISPGroup(effectiveIP)
+	}
+
+	if _, dbErr := rt.db.db.Exec(
+		`UPDATE share_user_sessions SET site_id=?, site_account_id=?, egress_node_id=?, upstream_token_ciphertext=?, upstream_user_id=?, client_user_id=CASE WHEN client_user_id='' THEN ? ELSE client_user_id END, client_ip=?, last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=?`,
+		targetSiteID, chosenAccountID, targetEgressNodeID, upCipher, newUID, clientUID, effectiveIP, tokenHash,
+	); dbErr != nil {
+		log.Printf("[%s] seamless site switch persist session: %v", targetInst.Site.Name, dbErr)
+	}
+
+	now := time.Now()
+	rt.mu.Lock()
+	if cur, exists := rt.sessions[tokenHash]; exists {
+		cur.siteID = targetSiteID
+		cur.siteAccountID = chosenAccountID
+		cur.egressNodeID = targetEgressNodeID
+		cur.upstreamToken = newToken
+		if cur.clientUID == "" {
+			cur.clientUID = clientUID
+		}
+		cur.upstreamUID = newUID
+		if effectiveIP != "" {
+			cur.clientIP = effectiveIP
+		}
+		cur.ispGroup = ispGroup
+		cur.lastHandoffAt = now
+		rt.sessions[tokenHash] = cur
+	}
+	if act := rt.activity[tokenHash]; act != nil {
+		act.draining = false
+		act.drainingSince = time.Time{}
+		act.playing = false
+		act.lastPlaybackAt = time.Time{}
+		act.hasNode = false
+		act.lastNodeID = 0
+		act.lastNodeName = ""
+	}
+	delete(rt.dirtyClientIP, tokenHash)
+	rt.lastSeen[tokenHash] = now
+	rt.mu.Unlock()
+
+	if oldUpstreamToken != "" && oldSiteID > 0 {
+		rt.logoutUpstream(oldSiteID, oldUpstreamToken, oldEgressNodeID)
+	}
+
+	log.Printf("[%s] seamless personal-route site switch: user #%d site #%d -> #%d (client_uid=%s -> upstream_uid=%s)",
+		targetInst.Site.Name, entry.userID, oldSiteID, targetSiteID, clientUID, newUID)
+	return 0, ""
+}
+
+// activeStreamCounts returns the number of currently playing devices for userID,
+// deduplicated by DeviceId (or tokenHash when DeviceId is absent), optionally
+// excluding a specific session (by its device key) so a device's own parallel
+// Range/HLS connections never block itself.
+func (rt *shareUserRuntime) activeStreamCountForUser(userID int64, excludeTokenHash string, now time.Time) int {
+	if rt == nil || userID <= 0 {
+		return 0
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.activeStreamCountForUserLocked(userID, excludeTokenHash, now)
+}
+
+func shareSessionDeviceKey(tokenHash, deviceID string) string {
+	if strings.TrimSpace(deviceID) != "" {
+		return "d:" + strings.TrimSpace(deviceID)
+	}
+	return "t:" + tokenHash
+}
+
+func (rt *shareUserRuntime) activeStreamCountForUserLocked(userID int64, excludeTokenHash string, now time.Time) int {
+	var excludeKey string
+	if excludeTokenHash != "" {
+		if exEntry, ok := rt.sessions[excludeTokenHash]; ok {
+			excludeKey = shareSessionDeviceKey(excludeTokenHash, exEntry.deviceID)
+		} else {
+			excludeKey = "t:" + excludeTokenHash
+		}
+	}
+	seen := make(map[string]struct{})
+	for hash, entry := range rt.sessions {
+		if entry.userID != userID {
+			continue
+		}
+		act := rt.activity[hash]
+		if act == nil || !act.isWatching(now) {
+			continue
+		}
+		dk := shareSessionDeviceKey(hash, entry.deviceID)
+		if excludeKey != "" && dk == excludeKey {
+			continue
+		}
+		seen[dk] = struct{}{}
+	}
+	return len(seen)
+}
+
+func (rt *shareUserRuntime) checkConcurrentStreamLimit(userID int64, tokenHash string, now time.Time) (blocked bool, limit int) {
+	if rt == nil || userID <= 0 {
+		return false, 0
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	state := rt.users[userID]
+	if state == nil || state.maxConcurrentStreams <= 0 {
+		return false, 0
+	}
+	otherPlaying := rt.activeStreamCountForUserLocked(userID, tokenHash, now)
+	if otherPlaying >= state.maxConcurrentStreams {
+		return true, state.maxConcurrentStreams
+	}
+	return false, state.maxConcurrentStreams
+}
+
+func shareConcurrentStreamLimitMessage(limit int) string {
+	return fmt.Sprintf("同时播放路数已达上限（最多 %d 路），请先停止其他设备的播放后再试", limit)
+}

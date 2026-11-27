@@ -177,7 +177,7 @@ func (a *App) publicHostRouter(panel http.Handler) http.Handler {
 				normalizeEmbeddedIngressRequestPath(r.URL, prefix)
 				stripIngressPathPrefix(r.URL, prefix)
 				normalizeStrippedIngressRequestPath(r.URL, prefix)
-				siteID, errStatus, errMsg := a.pm.shares.resolveShareRouteTarget(shareUserID, r)
+				siteID, errStatus, errMsg := a.pm.shares.resolveShareRouteTarget(shareUserID, r, requestClientKey(r, a.trustedProxies))
 				if errStatus != 0 {
 					writeShareJSONError(w, errStatus, errMsg)
 					return
