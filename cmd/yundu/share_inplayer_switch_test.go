@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -195,7 +196,7 @@ func TestInPlayerFavoriteSiteSwitchAndEdgeFullJPCO(t *testing.T) {
 		return res.StatusCode, parsed, string(raw)
 	}
 
-	assertExactlyOneFavorite := func(wantSiteID int64) {
+	assertExactlyOneFavorite := func(wantSiteID int64) map[int64]string {
 		t.Helper()
 		code, obj, raw := doJSON(http.MethodGet, "/sonthy/emby/Users/uid-uhd/Items?ParentId="+shareSwitchLibraryID, "tok-uhd")
 		if code != http.StatusOK {
@@ -206,25 +207,32 @@ func TestInPlayerFavoriteSiteSwitchAndEdgeFullJPCO(t *testing.T) {
 			t.Fatalf("expected 3 virtual site items, got %s", raw)
 		}
 		favCount := 0
-		wantItemID := shareSwitchSiteItemID(wantSiteID)
+		idsBySite := make(map[int64]string, 3)
 		for _, elem := range items {
 			m := elem.(map[string]any)
+			idStr, _ := m["Id"].(string)
+			sid, parsed := parseShareSwitchSiteItemID(idStr)
+			if !parsed {
+				t.Fatalf("invalid virtual site ID %q", idStr)
+			}
+			idsBySite[sid] = idStr
 			ud := m["UserData"].(map[string]any)
 			isFav, _ := ud["IsFavorite"].(bool)
 			if isFav {
 				favCount++
-				if m["Id"] != wantItemID {
-					t.Fatalf("wrong active favorite: got %v, want %s", m["Id"], wantItemID)
+				if sid != wantSiteID {
+					t.Fatalf("wrong active favorite: got site #%d (%s), want site #%d", sid, idStr, wantSiteID)
 				}
 			}
 		}
 		if favCount != 1 {
 			t.Fatalf("expected exactly 1 favorite heart, got %d (%s)", favCount, raw)
 		}
+		return idsBySite
 	}
 
 	// 1. Initial state: ONLY UHD is favorited (IsFavorite=true).
-	assertExactlyOneFavorite(siteUHD.ID)
+	initialIDs := assertExactlyOneFavorite(siteUHD.ID)
 
 	// 2. Virtual PNG covers work WITHOUT X-Emby-Token (Emby players often omit token on /Images/).
 	imgRes, err := http.Get(panel.URL + "/sonthy/emby/Items/" + shareSwitchLibraryID + "/Images/Primary")
@@ -264,34 +272,44 @@ func TestInPlayerFavoriteSiteSwitchAndEdgeFullJPCO(t *testing.T) {
 		t.Fatalf("first view = %+v, want Id=%s Name='切服 · RFC-UHD'", firstView, shareSwitchLibraryID)
 	}
 
-	// 5. After switching to RFC-UHD, ONLY RFC-UHD has a red heart (UHD is automatically cleared!).
-	assertExactlyOneFavorite(siteRFC.ID)
+	// 5. After switching to RFC-UHD, ONLY RFC-UHD has a red heart AND all card IDs rotated
+	//    to a fresh epoch so client local favorite caches (like CapyPlayer) clear old hearts!
+	afterRFCIDs := assertExactlyOneFavorite(siteRFC.ID)
+	if afterRFCIDs[siteUHD.ID] == initialIDs[siteUHD.ID] || afterRFCIDs[siteRFC.ID] == initialIDs[siteRFC.ID] {
+		t.Fatalf("expected virtual card IDs to rotate epoch on site switch: before=%v after=%v", initialIDs, afterRFCIDs)
+	}
 
 	// 6. Simulate JPCO going OFFLINE while user is on RFC-UHD: user can STILL click favorite
-	//    on SNTP (even via stale-cache DELETE!) locally on Master to escape the offline edge node!
+	//    on SNTP (even via stale-cache DELETE using an older-epoch ID!) locally on Master!
 	setJPCOOnline(false)
 
-	code, favObj, raw = doJSON(http.MethodDelete, "/sonthy/emby/Users/uid-uhd/FavoriteItems/"+shareSwitchSiteItemID(siteSNTP.ID), "tok-uhd")
+	code, favObj, raw = doJSON(http.MethodDelete, "/sonthy/emby/Users/uid-uhd/FavoriteItems/"+initialIDs[siteSNTP.ID], "tok-uhd")
 	if code != http.StatusOK || favObj["IsFavorite"] != true {
 		t.Fatalf("stale-cache DELETE switch to SNTP while JPCO offline = %d %s", code, raw)
 	}
-	assertExactlyOneFavorite(siteSNTP.ID)
+	afterSNTPIDs := assertExactlyOneFavorite(siteSNTP.ID)
+	if afterSNTPIDs[siteRFC.ID] == afterRFCIDs[siteRFC.ID] {
+		t.Fatalf("expected RFC card ID to rotate again after switching to SNTP")
+	}
 
 	// 7. Round-trip back to UHD: still exactly 1 favorite heart!
-	code, _, raw = doJSON(http.MethodPost, "/sonthy/emby/Users/uid-uhd/FavoriteItems/"+shareSwitchSiteItemID(siteUHD.ID), "tok-uhd")
+	code, _, raw = doJSON(http.MethodPost, "/sonthy/emby/Users/uid-uhd/FavoriteItems/"+afterSNTPIDs[siteUHD.ID], "tok-uhd")
 	if code != http.StatusOK {
 		t.Fatalf("switch back to UHD = %d %s", code, raw)
 	}
 	assertExactlyOneFavorite(siteUHD.ID)
 
-	// 8. Auxiliary detail endpoints on virtual card return clean 200 (never 500) and PlaybackInfo returns 404.
+	// 8. Auxiliary detail endpoints on virtual card return clean 200 (never 404/500).
 	code, _, _ = doJSON(http.MethodGet, "/sonthy/emby/Items/"+shareSwitchSiteItemID(siteUHD.ID)+"/Similar", "tok-uhd")
 	if code != http.StatusOK {
 		t.Fatalf("virtual card /Similar = %d, want 200", code)
 	}
-	code, _, _ = doJSON(http.MethodPost, "/sonthy/emby/Items/"+shareSwitchSiteItemID(siteUHD.ID)+"/PlaybackInfo", "tok-uhd")
-	if code != http.StatusNotFound {
-		t.Fatalf("virtual card /PlaybackInfo = %d, want 404", code)
+	code, pbObj, raw := doJSON(http.MethodPost, "/sonthy/emby/Items/"+shareSwitchSiteItemID(siteUHD.ID)+"/PlaybackInfo", "tok-uhd")
+	if code != http.StatusOK {
+		t.Fatalf("virtual card /PlaybackInfo = %d %s, want 200 empty MediaSources", code, raw)
+	}
+	if _, ok := pbObj["MediaSources"].([]any); !ok {
+		t.Fatalf("virtual card /PlaybackInfo missing MediaSources array: %s", raw)
 	}
 
 	// 9. Disabling system setting hides virtual switch view immediately.
@@ -324,8 +342,8 @@ func TestInPlayerFavoriteSiteSwitchAndEdgeFullJPCO(t *testing.T) {
 		t.Fatalf("single login = %d", singleResp.StatusCode)
 	}
 	code, _, raw = doJSON(http.MethodGet, "/single/emby/Users/uid-uhd/Items?ParentId="+shareSwitchLibraryID, "tok-uhd")
-	if code == http.StatusOK && strings.Contains(raw, shareSwitchSiteIDPrefix) {
-		t.Fatal("single-site user should not expose virtual switch library")
+	if code == http.StatusOK && (strings.Contains(raw, "云渡快捷切服") || !strings.Contains(raw, `"server":"uhd"`)) {
+		t.Fatalf("single-site user should proxy to upstream and not expose virtual switch library: %s", raw)
 	}
 }
 
@@ -601,5 +619,80 @@ func TestSiteIconAutoFetchCustomUploadAndOuterCardSwitching(t *testing.T) {
 	}
 	if directMasterHits.Load() != 0 {
 		t.Fatalf("Site B received %d direct Master requests (IP leak!)", directMasterHits.Load())
+	}
+}
+
+func makeTestBMPICO(t *testing.T, size int, c color.NRGBA) []byte {
+	t.Helper()
+	xorSize := size * size * 4
+	andRowStride := ((size + 31) / 32) * 4
+	andSize := andRowStride * size
+	dibSize := 40 + xorSize + andSize
+	var buf bytes.Buffer
+	// ICONDIR header (6 bytes)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	// ICONDIRENTRY (16 bytes)
+	buf.WriteByte(byte(size))
+	buf.WriteByte(byte(size))
+	buf.WriteByte(0)
+	buf.WriteByte(0)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(32))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(dibSize))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(22))
+	// BITMAPINFOHEADER (40 bytes)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(40))
+	_ = binary.Write(&buf, binary.LittleEndian, int32(size))
+	_ = binary.Write(&buf, binary.LittleEndian, int32(size*2))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(32))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(xorSize))
+	_ = binary.Write(&buf, binary.LittleEndian, int32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, int32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
+	// XOR pixels (BGRA)
+	for i := 0; i < size*size; i++ {
+		buf.Write([]byte{c.B, c.G, c.R, c.A})
+	}
+	// AND mask (all opaque = 0)
+	buf.Write(make([]byte, andSize))
+	return buf.Bytes()
+}
+
+func TestSiteIconICOAutoFetchAndDecode(t *testing.T) {
+	app := newTestApp(t)
+	bmpICO := makeTestBMPICO(t, 32, color.NRGBA{R: 120, G: 80, B: 230, A: 255})
+
+	// Simulate iris.pvq.cc: /web/* and /Users/.../Images/Primary all 404, only /favicon.ico returns 32-bit BMP ICO!
+	embyIris := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/favicon.ico" {
+			w.Header().Set("Content-Type", "image/vnd.microsoft.icon")
+			_, _ = w.Write(bmpICO)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(embyIris.Close)
+
+	siteIris := startTaggedShareSite(t, app, "鸢尾", "iris", embyIris.URL)
+	rec := httptest.NewRecorder()
+	app.handleSiteByID(rec, httptest.NewRequest(http.MethodPost, "/api/sites/"+strconv.FormatInt(siteIris.ID, 10)+"/icon/fetch", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fetch /favicon.ico failed: %d %s", rec.Code, rec.Body.String())
+	}
+	icon := app.db.getEffectiveSiteIcon(siteIris.ID)
+	if icon.Source != "auto" || icon.ContentType != "image/png" || !bytes.HasPrefix(icon.Data, []byte{0x89, 'P', 'N', 'G'}) {
+		t.Fatalf("expected decoded PNG from /favicon.ico, got source=%q ct=%q len=%d", icon.Source, icon.ContentType, len(icon.Data))
+	}
+	decoded, err := png.Decode(bytes.NewReader(icon.Data))
+	if err != nil {
+		t.Fatalf("png.Decode: %v", err)
+	}
+	if decoded.Bounds().Dx() != 32 || decoded.Bounds().Dy() != 32 {
+		t.Fatalf("decoded ICO bounds = %v, want 32x32", decoded.Bounds())
 	}
 }

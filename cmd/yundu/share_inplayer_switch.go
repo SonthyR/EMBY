@@ -18,13 +18,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
 	// 32-char lowercase hex IDs (Emby GUID-compatible) reserved exclusively for
 	// the in-player virtual "switch server" library and its site cards.
 	shareSwitchLibraryID    = "79756e64757377697463686c69623030" // "yunduswitchlib00"
-	shareSwitchSiteIDPrefix = "79756e6475737773"                 // "yundusws"
+	shareSwitchSiteIDPrefix = "79756e647573"                     // "yundus" (12 hex) + 8-hex epoch + 12-hex siteID = 32 hex
 )
 
 var inPlayerSwitchPNGCache sync.Map
@@ -38,11 +39,27 @@ type inPlayerSwitchSite struct {
 	IconHash         string
 }
 
-func shareSwitchSiteItemID(siteID int64) string {
+func nextInPlayerSwitchEpoch(prev uint32) uint32 {
+	unixNow := time.Now().Unix()
+	var nowEpoch uint32
+	if unixNow > 0 && unixNow <= math.MaxUint32 {
+		nowEpoch = uint32(unixNow)
+	}
+	if nowEpoch <= prev {
+		return prev + 1
+	}
+	return nowEpoch
+}
+
+func shareSwitchSiteItemIDForEpoch(siteID int64, epoch uint32) string {
 	if siteID <= 0 {
 		return ""
 	}
-	return shareSwitchSiteIDPrefix + fmt.Sprintf("%016x", uint64(siteID))
+	return fmt.Sprintf("%s%08x%012x", shareSwitchSiteIDPrefix, epoch, uint64(siteID)&0xffffffffffff)
+}
+
+func shareSwitchSiteItemID(siteID int64) string {
+	return shareSwitchSiteItemIDForEpoch(siteID, 0)
 }
 
 func isShareSwitchLibraryID(raw string) bool {
@@ -51,14 +68,32 @@ func isShareSwitchLibraryID(raw string) bool {
 
 func parseShareSwitchSiteItemID(raw string) (int64, bool) {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
-	if len(trimmed) != 32 || !strings.HasPrefix(trimmed, shareSwitchSiteIDPrefix) {
+	if len(trimmed) != 32 || isShareSwitchLibraryID(trimmed) || !strings.HasPrefix(trimmed, shareSwitchSiteIDPrefix) {
 		return 0, false
 	}
-	parsed, err := strconv.ParseUint(trimmed[16:], 16, 63)
+	// Validate the middle 8-hex epoch slice is valid hexadecimal (also accepts
+	// legacy v1.7.0 "77730000" epoch bytes seamlessly).
+	if _, err := strconv.ParseUint(trimmed[12:20], 16, 32); err != nil {
+		return 0, false
+	}
+	parsed, err := strconv.ParseUint(trimmed[20:], 16, 48)
 	if err != nil || parsed == 0 {
 		return 0, false
 	}
 	return int64(parsed), true
+}
+
+func (rt *shareUserRuntime) userSwitchEpoch(userID int64) uint32 {
+	if rt == nil || userID <= 0 {
+		return 0
+	}
+	rt.mu.RLock()
+	var epoch uint32
+	if st := rt.users[userID]; st != nil {
+		epoch = st.switchEpoch
+	}
+	rt.mu.RUnlock()
+	return epoch
 }
 
 func isShareSwitchAnyVirtualID(raw string) bool {
@@ -269,8 +304,8 @@ func buildInPlayerSwitchLibraryDTO(activeSite inPlayerSwitchSite, siteCount int,
 	}
 }
 
-func buildInPlayerSwitchSiteDTO(site inPlayerSwitchSite, isActive bool, virtualServerID string) map[string]any {
-	itemID := shareSwitchSiteItemID(site.ID)
+func buildInPlayerSwitchSiteDTO(site inPlayerSwitchSite, isActive bool, virtualServerID string, epoch uint32) map[string]any {
+	itemID := shareSwitchSiteItemIDForEpoch(site.ID, epoch)
 	imgTag := inPlayerSwitchImageTag("site", site.ID, site.Name, isActive, site.IconHash)
 	displayName := site.Name
 	tagline := "点亮爱心收藏 ❤️ 即刻无感切换到此服务器"
@@ -502,6 +537,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		return true
 	}
 	activeSiteID := sites[0].ID
+	switchEpoch := rt.userSwitchEpoch(routeUserID)
 
 	// 2. Favorite click -> switch primary site!
 	// Both POST (favorite) and DELETE (in case a client's stale local cache still
@@ -535,7 +571,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 				"PlayCount":             0,
 				"IsFavorite":            true,
 				"Played":                false,
-				"Key":                   shareSwitchSiteItemID(targetSiteID),
+				"Key":                   strings.ToLower(strings.TrimSpace(segs[3])),
 			})
 			return true
 		}
@@ -573,7 +609,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		if isShareSwitchLibraryID(parentID) {
 			allItems = make([]any, 0, len(sites))
 			for _, s := range sites {
-				allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID))
+				allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
 				if s.IconHash == "" {
 					rt.maybeAsyncFetchSiteAutoIcon(s.ID, "", "", 0)
 				}
@@ -585,7 +621,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 				} else if sid, ok := parseShareSwitchSiteItemID(part); ok {
 					for _, s := range sites {
 						if s.ID == sid {
-							allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID))
+							allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
 							break
 						}
 					}
@@ -635,7 +671,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		if sid, ok := parseShareSwitchSiteItemID(idSeg); ok {
 			for _, s := range sites {
 				if s.ID == sid {
-					writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID))
+					writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
 					return true
 				}
 			}
@@ -649,7 +685,13 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		sub := segs[2]
 		switch sub {
 		case "playbackinfo":
-			writeShareJSONError(w, http.StatusNotFound, "请点亮爱心收藏 ❤️ 即可切换服务器，无需播放")
+			// Players like CapyPlayer automatically pre-fetch PlaybackInfo on detail
+			// page open to render codec badges; return a clean 200 empty MediaSources
+			// payload to avoid noisy 404 logs.
+			writeInPlayerSwitchJSON(w, http.StatusOK, map[string]any{
+				"MediaSources":  []any{},
+				"PlaySessionId": "yundu-switch",
+			})
 			return true
 		case "similar", "intros", "additionalparts":
 			writeInPlayerSwitchJSON(w, http.StatusOK, map[string]any{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})

@@ -179,7 +179,7 @@ CGO_ENABLED=0 go build -trimpath -buildvcs=false -o yundu ./cmd/yundu
 
 ## 版本与开源致谢
 
-- 最新发布：`v1.7.0` · [完整更新记录](CHANGELOG.md) · [Releases](https://github.com/SonthyR/EMBY/releases/tag/v1.7.0)
+- 最新发布：`v1.7.1` · [完整更新记录](CHANGELOG.md) · [Releases](https://github.com/SonthyR/EMBY/releases/tag/v1.7.1)
 - **开源协议**：[MIT License](LICENSE)
 - **致谢上游**：云渡基于 [snnabb/Meridian](https://github.com/snnabb/Meridian) `v1.14.2`（MIT）二次开发，完整保留原作者版权声明；上游原始说明见 [docs/MERIDIAN-README.md](docs/MERIDIAN-README.md)。
 - **定位说明**：本项目面向个人多线路 Emby 体验优化与亲友小范围分享，请遵守所在地区法律法规及上游媒体服务器的使用条款。

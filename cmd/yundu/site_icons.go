@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -48,6 +49,172 @@ func detectSiteIconContentType(data []byte) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// normalizeSiteIconBytes validates supported image formats (PNG/JPEG/GIF/WebP)
+// and transparently converts Windows .ico favicons (both embedded-PNG and
+// 32-bit/24-bit BMP DIB frames) into standard PNG.
+func normalizeSiteIconBytes(raw []byte) ([]byte, string, bool) {
+	if len(raw) == 0 || len(raw) > siteIconMaxBytes {
+		return nil, "", false
+	}
+	if ct, ok := detectSiteIconContentType(raw); ok {
+		return raw, ct, true
+	}
+	if pngData, ok := decodeICOToPNG(raw); ok && len(pngData) <= siteIconMaxBytes {
+		return pngData, "image/png", true
+	}
+	return nil, "", false
+}
+
+// decodeICOToPNG extracts the highest-resolution supported frame from a Windows
+// ICO file (embedded PNG, 32-bit BGRA DIB, or 24-bit BGR DIB) and encodes it as PNG.
+func decodeICOToPNG(raw []byte) ([]byte, bool) {
+	if len(raw) < 6 || raw[0] != 0 || raw[1] != 0 || raw[2] != 1 || raw[3] != 0 {
+		return nil, false
+	}
+	count := int(binary.LittleEndian.Uint16(raw[4:6]))
+	if count <= 0 || count > 64 || len(raw) < 6+count*16 {
+		return nil, false
+	}
+
+	var bestPNG []byte
+	bestScore := -1
+	pngMagic := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
+	for i := 0; i < count; i++ {
+		off := 6 + i*16
+		w := int(raw[off])
+		if w == 0 {
+			w = 256
+		}
+		h := int(raw[off+1])
+		if h == 0 {
+			h = 256
+		}
+		bpp := int(binary.LittleEndian.Uint16(raw[off+6 : off+8]))
+		size := int(binary.LittleEndian.Uint32(raw[off+8 : off+12]))
+		imgOff := int(binary.LittleEndian.Uint32(raw[off+12 : off+16]))
+		if size <= 0 || imgOff < 6+count*16 || imgOff+size > len(raw) {
+			continue
+		}
+		entry := raw[imgOff : imgOff+size]
+
+		// Embedded PNG frame.
+		if len(entry) >= 8 && bytes.Equal(entry[:8], pngMagic) {
+			if cfg, err := png.DecodeConfig(bytes.NewReader(entry)); err == nil && cfg.Width > 0 && cfg.Height > 0 {
+				score := cfg.Width*cfg.Height*100 + 64
+				if score > bestScore {
+					bestScore = score
+					bestPNG = append([]byte(nil), entry...)
+				}
+			}
+			continue
+		}
+
+		// BMP DIB frame (40-byte BITMAPINFOHEADER, uncompressed BI_RGB = 0).
+		if len(entry) < 40 {
+			continue
+		}
+		hdrSizeU := binary.LittleEndian.Uint32(entry[0:4])
+		rawW := binary.LittleEndian.Uint32(entry[4:8])
+		rawH := binary.LittleEndian.Uint32(entry[8:12])
+		dibBPP := int(binary.LittleEndian.Uint16(entry[14:16]))
+		compression := binary.LittleEndian.Uint32(entry[16:20])
+		if hdrSizeU < 40 || int(hdrSizeU) > len(entry) || compression != 0 {
+			continue
+		}
+		hdrSize := int(hdrSizeU)
+		if rawW > 0 && rawW <= 512 {
+			w = int(rawW)
+		} else if rawW > 512 {
+			continue
+		}
+		if rawH > 0 && rawH <= 1024 {
+			dibH := int(rawH)
+			// ICO DIB headers double height to account for XOR + AND masks.
+			if dibH == h*2 || dibH%2 == 0 {
+				h = dibH / 2
+			} else {
+				h = dibH
+			}
+		} else if rawH > 1024 {
+			continue
+		}
+		if w <= 0 || h <= 0 || w > 512 || h > 512 {
+			continue
+		}
+		if dibBPP != 32 && dibBPP != 24 {
+			continue
+		}
+		if bpp == 0 {
+			bpp = dibBPP
+		}
+		bytesPerPixel := dibBPP / 8
+		xorRowStride := ((w*bytesPerPixel + 3) / 4) * 4
+		xorSize := xorRowStride * h
+		andRowStride := ((w + 31) / 32) * 4
+		if hdrSize+xorSize > len(entry) {
+			continue
+		}
+		xorData := entry[hdrSize : hdrSize+xorSize]
+		var andData []byte
+		if hdrSize+xorSize+andRowStride*h <= len(entry) {
+			andData = entry[hdrSize+xorSize : hdrSize+xorSize+andRowStride*h]
+		}
+
+		// Detect whether 32-bit DIB carries a non-zero alpha channel.
+		hasAlpha := false
+		if dibBPP == 32 {
+			for y := 0; y < h && !hasAlpha; y++ {
+				row := xorData[y*xorRowStride:]
+				for x := 0; x < w; x++ {
+					if row[x*4+3] != 0 {
+						hasAlpha = true
+						break
+					}
+				}
+			}
+		}
+
+		canvas := image.NewNRGBA(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			srcRow := xorData[(h-1-y)*xorRowStride:]
+			var maskRow []byte
+			if len(andData) > 0 {
+				maskRow = andData[(h-1-y)*andRowStride:]
+			}
+			for x := 0; x < w; x++ {
+				b := srcRow[x*bytesPerPixel]
+				g := srcRow[x*bytesPerPixel+1]
+				r := srcRow[x*bytesPerPixel+2]
+				a := uint8(255)
+				if dibBPP == 32 && hasAlpha {
+					a = srcRow[x*4+3]
+				} else if len(maskRow) > 0 {
+					if (maskRow[x/8]>>(7-(x%8)))&1 != 0 {
+						a = 0
+					}
+				}
+				canvas.SetNRGBA(x, y, color.NRGBA{R: r, G: g, B: b, A: a})
+			}
+		}
+
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, canvas); err != nil {
+			continue
+		}
+		score := w*h*100 + bpp
+		if score > bestScore {
+			bestScore = score
+			bestPNG = buf.Bytes()
+		}
+	}
+
+	if len(bestPNG) == 0 {
+		return nil, false
+	}
+	return bestPNG, true
 }
 
 func siteIconDataHash(data []byte) string {
@@ -195,6 +362,8 @@ func newSiteIconFetchFunc(
 			"/web/touchicon.png",
 			"/web/touchicon144.png",
 			"/web/assets/img/icon-transparent.png",
+			"/favicon.ico",
+			"/web/favicon.ico",
 		)
 
 		client := &http.Client{
@@ -264,8 +433,8 @@ func newSiteIconFetchFunc(
 					lastErr = errors.New("upstream icon exceeds 512 KB")
 					break
 				}
-				if ct, ok := detectSiteIconContentType(raw); ok {
-					return raw, ct, nil
+				if normData, ct, ok := normalizeSiteIconBytes(raw); ok {
+					return normData, ct, nil
 				}
 				lastErr = errors.New("upstream icon is not a supported image format")
 				break
@@ -489,12 +658,12 @@ func (a *App) handleSiteIcon(w http.ResponseWriter, r *http.Request, siteID int6
 			a.jsonErr(w, http.StatusBadRequest, "图片大小需在 512 KB 以内")
 			return
 		}
-		ct, ok := detectSiteIconContentType(raw)
+		normData, ct, ok := normalizeSiteIconBytes(raw)
 		if !ok {
-			a.jsonErr(w, http.StatusBadRequest, "仅支持 PNG / JPG / GIF / WebP 格式图片")
+			a.jsonErr(w, http.StatusBadRequest, "仅支持 PNG / JPG / GIF / WebP / ICO 格式图片")
 			return
 		}
-		if err := a.db.saveSiteCustomIcon(siteID, raw, ct); err != nil {
+		if err := a.db.saveSiteCustomIcon(siteID, normData, ct); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -502,7 +671,7 @@ func (a *App) handleSiteIcon(w http.ResponseWriter, r *http.Request, siteID int6
 			"ok":           true,
 			"source":       "custom",
 			"content_type": ct,
-			"hash":         siteIconDataHash(raw),
+			"hash":         siteIconDataHash(normData),
 		})
 
 	case sub == "" && r.Method == http.MethodDelete:

@@ -244,6 +244,7 @@ type shareUserState struct {
 	resetPeriod          string
 	siteOrder            []int64         // ordered site IDs (first enabled = active site)
 	sites                map[int64]int64 // site ID -> preferred site_account ID (0 = first usable)
+	switchEpoch          uint32          // rotates on primary site change so clients clear stale local favorite cache
 
 	pending atomic.Int64 // bytes metered but not yet written to share_users.traffic_used
 }
@@ -454,9 +455,12 @@ func (rt *shareUserRuntime) reload() error {
 	for _, item := range loaded {
 		seen[item.id] = true
 		state := rt.users[item.id]
+		var prevFirstSite int64
 		if state == nil {
-			state = &shareUserState{id: item.id}
+			state = &shareUserState{id: item.id, switchEpoch: nextInPlayerSwitchEpoch(0)}
 			rt.users[item.id] = state
+		} else if len(state.siteOrder) > 0 {
+			prevFirstSite = state.siteOrder[0]
 		}
 		state.username = item.username
 		state.passwordHash = item.hash
@@ -479,6 +483,11 @@ func (rt *shareUserRuntime) reload() error {
 		state.resetDay = item.resetDay
 		state.resetPeriod = item.resetPeriod
 		state.siteOrder = siteOrders[item.id]
+		if len(state.siteOrder) > 0 && prevFirstSite > 0 && state.siteOrder[0] != prevFirstSite {
+			state.switchEpoch = nextInPlayerSwitchEpoch(state.switchEpoch)
+		} else if state.switchEpoch == 0 {
+			state.switchEpoch = nextInPlayerSwitchEpoch(0)
+		}
 		state.sites = assignments[item.id]
 		if state.sites == nil {
 			state.sites = map[int64]int64{}
