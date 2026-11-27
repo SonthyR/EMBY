@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.9"
+var appVersion = "v1.5.10"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -276,6 +276,8 @@ func main() {
 	mux.HandleFunc("/api/backup/restore", cors(app.authMiddleware(app.handleBackupRestore)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/reorder", cors(app.authMiddleware(app.handleSiteReorder)))
+	mux.HandleFunc("/api/danmaku-sources", cors(app.authMiddleware(app.handleDanmakuSources)))
+	mux.HandleFunc("/api/danmaku-sources/", cors(app.authMiddleware(app.handleDanmakuSourceByID)))
 	mux.HandleFunc("/api/site-data/export", cors(app.authMiddleware(app.handleSiteDataExport)))
 	mux.HandleFunc("/api/site-data/import", cors(app.authMiddleware(app.handleSiteDataImport)))
 	mux.HandleFunc("/api/site-data/parse-message", cors(app.authMiddleware(app.handleSiteMessageParse)))
@@ -329,6 +331,7 @@ func main() {
 	mux.HandleFunc("/api/", cors(func(w http.ResponseWriter, _ *http.Request) {
 		app.jsonErr(w, http.StatusNotFound, "API route not found")
 	}))
+	mux.HandleFunc("/dm/", app.handleDanmakuProxy)
 
 	// Embedded static files
 	staticFS, err := fs.Sub(web.StaticFiles, "static")

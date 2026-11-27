@@ -176,7 +176,7 @@ func normalizeRoutePrefix(value string) (string, error) {
 }
 
 var reservedPathIngressPrefixes = map[string]struct{}{
-	"api": {}, "css": {}, "js": {}, "fonts": {}, "index.html": {}, "favicon.svg": {}, "_meridian": {},
+	"api": {}, "css": {}, "js": {}, "fonts": {}, "index.html": {}, "favicon.svg": {}, "_meridian": {}, "dm": {},
 }
 
 // normalizePathPrefix validates the single URL path segment used by shared

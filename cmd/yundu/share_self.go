@@ -224,6 +224,11 @@ func (a *App) buildShareSelfView(user *storedShareUser, r *http.Request) shareSe
 		ShareUser: a.shareUserView(user, false, origin),
 		Network:   a.buildShareSelfNetwork(r),
 	}
+	if view.Status == "active" {
+		if dm := a.buildShareUserDanmakuSources(user, origin); len(dm) > 0 {
+			view.DanmakuSources = dm
+		}
+	}
 	if a.pm != nil && a.pm.shares != nil {
 		if sessions, err := a.pm.shares.listSessions(user.ID); err == nil {
 			view.Sessions = sessions

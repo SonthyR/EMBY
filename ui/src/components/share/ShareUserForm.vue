@@ -5,13 +5,16 @@ import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
-import { shareApi, sitesApi, type ShareUser, type ShareUserInput, type Site, type SiteAccount } from '@/api'
+import { shareApi, sitesApi, type DanmakuSource, type ShareUser, type ShareUserInput, type Site, type SiteAccount } from '@/api'
 import { GB, dateOnly } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
 
-const RESERVED_PREFIXES = new Set(['api', 'app', 'legacy', 'css', 'js', 'fonts', 'index.html', 'favicon.svg', '_meridian'])
+const RESERVED_PREFIXES = new Set(['api', 'app', 'legacy', 'css', 'js', 'fonts', 'index.html', 'favicon.svg', '_meridian', 'dm'])
 
-const props = defineProps<{ open: boolean; user: ShareUser | null; sites: Site[] }>()
+const props = withDefaults(
+  defineProps<{ open: boolean; user: ShareUser | null; sites: Site[]; danmakuSources?: DanmakuSource[] }>(),
+  { danmakuSources: () => [] },
+)
 const emit = defineEmits<{ close: []; saved: [user: ShareUser, created: boolean] }>()
 
 const form = reactive({
@@ -28,6 +31,7 @@ const form = reactive({
 })
 const selected = reactive<Record<number, { on: boolean; account: number }>>({})
 const siteOrder = ref<number[]>([])
+const selectedDanmakuIds = ref<number[]>([])
 const accounts = reactive<Record<number, SiteAccount[]>>({})
 const saving = ref(false)
 const errors = reactive<Record<string, string>>({})
@@ -64,6 +68,16 @@ const orderedSites = computed(() => {
 
 const assignedSites = computed(() => orderedSites.value.filter(s => selected[s.id]?.on))
 const unassignedSites = computed(() => orderedSites.value.filter(s => !selected[s.id]?.on))
+const assignedDanmaku = computed(() => props.danmakuSources.filter(d => selectedDanmakuIds.value.includes(d.id)))
+const unassignedDanmaku = computed(() => props.danmakuSources.filter(d => !selectedDanmakuIds.value.includes(d.id)))
+
+function addDanmaku(id: number) {
+  if (!selectedDanmakuIds.value.includes(id)) selectedDanmakuIds.value = [...selectedDanmakuIds.value, id]
+}
+
+function removeDanmaku(id: number) {
+  selectedDanmakuIds.value = selectedDanmakuIds.value.filter(item => item !== id)
+}
 
 function reorderSelected(fromIdx: number, toIdx: number) {
   const active = assignedSites.value.map(s => s.id)
@@ -180,6 +194,7 @@ watch(
     const assignedIds = (user?.sites || []).map(s => s.site_id)
     const restIds = props.sites.map(s => s.id).filter(id => !assignedIds.includes(id))
     siteOrder.value = [...assignedIds, ...restIds]
+    selectedDanmakuIds.value = [...(user?.danmaku_source_ids || [])]
     loadAccounts()
   },
   { immediate: true },
@@ -229,6 +244,7 @@ function validate(): ShareUserInput | null {
     speed_limit: speed,
     traffic_reset_day: Number(form.resetDay) || 0,
     sites,
+    danmaku_source_ids: [...selectedDanmakuIds.value],
   }
 }
 
@@ -364,6 +380,29 @@ async function save() {
       </fieldset>
 
       <fieldset>
+        <legend>分配弹幕服务（可选 · 跨站通用，不限所看 Emby 服）</legend>
+        <p v-if="!danmakuSources.length" class="faint dm-empty-hint">尚未配置弹幕源，可在「站点 → 弹幕服务」中添加。</p>
+        <template v-else>
+          <div v-if="assignedDanmaku.length" class="dm-assigned">
+            <div v-for="dm in assignedDanmaku" :key="dm.id" class="dm-row">
+              <span class="site-name">{{ dm.name }}</span>
+              <span class="dm-egress-tag">{{ dm.egress_name || (dm.egress_node_id > 0 ? `节点 #${dm.egress_node_id}` : '主机直出') }}</span>
+              <span v-if="!dm.enabled" class="off-tag">停用</span>
+              <button type="button" class="rm-btn" aria-label="移除弹幕源" title="移除弹幕源" @click="removeDanmaku(dm.id)"><X /></button>
+            </div>
+          </div>
+          <div v-if="unassignedDanmaku.length" class="add-wrap">
+            <span class="add-label">{{ assignedDanmaku.length ? '点击继续分配其他弹幕源' : '点击为该账号分配弹幕源' }}</span>
+            <div class="add-chips">
+              <button v-for="dm in unassignedDanmaku" :key="dm.id" type="button" class="add-chip" @click="addDanmaku(dm.id)">
+                <Plus /><span>{{ dm.name }}</span><small v-if="!dm.enabled">停用</small>
+              </button>
+            </div>
+          </div>
+        </template>
+      </fieldset>
+
+      <fieldset>
         <legend>其他</legend>
         <UiField label="备注" for="su-note">
           <input id="su-note" v-model="form.note" class="input" maxlength="1000" placeholder="比如朋友的名字" />
@@ -465,5 +504,25 @@ legend + * { clear: both; }
 .add-chip small { font-size: 10.5px; color: var(--bad); }
 
 .err { margin: 0; font-size: 12px; color: var(--bad); }
+.dm-empty-hint { margin: 0; font-size: 12.5px; }
+.dm-assigned { display: flex; flex-direction: column; gap: 7px; }
+.dm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.dm-egress-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
 @media (max-width: 520px) { .grid { grid-template-columns: minmax(0, 1fr); } }
 </style>

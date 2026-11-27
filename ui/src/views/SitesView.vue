@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, Search, Copy, Zap, MoreHorizontal, GripVertical } from '@lucide/vue'
+import { Plus, Search, Copy, Zap, MoreHorizontal, GripVertical, MessageSquareText } from '@lucide/vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiMenu from '@/components/ui/UiMenu.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
@@ -11,6 +11,7 @@ import SiteEditor from '@/components/sites/SiteEditor.vue'
 import SiteImportDialog from '@/components/sites/SiteImportDialog.vue'
 import SiteExportDialog from '@/components/sites/SiteExportDialog.vue'
 import ReminderHistoryDialog from '@/components/sites/ReminderHistoryDialog.vue'
+import DanmakuDrawer from '@/components/sites/DanmakuDrawer.vue'
 import { edgeApi, sitesApi, type AccountReminderRow, type EdgeNode, type IngressCapabilities, type Site } from '@/api'
 import { INGRESS_LABEL, diagLatency, normalizedIngressMode, siteAccessAddress } from '@/components/sites/siteLogic'
 import { usePointerSort } from '@/composables/usePointerSort'
@@ -36,6 +37,7 @@ const importFormat = ref('json')
 const importData = ref('')
 const exportOpen = ref(false)
 const historyOpen = ref(false)
+const danmakuOpen = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 
 async function load(silent = false) {
@@ -221,6 +223,7 @@ const menuItems = [
       <UiMenu :items="menuItems" label="更多操作" @select="onMenu">
         <UiButton icon aria-label="更多操作"><MoreHorizontal /></UiButton>
       </UiMenu>
+      <UiButton variant="secondary" @click="danmakuOpen = true"><MessageSquareText />弹幕服务</UiButton>
       <UiButton variant="primary" @click="edit()"><Plus />添加站点</UiButton>
     </PageHeader>
 
@@ -353,6 +356,7 @@ const menuItems = [
     <SiteImportDialog :open="importOpen" :format="importFormat" :data="importData" @close="importOpen = false" @imported="load(true)" />
     <SiteExportDialog :open="exportOpen" @close="exportOpen = false" />
     <ReminderHistoryDialog :open="historyOpen" @close="historyOpen = false" @changed="load(true)" />
+    <DanmakuDrawer :open="danmakuOpen" :edge-nodes="edgeNodes" @close="danmakuOpen = false" />
   </div>
 </template>
 

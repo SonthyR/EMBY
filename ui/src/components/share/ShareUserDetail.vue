@@ -4,7 +4,7 @@ import { Copy, Pencil, Eye, EyeOff, MonitorSmartphone, ChevronRight, X, GripVert
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiProgress from '@/components/ui/UiProgress.vue'
-import { shareApi, shareUserToInput, type ShareSession, type ShareUser, type Site } from '@/api'
+import { shareApi, shareUserToInput, type DanmakuSource, type ShareSession, type ShareUser, type Site } from '@/api'
 import { confirm } from '@/stores/confirm'
 import { errorMessage, toast } from '@/stores/toast'
 import { copyText, daysUntil, dateOnly, formatBytes, relativeTime } from '@/utils/format'
@@ -16,8 +16,8 @@ interface DraftSite {
 }
 
 const props = withDefaults(
-  defineProps<{ open: boolean; user: ShareUser | null; sites?: Site[] }>(),
-  { sites: () => [] },
+  defineProps<{ open: boolean; user: ShareUser | null; sites?: Site[]; danmakuSources?: DanmakuSource[] }>(),
+  { sites: () => [], danmakuSources: () => [] },
 )
 const emit = defineEmits<{ close: []; edit: []; changed: []; deleted: []; copyShare: [] }>()
 const detail = ref<ShareUser | null>(null)
@@ -42,6 +42,29 @@ const unassignedSites = computed(() => {
   const assignedSet = new Set(draftSites.value.map(d => d.site_id))
   return props.sites.filter(s => !assignedSet.has(s.id))
 })
+
+const assignedDanmakuIds = computed(() => new Set(detail.value?.danmaku_source_ids || []))
+const assignedDanmakuList = computed(() => {
+  const urlById = new Map((detail.value?.danmaku_sources || []).map(d => [d.id, d.url]))
+  return props.danmakuSources
+    .filter(d => assignedDanmakuIds.value.has(d.id))
+    .map(d => ({ source: d, url: urlById.get(d.id) || '' }))
+})
+const unassignedDanmakuList = computed(() => props.danmakuSources.filter(d => !assignedDanmakuIds.value.has(d.id)))
+
+async function assignDanmaku(dm: DanmakuSource) {
+  const u = detail.value
+  if (!u || busy.value) return
+  const nextIds = [...new Set([...(u.danmaku_source_ids || []), dm.id])]
+  await run(`dm-add-${dm.id}`, () => shareApi.update(u.id, shareUserToInput(u, { danmaku_source_ids: nextIds })), `已分配弹幕「${dm.name}」`)
+}
+
+async function unassignDanmaku(dm: DanmakuSource) {
+  const u = detail.value
+  if (!u || busy.value) return
+  const nextIds = (u.danmaku_source_ids || []).filter(id => id !== dm.id)
+  await run(`dm-rm-${dm.id}`, () => shareApi.update(u.id, shareUserToInput(u, { danmaku_source_ids: nextIds })), `已取消分配「${dm.name}」`)
+}
 
 function syncDraftSites(u: ShareUser | null) {
   const next: DraftSite[] = []
@@ -120,6 +143,22 @@ const toggle = () => {
 const renew = (days: number) => run('renew', () => shareApi.renew(detail.value!.id, days), days === 365 ? '已续期 1 年' : `已续期 ${days} 天`)
 async function resetTraffic() {
   if (await confirm({ title: '清零已用流量？', message: '本周期的已用流量会归零，额度重新计算。', confirmText: '清零' })) run('reset', () => shareApi.resetTraffic(detail.value!.id), '已清零')
+}
+async function resetDanmakuToken() {
+  const u = detail.value
+  if (!u) return
+  if (
+    await confirm({
+      title: `重置 ${u.username} 的弹幕链接？`,
+      message: '旧的专属弹幕地址会立即失效，需在播放器中重新粘贴新地址；其他分享账号不受影响。',
+      confirmText: '重置链接',
+    })
+  ) {
+    await run('reset-danmaku', () => shareApi.resetDanmakuToken(u.id), '专属弹幕链接已重置')
+  }
+}
+async function copyDanmakuURL(url: string) {
+  if (url && (await copyText(url))) toast.success('专属弹幕地址已复制')
 }
 const kick = () => run('kick', () => shareApi.kick(detail.value!.id), '已断开所有设备')
 async function kickOne(session: ShareSession) {
@@ -310,6 +349,15 @@ async function saveSites() {
             <button v-if="detail.password" type="button" aria-label="复制密码" @click="copyPassword"><Copy /></button>
           </dd>
         </div>
+        <div v-if="detail.danmaku_sources?.length">
+          <dt>专属弹幕</dt>
+          <dd class="dm-links">
+            <div v-for="dm in detail.danmaku_sources" :key="dm.id" class="secret">
+              <span class="mono" :title="dm.url">{{ dm.name }}：{{ dm.url }}</span>
+              <button type="button" aria-label="复制弹幕地址" @click="copyDanmakuURL(dm.url)"><Copy /></button>
+            </div>
+          </dd>
+        </div>
         <div v-if="detail.note"><dt>备注信息</dt><dd>{{ detail.note }}</dd></div>
       </dl>
 
@@ -411,6 +459,65 @@ async function saveSites() {
         </div>
       </section>
 
+      <section v-if="danmakuSources.length" class="block sites-block">
+        <div class="block-head">
+          <h3>分配的弹幕服务</h3>
+          <span class="faint hint">跨站通用 · 随账号有效期联动</span>
+        </div>
+        <div v-if="assignedDanmakuList.length" class="drag-list">
+          <div v-for="{ source, url } in assignedDanmakuList" :key="source.id" class="drag-row" :class="{ off: !source.enabled }">
+            <div class="site-info">
+              <span class="site-name" :title="source.name">{{ source.name }}</span>
+              <span class="active-tag">{{ source.egress_name || (source.egress_node_id > 0 ? `节点 #${source.egress_node_id}` : '主机直出') }}</span>
+              <span v-if="!source.enabled" class="off-tag">停用</span>
+            </div>
+            <div class="row-tools">
+              <button
+                v-if="url"
+                type="button"
+                class="tool-btn"
+                :disabled="!!busy"
+                title="复制该用户专属弹幕地址"
+                aria-label="复制弹幕地址"
+                @click="copyDanmakuURL(url)"
+              >
+                <Copy />
+              </button>
+              <button
+                type="button"
+                class="tool-btn remove"
+                :disabled="!!busy"
+                title="取消分配该弹幕源"
+                aria-label="取消分配弹幕源"
+                @click="unassignDanmaku(source)"
+              >
+                <X />
+              </button>
+            </div>
+          </div>
+        </div>
+        <p v-else class="faint none">暂未分配弹幕服务</p>
+
+        <div v-if="unassignedDanmakuList.length" class="unassigned-wrap">
+          <span class="unassigned-label">点击分配弹幕服务</span>
+          <div class="unassigned-chips">
+            <button
+              v-for="dm in unassignedDanmakuList"
+              :key="dm.id"
+              type="button"
+              class="add-chip"
+              :class="{ off: !dm.enabled }"
+              :disabled="!!busy"
+              @click="assignDanmaku(dm)"
+            >
+              <Plus />
+              <span>{{ dm.name }}</span>
+              <small v-if="!dm.enabled">停用</small>
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="block">
         <h3>已登录设备</h3>
         <ul v-if="detail.sessions?.length" class="devices">
@@ -448,6 +555,7 @@ async function saveSites() {
           <button type="button" :disabled="!!busy" @click="renew(30)">续期 30 天<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="renew(365)">续期 1 年<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="resetTraffic">清零已用流量<ChevronRight /></button>
+          <button type="button" :disabled="!!busy" @click="resetDanmakuToken">重置弹幕链接<ChevronRight /></button>
           <button type="button" :disabled="!!busy || !detail.session_count" @click="kick">断开所有设备<ChevronRight /></button>
           <button type="button" :disabled="!!busy" @click="toggle">{{ detail.enabled ? '停用账号' : '启用账号' }}<ChevronRight /></button>
           <button type="button" class="danger" :disabled="!!busy" @click="remove">删除账号<ChevronRight /></button>
@@ -508,6 +616,7 @@ async function saveSites() {
   font-weight: 600;
 }
 .secret { display: flex; align-items: center; gap: 4px; }
+.dm-links { display: flex; flex-direction: column; gap: 4px; }
 .secret .mono { flex: 1; }
 .secret button { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .secret button:hover { background: var(--surface-hover); color: var(--text); }

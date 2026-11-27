@@ -753,12 +753,18 @@ func (a *App) handleRedeemRegister(w http.ResponseWriter, r *http.Request) {
 		userNote = "卡密开号 " + c.Code
 	}
 
+	danmakuToken, err := newShareDanmakuToken()
+	if err != nil {
+		_ = tx.Rollback()
+		a.jsonErr(w, http.StatusInternalServerError, "创建账号失败")
+		return
+	}
 	var maxOrder int
 	_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM share_users`).Scan(&maxOrder)
 	res, err := tx.Exec(
-		`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, sort_order)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		username, string(pwHash), pwCipher, routePrefix, userNote, 1, expiresAt, c.TrafficQuota, c.MaxDevices, c.SpeedLimit, c.ResetDay, resetPeriod, portalToken, maxOrder+1,
+		`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, danmaku_token, sort_order)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		username, string(pwHash), pwCipher, routePrefix, userNote, 1, expiresAt, c.TrafficQuota, c.MaxDevices, c.SpeedLimit, c.ResetDay, resetPeriod, portalToken, danmakuToken, maxOrder+1,
 	)
 	if err != nil {
 		_ = tx.Rollback()

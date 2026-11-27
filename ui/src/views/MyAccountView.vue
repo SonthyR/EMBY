@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ArrowUpToLine, Copy, GripVertical, LogOut, MonitorSmartphone, Moon, ShieldBan, Sun, SunMoon, Wifi, X } from '@lucide/vue'
+import { ArrowUpToLine, Copy, GripVertical, LogOut, MessageSquareText, MonitorSmartphone, Moon, ShieldBan, Sun, SunMoon, Wifi, X } from '@lucide/vue'
 import logo from '@/assets/logo.svg'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
@@ -392,6 +392,34 @@ async function changePassword() {
           </ul>
         </section>
 
+        <section v-if="me.status === 'active' && me.danmaku_sources?.length" class="bento-section danmaku-section">
+          <div class="block-head">
+            <h2 class="dm-heading"><MessageSquareText />弹幕服务</h2>
+            <span class="dm-badge">账号联动 · 国内直连</span>
+          </div>
+          <p class="faint hint">你的专属弹幕 API 地址，自动跟随当前账号有效期生效；账号过期或停用后自动失效，请勿外传。</p>
+          <ul class="dm-sources">
+            <li v-for="dm in me.danmaku_sources" :key="dm.id" class="dm-source-item">
+              <div class="dm-source-head">
+                <span class="dm-source-name">{{ dm.name }}</span>
+                <small v-if="dm.note" class="faint">{{ dm.note }}</small>
+              </div>
+              <div class="fixed-addr">
+                <span class="mono">{{ dm.url }}</span>
+                <UiButton variant="primary" size="sm" @click="copy(dm.url)"><Copy />复制地址</UiButton>
+              </div>
+            </li>
+          </ul>
+          <details class="dm-guide">
+            <summary>播放器填写指引（SenPlayer / Forward / Hills / Yamby）</summary>
+            <ul>
+              <li><strong>SenPlayer</strong>：设置 → 弹幕 → 弹幕服务器 / 自定义 API → 粘贴上方完整地址。</li>
+              <li><strong>Forward</strong>：设置 → 弹幕设置 → 自定义弹幕源 → 粘贴上方完整地址。</li>
+              <li><strong>Hills / Yamby</strong>：设置 → 弹幕 → 弹幕 API 地址 → 粘贴上方完整地址并开启。</li>
+            </ul>
+          </details>
+        </section>
+
         <section class="bento-section">
           <div class="block-head">
             <h2>已登录设备</h2>
@@ -585,6 +613,34 @@ h2 { margin: 0; font-size: 15.5px; font-weight: 700; letter-spacing: -0.015em; }
   background: var(--surface-2);
 }
 .fixed-addr .mono { overflow-wrap: anywhere; font-size: 13px; }
+.dm-heading { display: inline-flex; align-items: center; gap: 7px; }
+.dm-heading svg { width: 17px; height: 17px; color: var(--accent); }
+.dm-badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--good-soft);
+  color: var(--good);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.dm-sources { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.dm-source-item { display: flex; flex-direction: column; gap: 6px; }
+.dm-source-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.dm-source-name { font-size: 13.5px; font-weight: 600; color: var(--text); }
+.dm-guide {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.dm-guide summary { cursor: pointer; font-weight: 600; color: var(--text); list-style: none; }
+.dm-guide summary::-webkit-details-marker { display: none; }
+.dm-guide summary::before { content: '▸ '; color: var(--accent); }
+.dm-guide[open] summary::before { content: '▾ '; }
+.dm-guide ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; line-height: 1.55; }
 .drain-note {
   margin: 10px 0 0;
   padding: 10px 12px;

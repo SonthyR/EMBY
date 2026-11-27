@@ -45,10 +45,12 @@ type ShareUser struct {
 	NextResetAt      string               `json:"next_reset_at,omitempty"`
 	ActiveSiteID     int64                `json:"active_site_id,omitempty"`
 	ActiveSiteName   string               `json:"active_site_name,omitempty"`
-	Sites            []ShareUserSite      `json:"sites"`
-	Sessions         []shareStoredSession `json:"sessions,omitempty"`
-	CreatedAt        string               `json:"created_at"`
-	UpdatedAt        string               `json:"updated_at"`
+	Sites            []ShareUserSite          `json:"sites"`
+	Sessions         []shareStoredSession     `json:"sessions,omitempty"`
+	DanmakuSourceIDs []int64                  `json:"danmaku_source_ids"`
+	DanmakuSources   []shareSelfDanmakuSource `json:"danmaku_sources,omitempty"`
+	CreatedAt        string                   `json:"created_at"`
+	UpdatedAt        string                   `json:"updated_at"`
 }
 
 type ShareUserSiteInput struct {
@@ -66,14 +68,16 @@ type ShareUserInput struct {
 	TrafficQuota int64                `json:"traffic_quota"`
 	MaxDevices   int                  `json:"max_devices"`
 	SpeedLimit   int                  `json:"speed_limit"`
-	ResetDay     int                  `json:"traffic_reset_day"`
-	Sites        []ShareUserSiteInput `json:"sites"`
+	ResetDay         int                  `json:"traffic_reset_day"`
+	Sites            []ShareUserSiteInput `json:"sites"`
+	DanmakuSourceIDs *[]int64             `json:"danmaku_source_ids"`
 }
 
 type storedShareUser struct {
 	ShareUser
 	passwordCiphertext string
 	portalToken        string
+	danmakuToken       string
 }
 
 func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
@@ -83,8 +87,8 @@ func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
-	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
-		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.CreatedAt, &item.UpdatedAt)
+	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, traffic_reset_day, speed_limit, portal_token, danmaku_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
+		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.danmakuToken, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +98,11 @@ func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) 
 		return nil, err
 	}
 	item.Sites = sites
+	dmIDs, err := d.shareUserDanmakuSourceIDs(item.ID)
+	if err != nil {
+		return nil, err
+	}
+	item.DanmakuSourceIDs = dmIDs
 	return &item, nil
 }
 
@@ -238,6 +247,27 @@ func (a *App) normalizeShareUserInput(input ShareUserInput, excludeID int64, cre
 			}
 		}
 	}
+	if input.DanmakuSourceIDs != nil {
+		if len(*input.DanmakuSourceIDs) > 100 {
+			return input, errors.New("弹幕源选择数量过多")
+		}
+		dedup := make([]int64, 0, len(*input.DanmakuSourceIDs))
+		seenDM := make(map[int64]bool, len(*input.DanmakuSourceIDs))
+		for _, dmID := range *input.DanmakuSourceIDs {
+			if dmID <= 0 {
+				return input, errors.New("弹幕源选择无效")
+			}
+			if seenDM[dmID] {
+				continue
+			}
+			seenDM[dmID] = true
+			if _, err := a.db.GetDanmakuSource(dmID); err != nil {
+				return input, errors.New("所选弹幕源不存在")
+			}
+			dedup = append(dedup, dmID)
+		}
+		input.DanmakuSourceIDs = &dedup
+	}
 	return input, nil
 }
 
@@ -259,6 +289,10 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+		danmakuToken, err := newShareDanmakuToken()
+		if err != nil {
+			return 0, err
+		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 		if err != nil {
 			return 0, err
@@ -269,8 +303,8 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 		}
 		var maxOrder int
 		_ = tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM share_users`).Scan(&maxOrder)
-		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken, maxOrder+1)
+		result, err := tx.Exec(`INSERT INTO share_users(username, password_hash, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, max_devices, speed_limit, traffic_reset_day, traffic_reset_period, portal_token, danmaku_token, sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			input.Username, string(hash), cipher, input.RoutePrefix, input.Note, sqliteBool(enabled), input.ExpiresAt, input.TrafficQuota, input.MaxDevices, input.SpeedLimit, input.ResetDay, resetPeriod, portalToken, danmakuToken, maxOrder+1)
 		if err != nil {
 			if isSQLiteUniqueConstraintError(err) {
 				if strings.Contains(err.Error(), "route_prefix") {
@@ -328,6 +362,16 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 			return 0, err
 		}
 	}
+	if input.DanmakuSourceIDs != nil {
+		if _, err := tx.Exec(`DELETE FROM share_user_danmaku_sources WHERE share_user_id=?`, id); err != nil {
+			return 0, err
+		}
+		for _, dmID := range *input.DanmakuSourceIDs {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO share_user_danmaku_sources(share_user_id, danmaku_source_id) VALUES(?,?)`, id, dmID); err != nil {
+				return 0, err
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
@@ -362,6 +406,11 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin s
 		if password, err := decryptSiteAccountSecret(item.passwordCiphertext); err == nil {
 			view.Password = password
 		}
+		if origin != "" {
+			if dm := a.buildShareUserDanmakuSources(item, origin); len(dm) > 0 {
+				view.DanmakuSources = dm
+			}
+		}
 	}
 	if view.Sites == nil {
 		view.Sites = []ShareUserSite{}
@@ -369,6 +418,13 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin s
 		copied := make([]ShareUserSite, len(view.Sites))
 		copy(copied, view.Sites)
 		view.Sites = copied
+	}
+	if view.DanmakuSourceIDs == nil {
+		view.DanmakuSourceIDs = []int64{}
+	} else {
+		copiedDM := make([]int64, len(view.DanmakuSourceIDs))
+		copy(copiedDM, view.DanmakuSourceIDs)
+		view.DanmakuSourceIDs = copiedDM
 	}
 	if view.RoutePrefix != "" && origin != "" {
 		view.RouteURL = strings.TrimRight(origin, "/") + view.RoutePrefix
@@ -479,6 +535,12 @@ func (a *App) shareUserText(item *storedShareUser, origin string) (string, error
 		}
 		if origin != "" {
 			builder.WriteString("查看用量和到期：用上面的账号登录 " + origin + "\n")
+		}
+	}
+	if view.Status == "active" && len(view.DanmakuSources) > 0 {
+		builder.WriteString("专属弹幕 API（随账号有效期联动）：\n")
+		for _, dm := range view.DanmakuSources {
+			builder.WriteString("- " + dm.Name + "：" + dm.URL + "\n")
 		}
 	}
 	builder.WriteString("在 Emby 客户端中添加服务器地址后，用上面的用户名和密码登录。")
@@ -803,6 +865,27 @@ func (a *App) handleShareUserByID(w http.ResponseWriter, r *http.Request) {
 			updated = item
 		}
 		a.jsonOK(w, a.shareUserView(updated, true, a.shareTextOrigin(r)))
+	case "reset-danmaku-token":
+		if r.Method != http.MethodPost {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if _, err := a.db.resetShareUserDanmakuToken(id); err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "弹幕凭证重置失败")
+			return
+		}
+		updated, err := a.db.getShareUser(id)
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "分享账号读取失败")
+			return
+		}
+		view := a.shareUserView(updated, true, a.shareTextOrigin(r))
+		if shares != nil {
+			if sessions, err := shares.listSessions(id); err == nil {
+				view.Sessions = sessions
+			}
+		}
+		a.jsonOK(w, view)
 	case "renew":
 		if r.Method != http.MethodPost {
 			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")

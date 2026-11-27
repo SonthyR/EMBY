@@ -97,6 +97,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		{"share_users", "traffic_reset_day", "ALTER TABLE share_users ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "traffic_reset_period", "ALTER TABLE share_users ADD COLUMN traffic_reset_period TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "portal_token", "ALTER TABLE share_users ADD COLUMN portal_token TEXT NOT NULL DEFAULT ''"},
+		{"share_users", "danmaku_token", "ALTER TABLE share_users ADD COLUMN danmaku_token TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "speed_limit", "ALTER TABLE share_users ADD COLUMN speed_limit INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "route_prefix", "ALTER TABLE share_users ADD COLUMN route_prefix TEXT NOT NULL DEFAULT ''"},
 		{"share_users", "sort_order", "ALTER TABLE share_users ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"},
@@ -131,6 +132,12 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_portal ON share_users(portal_token) WHERE portal_token <> ''"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE share_users SET danmaku_token=lower(hex(randomblob(16))) WHERE danmaku_token=''"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_danmaku ON share_users(danmaku_token) WHERE danmaku_token <> ''"); err != nil {
 		return err
 	}
 	_, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_users_route_prefix ON share_users(route_prefix) WHERE route_prefix <> ''")

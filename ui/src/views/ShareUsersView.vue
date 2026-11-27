@@ -9,7 +9,7 @@ import ShareUserForm from '@/components/share/ShareUserForm.vue'
 import ShareUserDetail from '@/components/share/ShareUserDetail.vue'
 import ShareTextDialog from '@/components/share/ShareTextDialog.vue'
 import RedeemCodesPanel from '@/components/share/RedeemCodesPanel.vue'
-import { shareApi, sitesApi, type ShareStatus, type ShareUser, type Site } from '@/api'
+import { danmakuApi, shareApi, sitesApi, type DanmakuSource, type ShareStatus, type ShareUser, type Site } from '@/api'
 import { usePointerSort } from '@/composables/usePointerSort'
 import { copyText, daysUntil, dateOnly, formatBytes } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
@@ -19,6 +19,7 @@ const route = useRoute()
 const router = useRouter()
 const users = ref<ShareUser[]>([])
 const sites = ref<Site[]>([])
+const danmakuSources = ref<DanmakuSource[]>([])
 const loading = ref(true)
 const loadError = ref('')
 const query = ref('')
@@ -42,10 +43,15 @@ async function load(silent = false) {
   const gen = ++listLoadGen
   if (!silent) loading.value = true
   try {
-    const [list, siteList] = await Promise.all([shareApi.list(), sitesApi.list()])
+    const [list, siteList, dmList] = await Promise.all([
+      shareApi.list(),
+      sitesApi.list(),
+      danmakuApi.list().catch(() => [] as DanmakuSource[]),
+    ])
     if (gen !== listLoadGen) return
     users.value = list
     sites.value = siteList
+    danmakuSources.value = dmList
     loadError.value = ''
   } catch (error) {
     if (gen !== listLoadGen) return
@@ -287,6 +293,9 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
                     <span v-if="user.active_site_name || user.sites[0]?.site_name" class="emby-chip">
                       {{ user.active_site_name || user.sites[0]?.site_name }}
                     </span>
+                    <span v-if="user.danmaku_source_ids?.length" class="dm-chip">
+                      弹幕 ×{{ user.danmaku_source_ids.length }}
+                    </span>
                   </span>
                   <span class="sub">{{ [user.route_prefix, user.note || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
                 </span>
@@ -320,6 +329,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
       :open="!!selected && !formOpen"
       :user="selected"
       :sites="sites"
+      :danmaku-sources="danmakuSources"
       @close="selectedId = null"
       @edit="selected && openEdit(selected)"
       @changed="load(true)"
@@ -331,7 +341,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
       "
       @copy-share="selected && copyShare(selected)"
     />
-    <ShareUserForm :open="formOpen" :user="editing" :sites="sites" @close="formOpen = false" @saved="onSaved" />
+    <ShareUserForm :open="formOpen" :user="editing" :sites="sites" :danmaku-sources="danmakuSources" @close="formOpen = false" @saved="onSaved" />
     <ShareTextDialog :open="textOpen" :text="shareText" :created="justCreated" @close="textOpen = false" />
   </div>
 </template>
@@ -451,6 +461,15 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.dm-chip {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--good-soft);
+  color: var(--good);
   font-size: 11px;
   font-weight: 600;
 }

@@ -2,6 +2,9 @@ import { api } from './client'
 import type {
   AuthCheck,
   ClientFilterConfig,
+  DanmakuSource,
+  DanmakuSourceInput,
+  DanmakuTestResult,
   DashboardAnalyticsResponse,
   EdgeAutoHTTPSInput,
   EdgeAutoHTTPSStatus,
@@ -268,8 +271,19 @@ export const shareApi = {
   kickSession: (userId: number, sessionId: string) =>
     api.post<{ revoked: boolean }>(`/api/share-users/${id(userId)}/sessions/${encodeURIComponent(sessionId)}/kick`),
   resetTraffic: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-traffic`),
+  resetDanmakuToken: (userId: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/reset-danmaku-token`),
   renew: (userId: number, days: number) => api.post<ShareUser>(`/api/share-users/${id(userId)}/renew`, { days }),
   reorder: (userIds: number[]) => api.put<{ user_ids: number[] }>('/api/share-users/reorder', { user_ids: userIds }),
+}
+
+export const danmakuApi = {
+  list: () => api.get<DanmakuSource[]>('/api/danmaku-sources'),
+  create: (input: DanmakuSourceInput) => api.post<DanmakuSource>('/api/danmaku-sources', input),
+  update: (sourceId: number, input: DanmakuSourceInput) => api.put<DanmakuSource>(`/api/danmaku-sources/${id(sourceId)}`, input),
+  remove: (sourceId: number) => api.del<{ deleted: boolean }>(`/api/danmaku-sources/${id(sourceId)}`),
+  test: (sourceId: number) => api.post<DanmakuTestResult>(`/api/danmaku-sources/${id(sourceId)}/test`),
+  testDraft: (upstream_url: string, egress_node_id: number) =>
+    api.post<DanmakuTestResult>('/api/danmaku-sources/test', { upstream_url, egress_node_id }),
 }
 
 export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput> = {}): ShareUserInput {
@@ -285,6 +299,7 @@ export function shareUserToInput(user: ShareUser, patch: Partial<ShareUserInput>
     speed_limit: user.speed_limit || 0,
     traffic_reset_day: user.traffic_reset_day || 0,
     sites: user.sites.map(site => ({ site_id: site.site_id, site_account_id: site.site_account_id || 0 })),
+    danmaku_source_ids: [...(user.danmaku_source_ids || [])],
     ...patch,
   }
 }

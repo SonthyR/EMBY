@@ -92,6 +92,44 @@ export interface ShareSelfNetwork {
 
 export type ShareStatus = 'active' | 'disabled' | 'expired' | 'quota'
 
+export interface MyAccountDanmakuSource {
+  id: number
+  name: string
+  url: string
+  note?: string
+}
+
+export interface DanmakuSource {
+  id: number
+  name: string
+  upstream_url: string
+  egress_node_id: number
+  egress_name?: string
+  egress_online: boolean
+  enabled: boolean
+  sort_order: number
+  note: string
+  assigned_user_count?: number
+  created_at: string
+  updated_at: string
+}
+
+export interface DanmakuSourceInput {
+  name: string
+  upstream_url: string
+  egress_node_id: number
+  enabled: boolean
+  note: string
+}
+
+export interface DanmakuTestResult {
+  ok: boolean
+  status_code: number
+  latency_ms: number
+  egress_name: string
+  error?: string
+}
+
 export interface ShareUser {
   id: number
   username: string
@@ -114,6 +152,8 @@ export interface ShareUser {
   active_site_name?: string
   sites: ShareUserSite[]
   sessions?: ShareSession[]
+  danmaku_source_ids?: number[]
+  danmaku_sources?: MyAccountDanmakuSource[]
   created_at: string
   updated_at: string
 }
@@ -130,6 +170,7 @@ export interface ShareUserInput {
   speed_limit: number
   traffic_reset_day: number
   sites: { site_id: number; site_account_id: number }[]
+  danmaku_source_ids?: number[]
 }
 
 export type EdgeNodeStatus = 'online' | 'offline' | 'disabled' | 'quota' | 'waiting'
