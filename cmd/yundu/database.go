@@ -23,6 +23,8 @@ type DB struct {
 	droppedDynamicObservations  atomic.Uint64
 	droppedRequestLogs          atomic.Uint64
 	systemSettings              atomic.Pointer[SystemSettings]
+	siteIconCache               sync.Map
+	siteIconFetchInflight       sync.Map
 }
 
 func openDB(path string) (*DB, error) {

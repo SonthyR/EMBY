@@ -237,6 +237,25 @@ export const sitesApi = {
   remove: (siteId: number) => api.del<unknown>(`/api/sites/${id(siteId)}`),
   reorder: (siteIds: number[]) => api.put<unknown>('/api/sites/reorder', { site_ids: siteIds }),
   diag: (siteId: number) => api.get<any>(`/api/sites/${id(siteId)}/diag`),
+  iconUrl: (siteId: number, rev = 0) => `/api/sites/${id(siteId)}/icon${rev ? `?v=${rev}` : ''}`,
+  async iconMeta(siteId: number): Promise<{ hasIcon: boolean; source: 'custom' | 'auto' | 'default' }> {
+    const res = await fetch(`/api/sites/${id(siteId)}/icon`, { credentials: 'same-origin', cache: 'no-store' })
+    const raw = (res.headers.get('X-Site-Icon-Source') || 'default') as 'custom' | 'auto' | 'default'
+    return { hasIcon: res.status === 200, source: raw }
+  },
+  fetchIcon: (siteId: number) => api.post<{ ok: boolean; source: 'custom' | 'auto' | 'default'; hash?: string }>(`/api/sites/${id(siteId)}/icon/fetch`, {}),
+  async uploadIcon(siteId: number, blob: Blob): Promise<{ ok: boolean; source: 'custom'; hash?: string }> {
+    const res = await fetch(`/api/sites/${id(siteId)}/icon`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': blob.type || 'image/png' },
+      body: blob,
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error || '上传图标失败')
+    return data
+  },
+  deleteIcon: (siteId: number) => api.del<{ ok: boolean; source: 'custom' | 'auto' | 'default'; hash?: string }>(`/api/sites/${id(siteId)}/icon`),
   reminders: (status = '') => api.get<AccountReminderRow[]>('/api/account-reminders' + (status ? `?status=${encodeURIComponent(status)}` : '')),
   reminderHistory: () => api.get<ReminderRecord[]>('/api/account-reminders/history'),
   reminderAction: (record: ReminderRecord, action: 'handled' | 'ignored' | 'snoozed') =>

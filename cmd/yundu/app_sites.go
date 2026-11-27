@@ -456,6 +456,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if action == "icon" || strings.HasPrefix(action, "icon/") {
+		a.handleSiteIcon(w, r, id, strings.TrimPrefix(strings.TrimPrefix(action, "icon"), "/"))
+		return
+	}
 
 	switch {
 	case action == "dynamic-observations" && (r.Method == http.MethodGet || r.Method == http.MethodDelete):

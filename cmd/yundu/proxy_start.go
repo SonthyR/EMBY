@@ -162,6 +162,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	egressTransport := http.RoundTripper(&edgeEgressTransport{base: proxyTransport})
 	inst.shareLogout = newShareLogoutFunc(egressTransport, target, policy, configuredHeaders)
 	inst.shareLogin = newShareLoginFunc(egressTransport, target, policy, configuredHeaders)
+	inst.fetchSiteIcon = newSiteIconFetchFunc(egressTransport, target, policy, configuredHeaders)
 	baseTransport := egressTransport
 	if pingCacheState != nil {
 		baseTransport = &pingCacheTransport{base: baseTransport, cache: pingCacheState}
@@ -238,7 +239,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				}
 			}
 			if _, isPersonalRoute := shareRouteUserFromContext(proxyReq.In.Context()); isPersonalRoute && proxyReq.In.URL != nil {
-				if isEmbySystemInfoPath(proxyReq.In.URL.Path) || isEmbyUserIdentityPath(proxyReq.In.URL.Path) {
+				if isEmbySystemInfoPath(proxyReq.In.URL.Path) || isEmbyUserIdentityPath(proxyReq.In.URL.Path) || isEmbyUserViewsPath(proxyReq.In.URL.Path) {
 					proxyReq.Out.Header.Set("Accept-Encoding", "identity")
 				}
 			}
@@ -261,8 +262,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					if pm.shares.isRecentSiteSwitchSession(edgeCtx.shareTokenHash, time.Now()) {
 						sanitizePostSiteSwitchStaleIDError(resp, target.Path)
 					}
+					if err := pm.shares.injectInPlayerSwitchViewResponse(resp, target.Path, routeUserID, site.ID, virtualServerID); err != nil {
+						return err
+					}
 				}
 			}
+			captureSiteAvatarFromResponse(resp, target.Path, site.ID, pm.database)
 			dynamicResponse := responseIsDynamic(resp)
 			expectedSource := dynamicResponseExpectedStructuredSource(resp)
 			effectivePrefix := site.PathPrefix
@@ -425,6 +430,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			defer finishShareActivity()
 			trafficMeter.setShareUser(shareUser)
+			if routeUserID, isPersonalRoute := shareRouteUserFromContext(r.Context()); isPersonalRoute {
+				virtualServerID := pm.shares.personalVirtualServerID(routeUserID)
+				if pm.shares.handleInPlayerSiteSwitchRequest(w, r, routeUserID, shareUser, virtualServerID) {
+					return
+				}
+			}
 		}
 
 		if site.TrafficQuota > 0 {

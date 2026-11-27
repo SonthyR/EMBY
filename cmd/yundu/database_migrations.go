@@ -279,10 +279,19 @@ func (d *DB) migrateOnce() error {
 		log_display_node INTEGER NOT NULL DEFAULT 1, log_display_category INTEGER NOT NULL DEFAULT 1,
 		log_display_status INTEGER NOT NULL DEFAULT 1, log_display_timeline INTEGER NOT NULL DEFAULT 1,
 			log_search_mode TEXT NOT NULL DEFAULT 'like',
+			in_player_site_switch_enabled INTEGER NOT NULL DEFAULT 1,
 			session_epoch INTEGER NOT NULL DEFAULT 1,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
+	CREATE TABLE IF NOT EXISTS site_icons (
+		site_id INTEGER PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+		custom_data BLOB,
+		custom_content_type TEXT NOT NULL DEFAULT '',
+		auto_data BLOB,
+		auto_content_type TEXT NOT NULL DEFAULT '',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`); err != nil {
 		return err
 	}
@@ -380,6 +389,7 @@ func (d *DB) migrateOnce() error {
 		{"log_display_timeline", "ALTER TABLE system_settings ADD COLUMN log_display_timeline INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_upstream_ua", "ALTER TABLE system_settings ADD COLUMN log_display_upstream_ua INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_backend_address", "ALTER TABLE system_settings ADD COLUMN log_display_backend_address INTEGER NOT NULL DEFAULT 1"},
+		{"in_player_site_switch_enabled", "ALTER TABLE system_settings ADD COLUMN in_player_site_switch_enabled INTEGER NOT NULL DEFAULT 1"},
 		{"session_epoch", "ALTER TABLE system_settings ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1"},
 	} {
 		var exists int

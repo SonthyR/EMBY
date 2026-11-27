@@ -189,6 +189,14 @@ async function doRestore() {
               <UiField label="Ping 缓存" for="st-ping" help="分钟"><input id="st-ping" v-model.number="settings.ping_cache_minutes" class="input num" type="number" min="0" /></UiField>
             </div>
           </section>
+          <section class="group">
+            <h2>播放器内快捷切服</h2>
+            <UiSwitch
+              v-model="settings.in_player_site_switch_enabled"
+              label="在「我的媒体」首位显示「切服」卡片"
+              description="仅对拥有专属入口且绑定 2 个及以上站点的分享账号生效；点进目标服务器卡片并点亮爱心收藏 ❤️ 即可无感切服，单服账号不显示。"
+            />
+          </section>
         </template>
 
         <template v-if="settings && section === 'logs'">

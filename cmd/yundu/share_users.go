@@ -913,7 +913,7 @@ func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Reques
 		if entry.siteID == activeSite {
 			return entry.siteID, 0, ""
 		}
-		if drainingAllowed {
+		if drainingAllowed || isInPlayerSiteSwitchRequest(r) {
 			return entry.siteID, 0, ""
 		}
 		if activeSite == 0 {

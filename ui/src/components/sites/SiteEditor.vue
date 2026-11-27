@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Plus, Trash2, Zap, ChevronDown, ClipboardPaste } from '@lucide/vue'
+import { Plus, Trash2, Zap, ChevronDown, ClipboardPaste, Upload, RefreshCw, Image as ImageIcon } from '@lucide/vue'
 import UiDrawer from '@/components/ui/UiDrawer.vue'
 import UiButton from '@/components/ui/UiButton.vue'
 import UiField from '@/components/ui/UiField.vue'
@@ -64,6 +64,11 @@ const primaryTest = ref('')
 const showAdvanced = ref(false)
 const pasteText = ref('')
 const pasteOpen = ref(false)
+const iconSource = ref<'custom' | 'auto' | 'default'>('default')
+const iconHasImage = ref(false)
+const iconRev = ref(0)
+const iconBusy = ref<'upload' | 'fetch' | 'reset' | ''>('')
+const iconFileInput = ref<HTMLInputElement | null>(null)
 const editing = computed(() => !!props.site)
 const caps = computed(() => props.capabilities as Record<string, any>)
 const routeDomain = computed(() => String(caps.value.route_domain || ''))
@@ -114,11 +119,22 @@ watch(
     pasteOpen.value = !props.site
     pasteText.value = ''
     accounts.value = []
+    iconSource.value = 'default'
+    iconHasImage.value = false
+    iconRev.value = Date.now()
     if (props.site) {
       try {
         accounts.value = await sitesApi.accounts(props.site.id)
       } catch {
         accounts.value = []
+      }
+      try {
+        const meta = await sitesApi.iconMeta(props.site.id)
+        iconSource.value = meta.source
+        iconHasImage.value = meta.hasIcon
+      } catch {
+        iconSource.value = 'default'
+        iconHasImage.value = false
       }
     }
     try {
@@ -136,6 +152,87 @@ watch(
     }
   },
 )
+
+async function convertFileToIconBlob(file: File): Promise<Blob> {
+  if (file.size <= 512 * 1024 && ['image/png', 'image/jpeg', 'image/gif'].includes(file.type)) {
+    return file
+  }
+  const url = URL.createObjectURL(file)
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image()
+      el.onload = () => resolve(el)
+      el.onerror = () => reject(new Error('无法解析所选图片'))
+      el.src = url
+    })
+    const maxSide = 384
+    const scale = Math.min(1, maxSide / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
+    const w = Math.max(1, Math.round((img.naturalWidth || 256) * scale))
+    const h = Math.max(1, Math.round((img.naturalHeight || 256) * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return file
+    ctx.drawImage(img, 0, 0, w, h)
+    const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'))
+    return blob || file
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
+async function onIconFileSelected(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !props.site) return
+  iconBusy.value = 'upload'
+  try {
+    const blob = await convertFileToIconBlob(file)
+    await sitesApi.uploadIcon(props.site.id, blob)
+    iconSource.value = 'custom'
+    iconHasImage.value = true
+    iconRev.value = Date.now()
+    toast.success('站点图标已更新')
+  } catch (error) {
+    toast.error(errorMessage(error, '上传图标失败'))
+  } finally {
+    iconBusy.value = ''
+  }
+}
+
+async function fetchSiteIcon() {
+  if (!props.site) return
+  iconBusy.value = 'fetch'
+  try {
+    const res = await sitesApi.fetchIcon(props.site.id)
+    iconSource.value = res.source
+    iconHasImage.value = res.source !== 'default'
+    iconRev.value = Date.now()
+    toast.success(res.source === 'custom' ? '已抓取源站图标（当前仍优先显示自定义图标）' : '已抓取并缓存源站图标')
+  } catch (error) {
+    toast.error(errorMessage(error, '抓取源站图标失败'))
+  } finally {
+    iconBusy.value = ''
+  }
+}
+
+async function resetSiteIcon() {
+  if (!props.site) return
+  iconBusy.value = 'reset'
+  try {
+    const res = await sitesApi.deleteIcon(props.site.id)
+    iconSource.value = res.source
+    iconHasImage.value = res.source !== 'default'
+    iconRev.value = Date.now()
+    toast.success(res.source === 'auto' ? '已恢复使用源站自带图标' : '已恢复默认图标')
+  } catch (error) {
+    toast.error(errorMessage(error, '恢复失败'))
+  } finally {
+    iconBusy.value = ''
+  }
+}
 
 function normalizeURL(value: string) {
   let raw = String(value || '').trim().replaceAll('：', ':')
@@ -310,6 +407,23 @@ async function save() {
       <fieldset>
         <legend>源站</legend>
         <UiField label="站点名称" for="se-name"><input id="se-name" v-model="cfg.name" class="input" maxlength="64" :autofocus="!editing" /></UiField>
+        <UiField v-if="editing && site" label="站点图标" help="用于播放器「切服」卡片封面。系统会在登录时自动缓存源站自带头像，也可手动上传覆盖。">
+          <div class="icon-row">
+            <div class="icon-preview">
+              <img v-if="iconHasImage" :src="sitesApi.iconUrl(site.id, iconRev)" :alt="cfg.name" @error="iconHasImage = false" />
+              <ImageIcon v-else class="icon-empty" />
+            </div>
+            <div class="icon-meta">
+              <span class="icon-badge">{{ iconSource === 'custom' ? '自定义图标' : iconSource === 'auto' ? '源站自带图标' : '内置默认图标' }}</span>
+              <div class="icon-actions">
+                <input ref="iconFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden @change="onIconFileSelected" />
+                <UiButton size="sm" :loading="iconBusy === 'upload'" :disabled="!!iconBusy" @click="iconFileInput?.click()"><Upload />上传图片</UiButton>
+                <UiButton size="sm" variant="ghost" :loading="iconBusy === 'fetch'" :disabled="!!iconBusy" @click="fetchSiteIcon"><RefreshCw />抓取源站图标</UiButton>
+                <UiButton v-if="iconSource === 'custom'" size="sm" variant="ghost" :loading="iconBusy === 'reset'" :disabled="!!iconBusy" @click="resetSiteIcon">恢复默认</UiButton>
+              </div>
+            </div>
+          </div>
+        </UiField>
         <UiField label="回源地址" for="se-target" :help="primaryTest || '源站的 Emby 地址，例如 https://emby.example.com:443'">
           <div class="with-btn">
             <input id="se-target" v-model="cfg.target" class="input mono" placeholder="https://" spellcheck="false" autocapitalize="none" />
@@ -526,5 +640,12 @@ legend + * { clear: both; }
 .flip { transform: rotate(180deg); }
 .paste-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .row-end { display: flex; justify-content: flex-end; }
+.icon-row { display: flex; align-items: center; gap: 14px; }
+.icon-preview { width: 52px; height: 52px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-2); display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0; }
+.icon-preview img { width: 100%; height: 100%; object-fit: contain; padding: 4px; }
+.icon-empty { width: 22px; height: 22px; color: var(--text-3); }
+.icon-meta { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.icon-badge { font-size: 12px; color: var(--text-2); }
+.icon-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 @media (max-width: 560px) { .grid, .grid.three { grid-template-columns: minmax(0, 1fr); } .line .name { flex-basis: 100%; } }
 </style>
