@@ -431,7 +431,7 @@ func TestSiteIconAutoFetchCustomUploadAndOuterCardSwitching(t *testing.T) {
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/sessions/logout"):
 			w.WriteHeader(http.StatusNotFound)
-		case strings.HasSuffix(p, "/users/uid-b/images/primary"):
+		case strings.HasSuffix(p, "/web/touchicon.png"):
 			w.Header().Set("Content-Type", "image/png")
 			_, _ = w.Write(blueIcon)
 		case strings.HasSuffix(p, "/views"):

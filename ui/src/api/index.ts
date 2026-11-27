@@ -243,7 +243,16 @@ export const sitesApi = {
     const raw = (res.headers.get('X-Site-Icon-Source') || 'default') as 'custom' | 'auto' | 'default'
     return { hasIcon: res.status === 200, source: raw }
   },
-  fetchIcon: (siteId: number) => api.post<{ ok: boolean; source: 'custom' | 'auto' | 'default'; hash?: string }>(`/api/sites/${id(siteId)}/icon/fetch`, {}),
+  fetchIcon: (siteId: number) =>
+    api.post<{
+      ok: boolean
+      source: 'custom' | 'auto' | 'default'
+      hash?: string
+      fetched_type?: string
+      fetched_kind?: 'public_brand' | 'account_avatar'
+      requires_confirm?: boolean
+      preview_data_url?: string
+    }>(`/api/sites/${id(siteId)}/icon/fetch`, {}),
   async uploadIcon(siteId: number, blob: Blob): Promise<{ ok: boolean; source: 'custom'; hash?: string }> {
     const res = await fetch(`/api/sites/${id(siteId)}/icon`, {
       method: 'PUT',

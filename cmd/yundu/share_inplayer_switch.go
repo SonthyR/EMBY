@@ -130,7 +130,26 @@ func shortInPlayerSiteName(name string) string {
 
 func inPlayerSwitchImageTag(kind string, siteID int64, name string, active bool, iconHash string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("yundu-sw-img:%s:%d:%s:%t:%s", kind, siteID, name, active, iconHash)))
+	if kind == "lib" && siteID > 0 {
+		return fmt.Sprintf("s%d-%s", siteID, hex.EncodeToString(sum[:8]))
+	}
 	return hex.EncodeToString(sum[:8])
+}
+
+func parseInPlayerSwitchLibTagSiteID(tag string) (int64, bool) {
+	trimmed := strings.TrimSpace(tag)
+	if !strings.HasPrefix(trimmed, "s") {
+		return 0, false
+	}
+	idPart, _, ok := strings.Cut(trimmed[1:], "-")
+	if !ok || idPart == "" {
+		return 0, false
+	}
+	sid, err := strconv.ParseInt(idPart, 10, 64)
+	if err != nil || sid <= 0 {
+		return 0, false
+	}
+	return sid, true
 }
 
 // isInPlayerSiteSwitchRequest quickly checks whether an incoming Emby request
@@ -281,10 +300,52 @@ func (rt *shareUserRuntime) promoteShareUserSite(userID, targetSiteID int64) err
 	return nil
 }
 
-func buildInPlayerSwitchLibraryDTO(activeSite inPlayerSwitchSite, siteCount int, virtualServerID string) map[string]any {
-	imgTag := inPlayerSwitchImageTag("lib", activeSite.ID, activeSite.Name, true, activeSite.IconHash)
+type inPlayerSwitchViewState struct {
+	currentSite   inPlayerSwitchSite
+	preferredSite inPlayerSwitchSite
+	pendingSite   *inPlayerSwitchSite
+}
+
+func resolveInPlayerSwitchViewState(sites []inPlayerSwitchSite, currentSiteID int64) inPlayerSwitchViewState {
+	state := inPlayerSwitchViewState{
+		currentSite:   sites[0],
+		preferredSite: sites[0],
+	}
+	if currentSiteID > 0 {
+		for _, candidate := range sites {
+			if candidate.ID == currentSiteID {
+				state.currentSite = candidate
+				break
+			}
+		}
+	}
+	if state.currentSite.ID != state.preferredSite.ID {
+		pending := state.preferredSite
+		state.pendingSite = &pending
+	}
+	return state
+}
+
+func (rt *shareUserRuntime) resolveSessionSwitchViewState(routeUserID int64, sessionHash string, sites []inPlayerSwitchSite) inPlayerSwitchViewState {
+	var currentSiteID int64
+	if rt != nil && sessionHash != "" {
+		rt.mu.RLock()
+		if entry, exists := rt.sessions[sessionHash]; exists && entry.userID == routeUserID && entry.siteID > 0 {
+			currentSiteID = entry.siteID
+		}
+		rt.mu.RUnlock()
+	}
+	return resolveInPlayerSwitchViewState(sites, currentSiteID)
+}
+
+func buildInPlayerSwitchLibraryDTO(viewState inPlayerSwitchViewState, siteCount int, virtualServerID string) map[string]any {
+	name := "切服 · " + shortInPlayerSiteName(viewState.currentSite.Name)
+	if viewState.pendingSite != nil && viewState.pendingSite.ID != viewState.currentSite.ID {
+		name = fmt.Sprintf("切服 · %s（待切 %s）", shortInPlayerSiteName(viewState.currentSite.Name), shortInPlayerSiteName(viewState.pendingSite.Name))
+	}
+	imgTag := inPlayerSwitchImageTag("lib", viewState.currentSite.ID, name, true, viewState.currentSite.IconHash)
 	return map[string]any{
-		"Name":              "切服 · " + shortInPlayerSiteName(activeSite.Name),
+		"Name":              name,
 		"ServerId":          virtualServerID,
 		"Id":                shareSwitchLibraryID,
 		"Etag":              imgTag,
@@ -304,17 +365,32 @@ func buildInPlayerSwitchLibraryDTO(activeSite inPlayerSwitchSite, siteCount int,
 	}
 }
 
-func buildInPlayerSwitchSiteDTO(site inPlayerSwitchSite, isActive bool, virtualServerID string, epoch uint32) map[string]any {
+func buildInPlayerSwitchSiteDTO(site inPlayerSwitchSite, viewState inPlayerSwitchViewState, virtualServerID string, epoch uint32) map[string]any {
+	isCurrent := site.ID == viewState.currentSite.ID
+	isPending := viewState.pendingSite != nil && site.ID == viewState.pendingSite.ID
+	isFavorite := isCurrent
+	if viewState.pendingSite != nil {
+		isFavorite = isPending
+	}
 	itemID := shareSwitchSiteItemIDForEpoch(site.ID, epoch)
-	imgTag := inPlayerSwitchImageTag("site", site.ID, site.Name, isActive, site.IconHash)
+	imgTag := inPlayerSwitchImageTag("site", site.ID, site.Name, isCurrent || isPending, site.IconHash)
 	displayName := site.Name
 	tagline := "点亮爱心收藏 ❤️ 即刻无感切换到此服务器"
 	overview := fmt.Sprintf("点击右上角或操作栏的「爱心收藏 ❤️」即可无感切换到「%s」。切换后返回首页下拉刷新即可浏览新服片库。", site.Name)
-	if isActive {
+	switch {
+	case isCurrent && viewState.pendingSite != nil:
+		displayName = "✅ " + site.Name
+		tagline = fmt.Sprintf("当前正在播放此服务器 · 播完将自动切到「%s」", viewState.pendingSite.Name)
+		overview = fmt.Sprintf("当前设备仍在播放「%s」，已预约切换到「%s」。停播当前视频后将自动无感生效；如需取消切换，可重新点亮「%s」的爱心收藏 ❤️。", site.Name, viewState.pendingSite.Name, site.Name)
+	case isPending:
+		displayName = "⏳ " + site.Name + "（待切）"
+		tagline = fmt.Sprintf("已选为目标服务器 · 停播「%s」后自动生效", viewState.currentSite.Name)
+		overview = fmt.Sprintf("已预约切换到「%s」。由于当前设备正在播放「%s」，将在停播后自动完成无感换票。", site.Name, viewState.currentSite.Name)
+	case isCurrent:
 		displayName = "✅ " + site.Name
 		tagline = "当前正在使用此服务器"
 		overview = fmt.Sprintf("当前正在使用「%s」。如需切换其他服务器，请返回「切服」列表并点亮目标服务器的爱心收藏 ❤️。", site.Name)
-	} else if site.EdgeRoutingMode == edgeRoutingModeEdgeFull && site.EdgePinnedNodeID > 0 && !site.EdgePinnedOnline {
+	case site.EdgeRoutingMode == edgeRoutingModeEdgeFull && site.EdgePinnedNodeID > 0 && !site.EdgePinnedOnline:
 		overview = fmt.Sprintf("注意：「%s」当前绑定的专属从机处于离线状态，切过去后可能暂不可用。仍可点击爱心收藏 ❤️ 切换。", site.Name)
 	}
 	return map[string]any{
@@ -341,7 +417,7 @@ func buildInPlayerSwitchSiteDTO(site inPlayerSwitchSite, isActive bool, virtualS
 		"UserData": map[string]any{
 			"PlaybackPositionTicks": 0,
 			"PlayCount":             0,
-			"IsFavorite":            isActive,
+			"IsFavorite":            isFavorite,
 			"Played":                false,
 			"Key":                   itemID,
 		},
@@ -417,14 +493,8 @@ func (rt *shareUserRuntime) injectInPlayerSwitchViewResponse(
 		}
 	}
 
-	activeSite := sites[0]
-	for _, candidate := range sites {
-		if candidate.ID == currentSiteID {
-			activeSite = candidate
-			break
-		}
-	}
-	virtualView := buildInPlayerSwitchLibraryDTO(activeSite, len(sites), virtualServerID)
+	viewState := resolveInPlayerSwitchViewState(sites, currentSiteID)
+	virtualView := buildInPlayerSwitchLibraryDTO(viewState, len(sites), virtualServerID)
 	newItems := make([]any, 0, len(items)+1)
 	newItems = append(newItems, virtualView)
 	newItems = append(newItems, items...)
@@ -472,6 +542,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 	r *http.Request,
 	routeUserID int64,
 	shareUser *shareUserState,
+	shareSessionHash string,
 	virtualServerID string,
 ) bool {
 	if rt == nil || r == nil || r.URL == nil || routeUserID <= 0 {
@@ -485,23 +556,36 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		return false
 	}
 
+	viewState := rt.resolveSessionSwitchViewState(routeUserID, shareSessionHash, sites)
+
 	p := normalizeEmbyRelativePath(r.URL.Path)
 	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	isRead := r.Method == http.MethodGet || r.Method == http.MethodHead
 
 	// 1. Virtual PNG cover images (/Items/{virtualID}/Images/{type}[/0]).
-	// Outermost "切服 · <active>" card displays the CURRENT active site's own icon;
-	// each inner server card displays its own site's icon.
-	// Emby clients often omit X-Emby-Token on image fetches, so we authorize by
-	// personal-route user + assigned site membership.
+	// Outermost "切服 · <current>" card displays the session's CURRENT site icon
+	// (falling back to the tag-encoded site ID when clients omit X-Emby-Token on
+	// image fetches so draining devices keep their own cover); each inner server
+	// card displays its own site's icon.
 	if isRead && len(segs) >= 4 && segs[0] == "items" && segs[2] == "images" && isShareSwitchAnyVirtualID(segs[1]) {
 		imgType := strings.ToLower(segs[3])
 		landscape := imgType == "backdrop" || imgType == "thumb"
 		var imgBytes []byte
 		imgContentType := "image/png"
 		if isShareSwitchLibraryID(segs[1]) {
-			activeIcon := rt.db.getEffectiveSiteIcon(sites[0].ID)
-			imgBytes, imgContentType = compositeInPlayerSwitchCardWithIcon("lib", true, sites[0].ID, true, activeIcon)
+			coverSiteID := viewState.currentSite.ID
+			if shareSessionHash == "" {
+				if tagSiteID, ok := parseInPlayerSwitchLibTagSiteID(r.URL.Query().Get("tag")); ok {
+					for _, s := range sites {
+						if s.ID == tagSiteID {
+							coverSiteID = tagSiteID
+							break
+						}
+					}
+				}
+			}
+			activeIcon := rt.db.getEffectiveSiteIcon(coverSiteID)
+			imgBytes, imgContentType = compositeInPlayerSwitchCardWithIcon("lib", true, coverSiteID, true, activeIcon)
 		} else if sid, ok := parseShareSwitchSiteItemID(segs[1]); ok {
 			found := false
 			for _, s := range sites {
@@ -515,12 +599,13 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 				return true
 			}
 			siteIcon := rt.db.getEffectiveSiteIcon(sid)
-			imgBytes, imgContentType = compositeInPlayerSwitchCardWithIcon("site", sid == sites[0].ID, sid, landscape, siteIcon)
+			isHighlighted := sid == viewState.currentSite.ID || (viewState.pendingSite != nil && sid == viewState.pendingSite.ID)
+			imgBytes, imgContentType = compositeInPlayerSwitchCardWithIcon("site", isHighlighted, sid, landscape, siteIcon)
 		}
 		if len(imgBytes) > 0 {
 			w.Header().Set("Content-Type", imgContentType)
 			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("Cache-Control", "public, max-age=300")
+			w.Header().Set("Cache-Control", "private, max-age=300")
 			w.Header().Set("Content-Length", strconv.Itoa(len(imgBytes)))
 			w.WriteHeader(http.StatusOK)
 			if r.Method != http.MethodHead {
@@ -536,7 +621,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		writeShareJSONError(w, http.StatusUnauthorized, "请先登录后再使用快捷切服")
 		return true
 	}
-	activeSiteID := sites[0].ID
+	preferredSiteID := viewState.preferredSite.ID
 	switchEpoch := rt.userSwitchEpoch(routeUserID)
 
 	// 2. Favorite click -> switch primary site!
@@ -557,7 +642,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 				writeShareJSONError(w, http.StatusNotFound, "无权切换到该服务器")
 				return true
 			}
-			if targetSiteID != activeSiteID {
+			if targetSiteID != preferredSiteID {
 				if err := rt.promoteShareUserSite(routeUserID, targetSiteID); err != nil {
 					log.Printf("[share-switch] promote user #%d -> site #%d failed: %v", routeUserID, targetSiteID, err)
 					writeShareJSONError(w, http.StatusInternalServerError, "切换服务器失败，请稍后重试")
@@ -609,7 +694,7 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		if isShareSwitchLibraryID(parentID) {
 			allItems = make([]any, 0, len(sites))
 			for _, s := range sites {
-				allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
+				allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, viewState, virtualServerID, switchEpoch))
 				if s.IconHash == "" {
 					rt.maybeAsyncFetchSiteAutoIcon(s.ID, "", "", 0)
 				}
@@ -617,11 +702,11 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		} else if idsParam != "" {
 			for _, part := range strings.Split(idsParam, ",") {
 				if isShareSwitchLibraryID(part) {
-					allItems = append(allItems, buildInPlayerSwitchLibraryDTO(sites[0], len(sites), virtualServerID))
+					allItems = append(allItems, buildInPlayerSwitchLibraryDTO(viewState, len(sites), virtualServerID))
 				} else if sid, ok := parseShareSwitchSiteItemID(part); ok {
 					for _, s := range sites {
 						if s.ID == sid {
-							allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
+							allItems = append(allItems, buildInPlayerSwitchSiteDTO(s, viewState, virtualServerID, switchEpoch))
 							break
 						}
 					}
@@ -665,13 +750,13 @@ func (rt *shareUserRuntime) handleInPlayerSiteSwitchRequest(
 		(len(segs) == 2 && segs[0] == "items" && isShareSwitchAnyVirtualID(segs[1]))) {
 		idSeg := segs[len(segs)-1]
 		if isShareSwitchLibraryID(idSeg) {
-			writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchLibraryDTO(sites[0], len(sites), virtualServerID))
+			writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchLibraryDTO(viewState, len(sites), virtualServerID))
 			return true
 		}
 		if sid, ok := parseShareSwitchSiteItemID(idSeg); ok {
 			for _, s := range sites {
 				if s.ID == sid {
-					writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchSiteDTO(s, s.ID == activeSiteID, virtualServerID, switchEpoch))
+					writeInPlayerSwitchJSON(w, http.StatusOK, buildInPlayerSwitchSiteDTO(s, viewState, virtualServerID, switchEpoch))
 					return true
 				}
 			}

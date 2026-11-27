@@ -706,7 +706,18 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		applyDynamicCapabilityRequiredHeaders(outbound.Header, claims)
 	}
 	if claims.Kind == dynamicCapabilityKindResource && i.pm != nil && i.pm.edges != nil {
-		if tryRedirectDynamicResourceToEdgeNode(w, r, i.pm, i.site, target, outbound.Header, claims.RequiredHeaders) {
+		var selfTargets *dynamicSelfTargetPolicy
+		if i.state != nil && i.state.runtime != nil {
+			selfTargets = i.state.runtime.selfTargets.Load()
+		}
+		handled, deniedReason := tryRedirectDynamicResourceToEdgeNode(w, r, i.pm, i.site, target, outbound.Header, claims, i.policy, selfTargets)
+		if deniedReason != "" {
+			rollback()
+			i.observe(claims.Source, dynamicObservationDecisionDenied, deniedReason, authority)
+			newDynamicProxyError(deniedReason).writeResponse(w)
+			return
+		}
+		if handled {
 			if i.state.useCapability(token, time.Now()) {
 				commit()
 			}

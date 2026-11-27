@@ -655,13 +655,23 @@ assert_not_contains "$NGINX_CONFIG" 50001
 
 # Mock release downloads so install/update behavior can be tested without network.
 MOCK_LATEST='v9.9.9'
+MOCK_COSIGN_BIN="${TEST_ROOT}/mock-cosign"
+cat > "$MOCK_COSIGN_BIN" <<'MOCKCOSIGN'
+#!/usr/bin/env sh
+exit 0
+MOCKCOSIGN
+chmod 0755 "$MOCK_COSIGN_BIN"
+COSIGN_BIN="$MOCK_COSIGN_BIN"
+export MERIDIAN_UPDATE_LOCK_DIR="${TEST_ROOT}/locks"
+mkdir -p "$MERIDIAN_UPDATE_LOCK_DIR"
 get_latest_version() { printf '%s\n' "$MOCK_LATEST"; }
 detect_platform() { printf 'linux-amd64\n'; }
 download() {
     local url="$1" output="$2" version
     version=$(printf '%s' "$url" | awk -F/ '{print $(NF-1)}')
     if [[ "$url" == */SHA256SUMS.bundle* ]]; then
-        return 1
+        printf 'mock-sigstore-bundle-%s\n' "$version" > "$output"
+        return 0
     fi
     if [[ "$url" == */SHA256SUMS ]]; then
         printf '%s  meridian-linux-amd64\n' "$(sha256_file "${TEST_ROOT}/release-binary")" > "$output"
@@ -981,7 +991,8 @@ if (
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS.bundle* ]]; then
-            return 1
+            printf 'mock-sigstore-bundle-v9.9.12\n' > "$output"
+            return 0
         fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$failing_binary")" > "$output"
@@ -1313,7 +1324,8 @@ if (
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS.bundle* ]]; then
-            return 1
+            printf 'mock-sigstore-bundle-v9.9.13\n' > "$output"
+            return 0
         fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$retry_failing_binary")" > "$output"
@@ -1509,5 +1521,95 @@ if (run_cli update --port 18090) >"${TEST_ROOT}/update-port.log" 2>&1; then
     echo 'FAIL: update accepted an install-only port option' >&2
     exit 1
 fi
+
+# v1.8.0 #9: Release signature verification must fail closed on signed versions
+# when bundle download fails or signature verification fails, while allowing
+# only explicit legacy unsigned versions to fall back to SHA-256.
+(
+    sig_dir=$(mktemp -d "${TEST_ROOT}/v180-sig.XXXXXX")
+    printf 'abc  meridian-linux-amd64\n' > "${sig_dir}/SHA256SUMS"
+    download() { return 1; }
+    if (verify_release_signature v1.8.0 "${sig_dir}/SHA256SUMS" "${sig_dir}/SHA256SUMS.bundle") >/dev/null 2>&1; then
+        echo 'FAIL: missing signature bundle on v1.8.0 was unexpectedly accepted' >&2
+        exit 1
+    fi
+    # Explicit legacy unsigned version v1.0.0 is allowed to fall back to SHA-256.
+    verify_release_signature v1.0.0 "${sig_dir}/SHA256SUMS" "${sig_dir}/SHA256SUMS.bundle" >/dev/null 2>&1 \
+        || { echo 'FAIL: legacy unsigned v1.0.0 fallback failed' >&2; exit 1; }
+    # Bad signature must always fail closed.
+    download() { printf 'bad-bundle\n' > "$2"; return 0; }
+    cat > "${sig_dir}/bad-cosign" <<'BADCOSIGN'
+#!/usr/bin/env sh
+exit 1
+BADCOSIGN
+    chmod 0755 "${sig_dir}/bad-cosign"
+    COSIGN_BIN="${sig_dir}/bad-cosign"
+    if (verify_release_signature v1.8.0 "${sig_dir}/SHA256SUMS" "${sig_dir}/SHA256SUMS.bundle") >/dev/null 2>&1; then
+        echo 'FAIL: invalid signature was unexpectedly accepted' >&2
+        exit 1
+    fi
+)
+
+# v1.8.0 #3: Rollback MUST stop systemd service and confirm exit BEFORE restoring DATA_DIR,
+# and abort data swap if stopping the new process fails. Also verify external update lock
+# outside DATA_DIR rejects concurrent updates against the same instance.
+(
+    order_dir=$(mktemp -d "${TEST_ROOT}/v180-rollback-order.XXXXXX")
+    order_log="${order_dir}/order.log"
+    export MERIDIAN_UPDATE_LOCK_DIR="${order_dir}/locks"
+    mkdir -p "$MERIDIAN_UPDATE_LOCK_DIR" "${order_dir}/snap/data" "${order_dir}/data"
+    DATA_DIR="${order_dir}/data"
+    UPDATE_SNAPSHOT_DIR="${order_dir}/snap"
+    UPDATE_SNAPSHOT_RESTORED=0
+    UPDATE_BINARY_CHANGED=0
+    UPDATE_SERVICE_CHANGED=0
+    is_systemd() { return 0; }
+    systemctl() {
+        case "$*" in
+            *stop*) printf 'stop\n' >> "$order_log"; return 0 ;;
+            *show*) printf 'ActiveState=inactive\nMainPID=0\n'; return 0 ;;
+        esac
+        return 0
+    }
+    restore_update_snapshot() {
+        printf 'restore_data\n' >> "$order_log"
+        UPDATE_SNAPSHOT_RESTORED=1
+        return 0
+    }
+    restore_update_systemd_service() { printf 'restore_unit\n' >> "$order_log"; return 0; }
+    rollback_update_transaction
+    assert_eq $'stop\nrestore_data\nrestore_unit' "$(cat "$order_log")" 'rollback must stop service before restoring data and unit'
+
+    # If stop fails, data snapshot MUST NOT be restored.
+    : > "$order_log"
+    UPDATE_SNAPSHOT_RESTORED=0
+    systemctl() {
+        case "$*" in
+            *stop*) printf 'stop_fail\n' >> "$order_log"; return 1 ;;
+        esac
+        return 0
+    }
+    if rollback_update_transaction >/dev/null 2>&1; then
+        echo 'FAIL: rollback succeeded even though service stop failed' >&2
+        exit 1
+    fi
+    assert_eq 'stop_fail' "$(cat "$order_log")" 'data restore must be skipped when stop fails'
+
+    # Lock file must reside outside DATA_DIR and block concurrent acquire_update_lock.
+    lock_path=$(resolve_update_lock_file)
+    case "$lock_path" in
+        "${DATA_DIR}"/*)
+            echo "FAIL: update lock must reside outside DATA_DIR, got $lock_path" >&2
+            exit 1
+            ;;
+    esac
+    acquire_update_lock
+    if (acquire_update_lock) >/dev/null 2>&1; then
+        release_update_lock
+        echo 'FAIL: concurrent update lock acquisition was unexpectedly allowed' >&2
+        exit 1
+    fi
+    release_update_lock
+)
 
 echo 'installer tests passed'

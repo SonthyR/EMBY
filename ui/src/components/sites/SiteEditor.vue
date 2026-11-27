@@ -67,17 +67,20 @@ const pasteOpen = ref(false)
 const iconSource = ref<'custom' | 'auto' | 'default'>('default')
 const iconHasImage = ref(false)
 const iconRev = ref(0)
-const iconBusy = ref<'upload' | 'fetch' | 'reset' | ''>('')
+const iconBusy = ref<'upload' | 'fetch' | 'reset' | 'confirm' | ''>('')
 const iconFileInput = ref<HTMLInputElement | null>(null)
+const pendingAvatarPreview = ref<{ siteId: number; dataUrl: string; contentType: string } | null>(null)
 const editing = computed(() => !!props.site)
 const caps = computed(() => props.capabilities as Record<string, any>)
 const routeDomain = computed(() => String(caps.value.route_domain || ''))
 const hostAvailable = computed(() => caps.value.host_only_available !== false && caps.value.domain_prefix_available === true)
 
 watch(
-  () => props.open,
-  async open => {
+  () => [props.open, props.site?.id ?? 0] as const,
+  async ([open]) => {
+    pendingAvatarPreview.value = null
     if (!open) return
+    const targetSiteID = props.site?.id ?? 0
     const s = (props.site || {}) as Record<string, any>
     const mode = props.site ? normalizedIngressMode(props.site) : 'path'
     const domain = routeDomain.value
@@ -122,19 +125,24 @@ watch(
     iconSource.value = 'default'
     iconHasImage.value = false
     iconRev.value = Date.now()
-    if (props.site) {
+    if (props.site && targetSiteID > 0) {
       try {
-        accounts.value = await sitesApi.accounts(props.site.id)
+        const list = await sitesApi.accounts(targetSiteID)
+        if ((props.site?.id ?? 0) === targetSiteID) accounts.value = list
       } catch {
-        accounts.value = []
+        if ((props.site?.id ?? 0) === targetSiteID) accounts.value = []
       }
       try {
-        const meta = await sitesApi.iconMeta(props.site.id)
-        iconSource.value = meta.source
-        iconHasImage.value = meta.hasIcon
+        const meta = await sitesApi.iconMeta(targetSiteID)
+        if ((props.site?.id ?? 0) === targetSiteID) {
+          iconSource.value = meta.source
+          iconHasImage.value = meta.hasIcon
+        }
       } catch {
-        iconSource.value = 'default'
-        iconHasImage.value = false
+        if ((props.site?.id ?? 0) === targetSiteID) {
+          iconSource.value = 'default'
+          iconHasImage.value = false
+        }
       }
     }
     try {
@@ -153,84 +161,149 @@ watch(
   },
 )
 
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string' && reader.result.startsWith('data:')) {
+        resolve(reader.result)
+      } else {
+        reject(new Error('无法读取所选图片'))
+      }
+    }
+    reader.onerror = () => reject(new Error('无法读取所选图片'))
+    reader.readAsDataURL(file)
+  })
+}
+
+function dataURLToBlob(dataUrl: string, fallbackType = 'image/png'): Blob {
+  const [header, b64 = ''] = dataUrl.split(',', 2)
+  const ctMatch = /^data:([^;]+);base64$/i.exec(header || '')
+  const contentType = ctMatch?.[1] || fallbackType
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return new Blob([bytes], { type: contentType })
+}
+
 async function convertFileToIconBlob(file: File): Promise<Blob> {
   if (file.size <= 512 * 1024 && ['image/png', 'image/jpeg', 'image/gif'].includes(file.type)) {
     return file
   }
-  const url = URL.createObjectURL(file)
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const el = new Image()
-      el.onload = () => resolve(el)
-      el.onerror = () => reject(new Error('无法解析所选图片'))
-      el.src = url
-    })
-    const maxSide = 384
-    const scale = Math.min(1, maxSide / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
-    const w = Math.max(1, Math.round((img.naturalWidth || 256) * scale))
-    const h = Math.max(1, Math.round((img.naturalHeight || 256) * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return file
-    ctx.drawImage(img, 0, 0, w, h)
-    const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'))
-    return blob || file
-  } finally {
-    URL.revokeObjectURL(url)
-  }
+  const dataUrl = await readFileAsDataURL(file)
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const el = new Image()
+    el.onload = () => resolve(el)
+    el.onerror = () => reject(new Error('无法解析所选图片'))
+    el.src = dataUrl
+  })
+  const maxSide = 384
+  const scale = Math.min(1, maxSide / Math.max(img.naturalWidth || 1, img.naturalHeight || 1))
+  const w = Math.max(1, Math.round((img.naturalWidth || 256) * scale))
+  const h = Math.max(1, Math.round((img.naturalHeight || 256) * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return file
+  ctx.drawImage(img, 0, 0, w, h)
+  const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'))
+  return blob || file
 }
 
 async function onIconFileSelected(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   input.value = ''
-  if (!file || !props.site) return
+  const targetSiteID = props.site?.id ?? 0
+  if (!file || targetSiteID <= 0) return
   iconBusy.value = 'upload'
   try {
     const blob = await convertFileToIconBlob(file)
-    await sitesApi.uploadIcon(props.site.id, blob)
-    iconSource.value = 'custom'
-    iconHasImage.value = true
-    iconRev.value = Date.now()
+    await sitesApi.uploadIcon(targetSiteID, blob)
+    if ((props.site?.id ?? 0) === targetSiteID) {
+      pendingAvatarPreview.value = null
+      iconSource.value = 'custom'
+      iconHasImage.value = true
+      iconRev.value = Date.now()
+    }
     toast.success('站点图标已更新')
   } catch (error) {
     toast.error(errorMessage(error, '上传图标失败'))
   } finally {
-    iconBusy.value = ''
+    if (iconBusy.value === 'upload') iconBusy.value = ''
   }
 }
 
 async function fetchSiteIcon() {
-  if (!props.site) return
+  const targetSiteID = props.site?.id ?? 0
+  if (targetSiteID <= 0) return
   iconBusy.value = 'fetch'
   try {
-    const res = await sitesApi.fetchIcon(props.site.id)
+    const res = await sitesApi.fetchIcon(targetSiteID)
+    if ((props.site?.id ?? 0) !== targetSiteID) return
+    if (res.requires_confirm && res.preview_data_url) {
+      pendingAvatarPreview.value = {
+        siteId: targetSiteID,
+        dataUrl: res.preview_data_url,
+        contentType: res.fetched_type || 'image/png',
+      }
+      toast.info('已拉取源站账号头像，请预览确认后设为公开站标')
+      return
+    }
+    pendingAvatarPreview.value = null
     iconSource.value = res.source
     iconHasImage.value = res.source !== 'default'
     iconRev.value = Date.now()
-    toast.success(res.source === 'custom' ? '已抓取源站图标（当前仍优先显示自定义图标）' : '已抓取并缓存源站图标')
+    toast.success(res.source === 'custom' ? '已抓取源站公开图标（当前仍优先显示自定义图标）' : '已抓取并缓存源站公开图标')
   } catch (error) {
     toast.error(errorMessage(error, '抓取源站图标失败'))
   } finally {
-    iconBusy.value = ''
+    if (iconBusy.value === 'fetch') iconBusy.value = ''
+  }
+}
+
+async function confirmPendingAvatar() {
+  const preview = pendingAvatarPreview.value
+  if (!preview || preview.siteId <= 0) return
+  const targetSiteID = preview.siteId
+  iconBusy.value = 'confirm'
+  try {
+    const blob = dataURLToBlob(preview.dataUrl, preview.contentType)
+    await sitesApi.uploadIcon(targetSiteID, blob)
+    if ((props.site?.id ?? 0) === targetSiteID) {
+      pendingAvatarPreview.value = null
+      iconSource.value = 'custom'
+      iconHasImage.value = true
+      iconRev.value = Date.now()
+    }
+    toast.success('已确认并设为站点图标')
+  } catch (error) {
+    toast.error(errorMessage(error, '确认保存图标失败'))
+  } finally {
+    if (iconBusy.value === 'confirm') iconBusy.value = ''
   }
 }
 
 async function resetSiteIcon() {
-  if (!props.site) return
+  const targetSiteID = props.site?.id ?? 0
+  if (targetSiteID <= 0) return
   iconBusy.value = 'reset'
   try {
-    const res = await sitesApi.deleteIcon(props.site.id)
-    iconSource.value = res.source
-    iconHasImage.value = res.source !== 'default'
-    iconRev.value = Date.now()
-    toast.success(res.source === 'auto' ? '已恢复使用源站自带图标' : '已恢复默认图标')
+    const res = await sitesApi.deleteIcon(targetSiteID)
+    if ((props.site?.id ?? 0) === targetSiteID) {
+      pendingAvatarPreview.value = null
+      iconSource.value = res.source
+      iconHasImage.value = res.source !== 'default'
+      iconRev.value = Date.now()
+    }
+    toast.success(res.source === 'auto' ? '已恢复使用源站公开图标' : '已恢复默认图标')
   } catch (error) {
     toast.error(errorMessage(error, '恢复失败'))
   } finally {
-    iconBusy.value = ''
+    if (iconBusy.value === 'reset') iconBusy.value = ''
   }
 }
 
@@ -407,19 +480,31 @@ async function save() {
       <fieldset>
         <legend>源站</legend>
         <UiField label="站点名称" for="se-name"><input id="se-name" v-model="cfg.name" class="input" maxlength="64" :autofocus="!editing" /></UiField>
-        <UiField v-if="editing && site" label="站点图标" help="用于播放器「切服」卡片封面。系统会在登录时自动缓存源站自带头像，也可手动上传覆盖。">
+        <UiField v-if="editing && site" label="站点图标" help="用于播放器「切服」卡片封面。系统仅自动抓取源站公开品牌图标；使用源站账号头像时需手动预览确认，也可直接上传图片。">
           <div class="icon-row">
             <div class="icon-preview">
               <img v-if="iconHasImage" :src="sitesApi.iconUrl(site.id, iconRev)" :alt="cfg.name" @error="iconHasImage = false" />
               <ImageIcon v-else class="icon-empty" />
             </div>
             <div class="icon-meta">
-              <span class="icon-badge">{{ iconSource === 'custom' ? '自定义图标' : iconSource === 'auto' ? '源站自带图标' : '内置默认图标' }}</span>
+              <span class="icon-badge">{{ iconSource === 'custom' ? '自定义图标' : iconSource === 'auto' ? '源站公开图标' : '内置默认图标' }}</span>
               <div class="icon-actions">
                 <input ref="iconFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden @change="onIconFileSelected" />
                 <UiButton size="sm" :loading="iconBusy === 'upload'" :disabled="!!iconBusy" @click="iconFileInput?.click()"><Upload />上传图片</UiButton>
                 <UiButton size="sm" variant="ghost" :loading="iconBusy === 'fetch'" :disabled="!!iconBusy" @click="fetchSiteIcon"><RefreshCw />抓取源站图标</UiButton>
                 <UiButton v-if="iconSource === 'custom'" size="sm" variant="ghost" :loading="iconBusy === 'reset'" :disabled="!!iconBusy" @click="resetSiteIcon">恢复默认</UiButton>
+              </div>
+            </div>
+          </div>
+          <div v-if="pendingAvatarPreview && pendingAvatarPreview.siteId === site.id" class="icon-confirm">
+            <div class="icon-preview">
+              <img :src="pendingAvatarPreview.dataUrl" alt="待确认站标预览" />
+            </div>
+            <div class="icon-meta">
+              <span class="icon-badge">该源站未提供公开站标，已读取配置账号头像。请确认可公开作为全站图标：</span>
+              <div class="icon-actions">
+                <UiButton size="sm" variant="primary" :loading="iconBusy === 'confirm'" :disabled="!!iconBusy" @click="confirmPendingAvatar">确认设为站标</UiButton>
+                <UiButton size="sm" variant="ghost" :disabled="!!iconBusy" @click="pendingAvatarPreview = null">取消</UiButton>
               </div>
             </div>
           </div>
@@ -641,6 +726,7 @@ legend + * { clear: both; }
 .paste-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .row-end { display: flex; justify-content: flex-end; }
 .icon-row { display: flex; align-items: center; gap: 14px; }
+.icon-confirm { display: flex; align-items: center; gap: 12px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .icon-preview { width: 52px; height: 52px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-2); display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0; }
 .icon-preview img { width: 100%; height: 100%; object-fit: contain; padding: 4px; }
 .icon-empty { width: 22px; height: 22px; color: var(--text-3); }

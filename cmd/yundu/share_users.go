@@ -940,20 +940,42 @@ func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Reques
 	return activeSite, 0, ""
 }
 
-func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Request) func() {
+// acquireRequestActivity atomically checks the concurrent stream limit (when
+// required) and registers request playback/stream activity under a single
+// rt.mu.Lock() acquisition so simultaneous playback starts from different
+// devices cannot both bypass a 1-stream cap.
+func (rt *shareUserRuntime) acquireRequestActivity(userID int64, tokenHash string, r *http.Request, now time.Time, checkLimit bool) (func(), bool, int) {
+	noop := func() {}
 	if rt == nil || tokenHash == "" {
-		return func() {}
+		return noop, false, 0
 	}
 	isStart := isSharePlaybackStartRequest(r)
 	isProgress := isSharePlaybackProgressRequest(r)
 	isStopped := isSharePlaybackStoppedRequest(r)
 	isMedia := isShareActiveMediaRequest(r)
-	if !isStart && !isProgress && !isStopped && !isMedia {
-		return func() {}
+	shouldCheckLimit := checkLimit && userID > 0 && (isMedia || isStart)
+	if !shouldCheckLimit && !isStart && !isProgress && !isStopped && !isMedia {
+		return noop, false, 0
 	}
 	masterName := rt.masterNodeName()
-	now := time.Now()
+	if now.IsZero() {
+		now = time.Now()
+	}
 	rt.mu.Lock()
+	if shouldCheckLimit {
+		if state := rt.users[userID]; state != nil && state.maxConcurrentStreams > 0 {
+			otherPlaying := rt.activeStreamCountForUserLocked(userID, tokenHash, now)
+			if otherPlaying >= state.maxConcurrentStreams {
+				limit := state.maxConcurrentStreams
+				rt.mu.Unlock()
+				return noop, true, limit
+			}
+		}
+	}
+	if !isStart && !isProgress && !isStopped && !isMedia {
+		rt.mu.Unlock()
+		return noop, false, 0
+	}
 	act := rt.activity[tokenHash]
 	if act == nil {
 		act = &shareSessionActivity{}
@@ -972,7 +994,7 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 	}
 	rt.mu.Unlock()
 	if !isMedia && !isStopped {
-		return func() {}
+		return noop, false, 0
 	}
 	return func() {
 		revokeNow := false
@@ -1015,7 +1037,12 @@ func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Reque
 		if revokeNow {
 			_ = rt.revokeByHash(tokenHash)
 		}
-	}
+	}, false, 0
+}
+
+func (rt *shareUserRuntime) beginRequestActivity(tokenHash string, r *http.Request) func() {
+	finish, _, _ := rt.acquireRequestActivity(0, tokenHash, r, time.Now(), false)
+	return finish
 }
 
 func (rt *shareUserRuntime) scheduleDrainSweepLocked() {
@@ -1405,14 +1432,12 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 			}
 			rt.mu.Unlock()
 		}
-		if isShareActiveMediaRequest(r) || isSharePlaybackStartRequest(r) {
-			if blocked, limit := rt.checkConcurrentStreamLimit(entry.userID, hash, now); blocked {
-				writeShareJSONError(w, http.StatusTooManyRequests, shareConcurrentStreamLimitMessage(limit))
-				return r, nil, nil, "", noop, true
-			}
+		finish, blocked, limit := rt.acquireRequestActivity(entry.userID, hash, r, now, true)
+		if blocked {
+			writeShareJSONError(w, http.StatusTooManyRequests, shareConcurrentStreamLimitMessage(limit))
+			return r, nil, nil, "", noop, true
 		}
 		r = r.WithContext(withSharePreWatching(r.Context(), wasWatching))
-		finish := rt.beginRequestActivity(hash, r)
 		return r, nil, state, hash, finish, false
 	}
 	// Dynamic playback routes carry no Emby token; attribute them through the
@@ -1447,13 +1472,11 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 			writeShareJSONError(w, http.StatusUnauthorized, msg)
 			return r, nil, nil, "", noop, true
 		}
-		if isShareActiveMediaRequest(r) {
-			if blocked, limit := rt.checkConcurrentStreamLimit(userID, tokenHash, now); blocked {
-				writeShareJSONError(w, http.StatusTooManyRequests, shareConcurrentStreamLimitMessage(limit))
-				return r, nil, nil, "", noop, true
-			}
+		finish, blocked, limit := rt.acquireRequestActivity(userID, tokenHash, r, now, isShareActiveMediaRequest(r))
+		if blocked {
+			writeShareJSONError(w, http.StatusTooManyRequests, shareConcurrentStreamLimitMessage(limit))
+			return r, nil, nil, "", noop, true
 		}
-		finish := rt.beginRequestActivity(tokenHash, r)
 		return r, nil, state, tokenHash, finish, false
 	}
 	return r, nil, nil, "", noop, false

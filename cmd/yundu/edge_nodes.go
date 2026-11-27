@@ -38,9 +38,12 @@ const (
 	edgeTicketTTL            = 6 * time.Hour
 	edgeTicketPathPrefix     = "/_yundu/p/"
 	edgeEgressPath           = "/_yundu/egress"
-	edgeEgressTicketHeader   = "X-Yundu-Egress-Ticket"
-	edgeEgressMarkerHeader   = "X-Yundu-Egress"
-	edgeEgressTicketTTL      = 2 * time.Minute
+	edgeEgressTicketHeader          = "X-Yundu-Egress-Ticket"
+	edgeEgressMarkerHeader          = "X-Yundu-Egress"
+	edgeAgentDynamicGuardHeader     = "X-Yundu-Dynamic-Guard"
+	edgeMasterTrafficBatchAckHeader = "X-Yundu-Traffic-Batch-Ack"
+	edgeTrafficBatchMaxMemory       = 512
+	edgeEgressTicketTTL             = 2 * time.Minute
 	edgeMaxTicketBytes       = 16 << 10
 	edgeHeartbeatBodyLimit   = 1 << 20
 	edgeNodeDefaultPort      = 19090
@@ -100,6 +103,13 @@ CREATE TABLE IF NOT EXISTS isp_group_settings (
 	block_connect INTEGER NOT NULL DEFAULT 0,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS edge_traffic_batches (
+	node_id INTEGER NOT NULL,
+	batch_id TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY(node_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_edge_traffic_batches_node_created ON edge_traffic_batches(node_id, created_at);
 `
 
 func ensureEdgeNodeSchema(ctx context.Context, conn *sql.Conn) error {
@@ -321,19 +331,30 @@ func openEdgeEgressTicket(token, encoded string) (edgeEgressTicket, error) {
 	return ticket, nil
 }
 
+type edgeDynamicGuardPolicy struct {
+	Profile             string              `json:"p"`
+	AllowHTTPSDowngrade bool                `json:"hd,omitempty"`
+	DomainRules         []DynamicDomainRule `json:"dr,omitempty"`
+	PreviousScheme      string              `json:"ps,omitempty"`
+	AllowRedirects      bool                `json:"ar,omitempty"`
+	MaxRedirects        int                 `json:"mr,omitempty"`
+	DeniedHosts         []string            `json:"dh,omitempty"`
+}
+
 type edgePlaybackTicket struct {
-	Version      int               `json:"v"`
-	NodeID       int64             `json:"n"`
-	SiteID       int64             `json:"s"`
-	ShareUserID  int64             `json:"u,omitempty"`
-	TokenHash    string            `json:"th,omitempty"`
-	ClientIP     string            `json:"cip,omitempty"`
-	SpeedMbps    int               `json:"sp,omitempty"`
-	TargetURL    string            `json:"t"`
-	Headers      map[string]string `json:"h,omitempty"`
-	ClientIPMode string            `json:"cm,omitempty"`
-	FollowRedir  bool              `json:"fr,omitempty"`
-	ExpiresAt    int64             `json:"exp"`
+	Version      int                     `json:"v"`
+	NodeID       int64                   `json:"n"`
+	SiteID       int64                   `json:"s"`
+	ShareUserID  int64                   `json:"u,omitempty"`
+	TokenHash    string                  `json:"th,omitempty"`
+	ClientIP     string                  `json:"cip,omitempty"`
+	SpeedMbps    int                     `json:"sp,omitempty"`
+	TargetURL    string                  `json:"t"`
+	Headers      map[string]string       `json:"h,omitempty"`
+	ClientIPMode string                  `json:"cm,omitempty"`
+	FollowRedir  bool                    `json:"fr,omitempty"`
+	DynamicGuard *edgeDynamicGuardPolicy `json:"dg,omitempty"`
+	ExpiresAt    int64                   `json:"exp"`
 }
 
 func sealEdgePlaybackTicket(token string, ticket edgePlaybackTicket) (string, error) {
@@ -507,9 +528,11 @@ type edgeNodeLiveState struct {
 	alertKnownOffline   bool
 	alertQuota80Period  string
 	alertQuota100Period string
-	supportsSpeedtest   bool
-	supportsDirectPopup bool
-	supportsEgress      bool
+	supportsSpeedtest    bool
+	supportsDirectPopup  bool
+	supportsEgress       bool
+	supportsDynamicGuard bool
+	lastAgentInstance    string
 	ispHealth           map[string]*ispHealthState
 	ispProbeSeq         uint64
 	ispForceProbeID     string
@@ -522,6 +545,36 @@ type edgeNodeLiveState struct {
 	persistedTotalOut int64
 	pendingTotalIn    atomic.Int64
 	pendingTotalOut   atomic.Int64
+
+	recentTrafficBatches    map[string]struct{}
+	recentTrafficBatchOrder []string
+}
+
+func (n *edgeNodeLiveState) hasRecentTrafficBatchLocked(batchID string) bool {
+	if n == nil || batchID == "" || n.recentTrafficBatches == nil {
+		return false
+	}
+	_, ok := n.recentTrafficBatches[batchID]
+	return ok
+}
+
+func (n *edgeNodeLiveState) rememberTrafficBatchLocked(batchID string) {
+	if n == nil || batchID == "" {
+		return
+	}
+	if n.recentTrafficBatches == nil {
+		n.recentTrafficBatches = make(map[string]struct{}, 32)
+	}
+	if _, exists := n.recentTrafficBatches[batchID]; exists {
+		return
+	}
+	n.recentTrafficBatches[batchID] = struct{}{}
+	n.recentTrafficBatchOrder = append(n.recentTrafficBatchOrder, batchID)
+	for len(n.recentTrafficBatchOrder) > edgeTrafficBatchMaxMemory {
+		evicted := n.recentTrafficBatchOrder[0]
+		n.recentTrafficBatchOrder = n.recentTrafficBatchOrder[1:]
+		delete(n.recentTrafficBatches, evicted)
+	}
 }
 
 func (n *edgeNodeLiveState) totalDirections() (int64, int64) {
@@ -1343,6 +1396,17 @@ func (rt *edgeNodeRuntime) nodeNameByID(nodeID int64) string {
 		return node.name
 	}
 	return ""
+}
+
+func (rt *edgeNodeRuntime) nodeSupportsDynamicGuard(nodeID int64) bool {
+	if rt == nil || nodeID <= 0 {
+		return false
+	}
+	now := time.Now()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	node := rt.nodes[nodeID]
+	return node != nil && node.isOnline(now) && node.supportsDynamicGuard
 }
 
 func (rt *edgeNodeRuntime) lookupISPGroup(clientIP string) string {
@@ -2966,26 +3030,29 @@ type agentHeartbeatRequest struct {
 	UpgradeRequestID    string                         `json:"upgrade_request_id,omitempty"`
 	UpgradeStatus       string                         `json:"upgrade_status,omitempty"`
 	CertFingerprint     string                         `json:"cert_fingerprint"`
+	TrafficBatchID      string                         `json:"traffic_batch_id,omitempty"`
 	TrafficReports      []agentTrafficReport           `json:"traffic_reports"`
 	IPMismatchEvents    []agentIPMismatchEvent         `json:"ip_mismatch_events,omitempty"`
 }
 
 type agentHeartbeatResponse struct {
-	OK                bool                 `json:"ok"`
-	NodeEnabled       bool                 `json:"node_enabled"`
-	BlockedUsers      []int64              `json:"blocked_users"`
-	RevokedHashes     []string             `json:"revoked_hashes"`
-	UserSpeedLimits   map[int64]int        `json:"user_speed_limits"`
-	ProbeTargets      []agentProbeTarget   `json:"probe_targets,omitempty"`
-	ISPProbeConfig    *agentISPProbeConfig `json:"isp_probe_config,omitempty"`
-	SpeedtestTask     *agentSpeedtestTask  `json:"speedtest_task,omitempty"`
-	CancelSpeedtestID string              `json:"cancel_speedtest_id,omitempty"`
-	AckSpeedtestID    string              `json:"ack_speedtest_id,omitempty"`
-	UpgradeToVersion  string              `json:"upgrade_to_version,omitempty"`
-	UpgradeRequestID  string              `json:"upgrade_request_id,omitempty"`
-	TLSCertPEM        string              `json:"tls_cert_pem,omitempty"`
-	TLSKeyPEM         string              `json:"tls_key_pem,omitempty"`
-	CertFingerprint   string              `json:"cert_fingerprint,omitempty"`
+	OK                       bool                 `json:"ok"`
+	NodeEnabled              bool                 `json:"node_enabled"`
+	BlockedUsers             []int64              `json:"blocked_users"`
+	RevokedHashes            []string             `json:"revoked_hashes"`
+	UserSpeedLimits          map[int64]int        `json:"user_speed_limits"`
+	ProbeTargets             []agentProbeTarget   `json:"probe_targets,omitempty"`
+	ISPProbeConfig           *agentISPProbeConfig `json:"isp_probe_config,omitempty"`
+	SpeedtestTask            *agentSpeedtestTask  `json:"speedtest_task,omitempty"`
+	CancelSpeedtestID        string               `json:"cancel_speedtest_id,omitempty"`
+	AckSpeedtestID           string               `json:"ack_speedtest_id,omitempty"`
+	TrafficBatchAckSupported bool                 `json:"traffic_batch_ack_supported,omitempty"`
+	AckTrafficBatchID        string               `json:"ack_traffic_batch_id,omitempty"`
+	UpgradeToVersion         string               `json:"upgrade_to_version,omitempty"`
+	UpgradeRequestID         string               `json:"upgrade_request_id,omitempty"`
+	TLSCertPEM               string               `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM                string               `json:"tls_key_pem,omitempty"`
+	CertFingerprint          string               `json:"cert_fingerprint,omitempty"`
 }
 
 func (a *App) masterTLSPEMForHost(hostname string) (certPEM, keyPEM, fingerprint string, ok bool) {
@@ -3098,32 +3165,47 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if a.db != nil {
 		billingMode = a.db.currentSystemSettings().TrafficBillingMode
 	}
-	var nodeBytesDelta, nodeInDelta, nodeOutDelta int64
-	for _, report := range req.TrafficReports {
-		if report.BytesIn < 0 || report.BytesOut < 0 {
-			continue
-		}
-		billed := trafficBillableBytes(billingMode, report.BytesIn, report.BytesOut)
-		nodeBytesDelta += billed
-		nodeInDelta += report.BytesIn
-		nodeOutDelta += report.BytesOut
-		// Credit site traffic meters if the site is loaded.
-		if report.SiteID > 0 {
-			a.pm.recordExternalSiteTraffic(report.SiteID, report.BytesIn, report.BytesOut, report.Requests, now)
-		}
-		// Credit share user traffic and refresh draining playback timestamp.
-		if a.pm.shares != nil && report.ShareUserID > 0 {
-			a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, node.id, nodeName, now)
-		}
+	trafficBatchID := strings.TrimSpace(req.TrafficBatchID)
+	if len(trafficBatchID) > 128 {
+		a.jsonErr(w, http.StatusBadRequest, "invalid traffic batch id")
+		return
 	}
-	if nodeBytesDelta > 0 {
-		node.pending.Add(nodeBytesDelta)
-	}
-	if nodeInDelta > 0 {
-		node.pendingTotalIn.Add(nodeInDelta)
-	}
-	if nodeOutDelta > 0 {
-		node.pendingTotalOut.Add(nodeOutDelta)
+	var ackTrafficBatchID string
+	if trafficBatchID != "" {
+		if err := a.applyIdempotentEdgeTrafficBatch(nodeID, node, nodeName, trafficBatchID, req.TrafficReports, billingMode, now); err != nil {
+			log.Printf("edge node %d: commit traffic batch %s: %v", nodeID, trafficBatchID, err)
+			a.jsonErr(w, http.StatusInternalServerError, "failed to commit traffic batch")
+			return
+		}
+		ackTrafficBatchID = trafficBatchID
+	} else {
+		var nodeBytesDelta, nodeInDelta, nodeOutDelta int64
+		for _, report := range req.TrafficReports {
+			if report.BytesIn < 0 || report.BytesOut < 0 {
+				continue
+			}
+			billed := trafficBillableBytes(billingMode, report.BytesIn, report.BytesOut)
+			nodeBytesDelta += billed
+			nodeInDelta += report.BytesIn
+			nodeOutDelta += report.BytesOut
+			// Credit site traffic meters if the site is loaded.
+			if report.SiteID > 0 {
+				a.pm.recordExternalSiteTraffic(report.SiteID, report.BytesIn, report.BytesOut, report.Requests, now)
+			}
+			// Credit share user traffic and refresh draining playback timestamp.
+			if a.pm.shares != nil && report.ShareUserID > 0 {
+				a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, billed, report.Playing, node.id, nodeName, now)
+			}
+		}
+		if nodeBytesDelta > 0 {
+			node.pending.Add(nodeBytesDelta)
+		}
+		if nodeInDelta > 0 {
+			node.pendingTotalIn.Add(nodeInDelta)
+		}
+		if nodeOutDelta > 0 {
+			node.pendingTotalOut.Add(nodeOutDelta)
+		}
 	}
 	var ackSpeedtestID string
 	if req.SpeedtestProgress != nil && a.speedtest != nil {
@@ -3135,10 +3217,19 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	a.pm.edges.mu.Lock()
 	node.lastSeen = now
+	agentInstance := strings.TrimSpace(r.Header.Get(edgeAgentInstanceHeader))
+	if agentInstance != "" && node.lastAgentInstance != "" && agentInstance != node.lastAgentInstance {
+		node.supportsDynamicGuard = false
+		node.supportsDirectPopup = false
+	}
+	if agentInstance != "" {
+		node.lastAgentInstance = agentInstance
+	}
 	if req.SupportsSpeedtest {
 		node.supportsSpeedtest = true
 	}
 	node.supportsDirectPopup = req.SupportsDirectPopup || strings.TrimSpace(r.Header.Get("X-Yundu-Direct-Popup")) == "1"
+	node.supportsDynamicGuard = strings.TrimSpace(r.Header.Get(edgeAgentDynamicGuardHeader)) == "1"
 	if strings.TrimSpace(r.Header.Get("X-Yundu-Egress-Capable")) == "1" || agentVersionSupportsEgress(req.Version) {
 		node.supportsEgress = true
 	}
@@ -3246,15 +3337,17 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	})
 
 	resp := agentHeartbeatResponse{
-		OK:               true,
-		NodeEnabled:      nodeEnabled,
-		BlockedUsers:     []int64{},
-		RevokedHashes:    []string{},
-		UserSpeedLimits:  map[int64]int{},
-		ProbeTargets:     probeTargets,
-		ISPProbeConfig:   ispProbeCfg,
-		UpgradeToVersion: upgradeVersion,
-		UpgradeRequestID: upgradeReqID,
+		OK:                       true,
+		NodeEnabled:              nodeEnabled,
+		BlockedUsers:             []int64{},
+		RevokedHashes:            []string{},
+		UserSpeedLimits:          map[int64]int{},
+		ProbeTargets:             probeTargets,
+		ISPProbeConfig:           ispProbeCfg,
+		TrafficBatchAckSupported: true,
+		AckTrafficBatchID:        ackTrafficBatchID,
+		UpgradeToVersion:         upgradeVersion,
+		UpgradeRequestID:         upgradeReqID,
 	}
 	if a.pm.shares != nil {
 		resp.BlockedUsers, resp.RevokedHashes, resp.UserSpeedLimits = a.pm.shares.agentSyncSnapshot(now)
@@ -3275,7 +3368,209 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if probeClaim != "" {
 		w.Header().Set(edgeAgentProbeClaimHeader, probeClaim)
 	}
+	w.Header().Set(edgeMasterTrafficBatchAckHeader, "1")
 	a.jsonOK(w, resp)
+}
+
+func (a *App) applyIdempotentEdgeTrafficBatch(
+	nodeID int64,
+	node *edgeNodeLiveState,
+	nodeName string,
+	batchID string,
+	reports []agentTrafficReport,
+	billingMode string,
+	now time.Time,
+) error {
+	if a == nil || a.db == nil || node == nil || batchID == "" {
+		return nil
+	}
+	a.pm.edges.mu.RLock()
+	alreadySeen := node.hasRecentTrafficBatchLocked(batchID)
+	a.pm.edges.mu.RUnlock()
+	if alreadySeen {
+		if a.pm != nil && a.pm.shares != nil {
+			for _, report := range reports {
+				if report.ShareUserID > 0 && report.Playing {
+					a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, 0, true, nodeID, nodeName, now)
+				}
+			}
+		}
+		return nil
+	}
+
+	type siteDelta struct {
+		bytesIn  int64
+		bytesOut int64
+		requests int64
+	}
+	siteTotals := make(map[int64]siteDelta)
+	userTotals := make(map[int64]int64)
+	var nodeBytesDelta, nodeInDelta, nodeOutDelta int64
+	for _, report := range reports {
+		if report.BytesIn < 0 || report.BytesOut < 0 || report.Requests < 0 {
+			continue
+		}
+		billed := trafficBillableBytes(billingMode, report.BytesIn, report.BytesOut)
+		nodeBytesDelta += billed
+		nodeInDelta += report.BytesIn
+		nodeOutDelta += report.BytesOut
+		if report.SiteID > 0 && (report.BytesIn > 0 || report.BytesOut > 0 || report.Requests > 0) {
+			sd := siteTotals[report.SiteID]
+			sd.bytesIn += report.BytesIn
+			sd.bytesOut += report.BytesOut
+			sd.requests += report.Requests
+			siteTotals[report.SiteID] = sd
+		}
+		if report.ShareUserID > 0 && billed > 0 {
+			userTotals[report.ShareUserID] += billed
+		}
+	}
+
+	tx, err := a.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO edge_traffic_batches(node_id, batch_id, created_at) VALUES(?, ?, ?)`,
+		nodeID, batchID, now.UnixNano(),
+	)
+	if err != nil {
+		return err
+	}
+	affected, affErr := res.RowsAffected()
+	if affErr != nil {
+		return affErr
+	}
+	if affected == 0 {
+		// Already committed in SQLite (for example before a master restart).
+		a.pm.edges.mu.Lock()
+		node.rememberTrafficBatchLocked(batchID)
+		a.pm.edges.mu.Unlock()
+		if a.pm != nil && a.pm.shares != nil {
+			for _, report := range reports {
+				if report.ShareUserID > 0 && report.Playing {
+					a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, 0, true, nodeID, nodeName, now)
+				}
+			}
+		}
+		return nil
+	}
+
+	if nodeBytesDelta > 0 || nodeInDelta > 0 || nodeOutDelta > 0 {
+		if _, err := tx.Exec(
+			`UPDATE edge_nodes SET traffic_used=traffic_used+?, total_bytes_in=total_bytes_in+?, total_bytes_out=total_bytes_out+? WHERE id=?`,
+			nodeBytesDelta, nodeInDelta, nodeOutDelta, nodeID,
+		); err != nil {
+			return err
+		}
+	}
+	minute := trafficMinuteBucket(now)
+	for siteID, sd := range siteTotals {
+		if _, err := tx.Exec(
+			`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, requests, recorded_at)
+			 VALUES (?,?,?,?,?)
+			 ON CONFLICT(site_id, recorded_at) DO UPDATE SET
+				bytes_in = traffic_logs.bytes_in + excluded.bytes_in,
+				bytes_out = traffic_logs.bytes_out + excluded.bytes_out,
+				requests = traffic_logs.requests + excluded.requests`,
+			siteID, sd.bytesIn, sd.bytesOut, sd.requests, minute,
+		); err != nil {
+			return err
+		}
+		if sd.bytesIn != 0 || sd.bytesOut != 0 {
+			if _, err := tx.Exec(
+				`UPDATE sites SET traffic_used=traffic_used+?+?, traffic_used_in=traffic_used_in+?, traffic_used_out=traffic_used_out+?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				sd.bytesIn, sd.bytesOut, sd.bytesIn, sd.bytesOut, siteID,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	for userID, billed := range userTotals {
+		if _, err := tx.Exec(`UPDATE share_users SET traffic_used=traffic_used+? WHERE id=?`, billed, userID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM edge_traffic_batches WHERE node_id=? AND batch_id NOT IN (SELECT batch_id FROM edge_traffic_batches WHERE node_id=? ORDER BY created_at DESC LIMIT ?)`,
+		nodeID, nodeID, edgeTrafficBatchMaxMemory,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Update in-memory persisted mirrors strictly AFTER durable SQLite commit.
+	a.pm.edges.mu.Lock()
+	node.persistedUsed += nodeBytesDelta
+	node.persistedTotalIn += nodeInDelta
+	node.persistedTotalOut += nodeOutDelta
+	node.rememberTrafficBatchLocked(batchID)
+	a.pm.edges.mu.Unlock()
+
+	if a.pm != nil {
+		for siteID, sd := range siteTotals {
+			a.pm.recordCommittedExternalSiteTraffic(siteID, sd.bytesIn, sd.bytesOut, sd.requests)
+		}
+		if a.pm.shares != nil {
+			for userID, billed := range userTotals {
+				a.pm.shares.recordCommittedExternalTraffic(userID, billed)
+			}
+			for _, report := range reports {
+				if report.ShareUserID > 0 && report.Playing {
+					a.pm.shares.recordExternalTraffic(report.ShareUserID, report.TokenHash, 0, true, nodeID, nodeName, now)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// recordCommittedExternalSiteTraffic updates a loaded site's persisted and
+// cumulative live counters after durable SQLite commit without touching pending
+// flush buffers (preventing double persistence on the next periodic flush).
+func (pm *ProxyManager) recordCommittedExternalSiteTraffic(siteID, bytesIn, bytesOut, requests int64) {
+	if pm == nil || siteID <= 0 || (bytesIn == 0 && bytesOut == 0 && requests == 0) {
+		return
+	}
+	pm.mu.RLock()
+	inst := pm.proxies[siteID]
+	pm.mu.RUnlock()
+	if inst == nil {
+		return
+	}
+	inst.trafficMu.Lock()
+	if bytesIn > 0 {
+		inst.persistedBytesIn.Add(bytesIn)
+		inst.cumulativeBytesIn.Add(bytesIn)
+		inst.persistedTraffic.Add(bytesIn)
+	}
+	if bytesOut > 0 {
+		inst.persistedBytesOut.Add(bytesOut)
+		inst.cumulativeBytesOut.Add(bytesOut)
+		inst.persistedTraffic.Add(bytesOut)
+	}
+	if requests > 0 {
+		inst.reqCount.Add(requests)
+	}
+	if bytesIn > 0 || bytesOut > 0 {
+		inst.trafficCycleStart = time.Time{}
+	}
+	inst.trafficMu.Unlock()
+}
+
+func (rt *shareUserRuntime) recordCommittedExternalTraffic(userID, billed int64) {
+	if rt == nil || userID <= 0 || billed <= 0 {
+		return
+	}
+	rt.mu.Lock()
+	if state := rt.users[userID]; state != nil {
+		state.persistedUsed += billed
+	}
+	rt.mu.Unlock()
 }
 
 // recordExternalSiteTraffic adds agent-reported traffic into a site's live meters.

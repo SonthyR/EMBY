@@ -224,5 +224,62 @@ jobs:
           build-args: |
             VERSION=${{ env.RELEASE_TAG }}
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+
+  promote-docker-latest:
+    needs: [verify, release, docker]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: docker-latest-promotion
+      cancel-in-progress: false
+    permissions:
+      packages: write
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/yundu" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote Docker latest tag only for highest published release
+        run: |
+          set -euo pipefail
+          candidates=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V -r)
+          if [ -z "$candidates" ]; then
+            echo "No published stable releases found; skipping :latest promotion."
+            exit 0
+          fi
+          highest_valid=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            if docker buildx imagetools inspect "${IMAGE_NAME}:${tag}" >/dev/null 2>&1; then
+              highest_valid="$tag"
+              break
+            fi
+          done <<< "$candidates"
+          if [ -z "$highest_valid" ]; then
+            echo "No published stable release has a verified GHCR image; skipping :latest promotion." >&2
+            exit 1
+          fi
+          echo "Highest published stable release with verified image: ${highest_valid} (current workflow: ${RELEASE_TAG})"
+          if [ "$highest_valid" != "$RELEASE_TAG" ]; then
+            echo "Current release ${RELEASE_TAG} is older than ${highest_valid}; leaving :latest pointing to ${highest_valid}."
+            exit 0
+          fi
+          docker buildx imagetools create -t "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${highest_valid}"
+          echo "Promoted ${IMAGE_NAME}:latest -> ${IMAGE_NAME}:${highest_valid}"

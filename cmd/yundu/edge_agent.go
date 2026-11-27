@@ -278,9 +278,13 @@ type edgeAgent struct {
 	limiters     map[int64]*shareRateLimiter
 	speedLimits  map[int64]int
 
-	trafficMu sync.Mutex
-	traffic   map[agentTrafficKey]*agentTrafficAccum
-	flushCh   chan struct{}
+	trafficMu                   sync.Mutex
+	traffic                     map[agentTrafficKey]*agentTrafficAccum
+	pendingTrafficBatchID       string
+	pendingTrafficBatchReports  []agentTrafficReport
+	trafficBatchSeq             uint64
+	masterSupportsTrafficBatch  atomic.Bool
+	flushCh                     chan struct{}
 
 	ipMismatchMu sync.Mutex
 	ipMismatches []agentIPMismatchEvent
@@ -323,7 +327,13 @@ type edgeAgent struct {
 
 	restartCh   chan struct{}
 	restartOnce sync.Once
+
+	dynamicResolver       dynamicIPResolver
+	dynamicDial           dynamicDialContextFunc
+	dynamicInterfaceAddrs dynamicInterfaceAddrsFunc
 }
+
+var errEdgeDynamicTargetDenied = errors.New("dynamic target denied by edge policy")
 
 type directStreamBudget struct {
 	used int64
@@ -440,11 +450,15 @@ func (a *edgeAgent) recordTraffic(siteID, shareUserID int64, tokenHash string, b
 	a.trafficMu.Unlock()
 }
 
-func (a *edgeAgent) drainTrafficReports() []agentTrafficReport {
+func (a *edgeAgent) prepareTrafficBatch() (string, []agentTrafficReport) {
 	a.trafficMu.Lock()
+	defer a.trafficMu.Unlock()
+	if len(a.pendingTrafficBatchReports) > 0 {
+		copied := append([]agentTrafficReport(nil), a.pendingTrafficBatchReports...)
+		return a.pendingTrafficBatchID, copied
+	}
 	if len(a.traffic) == 0 {
-		a.trafficMu.Unlock()
-		return nil
+		return "", nil
 	}
 	reports := make([]agentTrafficReport, 0, len(a.traffic))
 	for key, acc := range a.traffic {
@@ -459,11 +473,38 @@ func (a *edgeAgent) drainTrafficReports() []agentTrafficReport {
 		})
 	}
 	a.traffic = make(map[agentTrafficKey]*agentTrafficAccum)
+	a.trafficBatchSeq++
+	batchID := fmt.Sprintf("%s-%d", a.instanceID, a.trafficBatchSeq)
+	a.pendingTrafficBatchID = batchID
+	a.pendingTrafficBatchReports = reports
+	copied := append([]agentTrafficReport(nil), reports...)
+	return batchID, copied
+}
+
+func (a *edgeAgent) ackTrafficBatch(batchID string) {
+	a.trafficMu.Lock()
+	if batchID == "" || a.pendingTrafficBatchID == batchID {
+		a.pendingTrafficBatchID = ""
+		a.pendingTrafficBatchReports = nil
+	}
 	a.trafficMu.Unlock()
+}
+
+func (a *edgeAgent) drainTrafficReports() []agentTrafficReport {
+	_, reports := a.prepareTrafficBatch()
 	return reports
 }
 
 func (a *edgeAgent) restoreTrafficReports(reports []agentTrafficReport) {
+	if len(reports) == 0 {
+		return
+	}
+	a.trafficMu.Lock()
+	if len(a.pendingTrafficBatchReports) > 0 {
+		a.trafficMu.Unlock()
+		return
+	}
+	a.trafficMu.Unlock()
 	for _, r := range reports {
 		a.recordTraffic(r.SiteID, r.ShareUserID, r.TokenHash, r.BytesIn, r.BytesOut, r.Requests, r.Playing)
 	}
@@ -740,7 +781,11 @@ func (a *edgeAgent) restoreIPMismatchEvents(events []agentIPMismatchEvent) {
 }
 
 func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
-	reports := a.drainTrafficReports()
+	batchID, reports := a.prepareTrafficBatch()
+	sendBatchID := ""
+	if len(reports) > 0 && a.masterSupportsTrafficBatch.Load() {
+		sendBatchID = batchID
+	}
 	ipMismatches := a.drainIPMismatchEvents()
 	bytesInWindow := a.windowBytes.Swap(0)
 	nowNano := time.Now().UnixNano()
@@ -775,19 +820,18 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 		UpgradeRequestID:  upgradeReqID,
 		UpgradeStatus:     upgradeStatus,
 		CertFingerprint:   fp,
+		TrafficBatchID:    sendBatchID,
 		TrafficReports:    reports,
 		IPMismatchEvents:  ipMismatches,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		a.restoreTrafficReports(reports)
 		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
 	endpoint := a.cfg.MasterURL + "/api/agent/heartbeat"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		a.restoreTrafficReports(reports)
 		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
@@ -800,23 +844,37 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	}
 	req.Header.Set("X-Yundu-Direct-Popup", "1")
 	req.Header.Set("X-Yundu-Egress-Capable", "1")
+	req.Header.Set(edgeAgentDynamicGuardHeader, "1")
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
 
 	resp, err := a.masterClient.Do(req)
 	if err != nil {
-		a.restoreTrafficReports(reports)
 		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		a.restoreTrafficReports(reports)
 		a.restoreIPMismatchEvents(ipMismatches)
+		if resp.StatusCode == http.StatusBadRequest && sendBatchID != "" {
+			// Master was downgraded to a version that rejects unknown JSON fields.
+			a.masterSupportsTrafficBatch.Store(false)
+		}
 		return fmt.Errorf("master returned HTTP %d", resp.StatusCode)
 	}
 	var reply agentHeartbeatResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&reply); err != nil {
 		return err
+	}
+	masterSupportsBatch := strings.TrimSpace(resp.Header.Get(edgeMasterTrafficBatchAckHeader)) == "1" || reply.TrafficBatchAckSupported
+	a.masterSupportsTrafficBatch.Store(masterSupportsBatch)
+	if len(reports) > 0 {
+		if sendBatchID != "" {
+			if reply.AckTrafficBatchID == sendBatchID {
+				a.ackTrafficBatch(sendBatchID)
+			}
+		} else {
+			a.ackTrafficBatch(batchID)
+		}
 	}
 	a.nodeEnabled.Store(reply.NodeEnabled)
 
@@ -1278,7 +1336,12 @@ func (a *edgeAgent) handler() http.Handler {
 			}
 		}
 
-		targetURL, err := resolveAgentTicketURL(ticket.TargetURL, subPath, r.URL.RawQuery)
+		var targetURL *url.URL
+		if ticket.DynamicGuard != nil {
+			targetURL, err = normalizeDynamicURL(ticket.TargetURL)
+		} else {
+			targetURL, err = resolveAgentTicketURL(ticket.TargetURL, subPath, r.URL.RawQuery)
+		}
 		if err != nil {
 			writeShareJSONError(w, http.StatusBadRequest, "无效的媒体地址")
 			return
@@ -1295,13 +1358,32 @@ func (a *edgeAgent) handler() http.Handler {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
+			if errors.Is(err, errEdgeDynamicTargetDenied) {
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("X-Content-Type-Options", "nosniff")
+				writeShareJSONError(w, http.StatusBadGateway, "dynamic discovery unavailable")
+				return
+			}
 			log.Printf("edge agent upstream error: %v", err)
 			writeShareJSONError(w, http.StatusBadGateway, "上游媒体暂不可用")
 			return
 		}
 		defer resp.Body.Close()
 
-		copyAgentResponseHeaders(w.Header(), resp.Header)
+		if ticket.DynamicGuard != nil {
+			if resp.StatusCode < http.StatusBadRequest && (dynamicResponseHasPositiveStructuredContentType(resp) || dynamicResponseIsActiveContent(resp)) {
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("X-Content-Type-Options", "nosniff")
+				writeShareJSONError(w, http.StatusBadGateway, "dynamic discovery unavailable")
+				return
+			}
+			copyAgentResponseHeaders(w.Header(), resp.Header)
+			w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+		} else {
+			copyAgentResponseHeaders(w.Header(), resp.Header)
+		}
 		w.WriteHeader(resp.StatusCode)
 		if r.Method == http.MethodHead {
 			a.recordTraffic(ticket.SiteID, ticket.ShareUserID, ticket.TokenHash, 0, 0, 1, true)
@@ -1382,6 +1464,9 @@ func resolveAgentTicketURL(rawBase, subPath, clientQuery string) (*url.URL, erro
 }
 
 func (a *edgeAgent) fetchUpstream(ctx context.Context, inbound *http.Request, initialURL *url.URL, ticket edgePlaybackTicket) (*http.Response, error) {
+	if ticket.DynamicGuard != nil {
+		return a.fetchGuardedDynamicUpstream(ctx, inbound, initialURL, ticket)
+	}
 	currentURL := initialURL
 	originAuthority := redirectHostKey(initialURL)
 	for hop := 0; hop <= edgeAgentMaxRedirects; hop++ {
@@ -1430,6 +1515,187 @@ func (a *edgeAgent) fetchUpstream(ctx context.Context, inbound *http.Request, in
 		currentURL = next
 	}
 	return nil, errors.New("too many upstream redirects")
+}
+
+type transportCloserBody struct {
+	io.ReadCloser
+	transport *http.Transport
+	once      sync.Once
+}
+
+func (b *transportCloserBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() {
+		if b.transport != nil {
+			b.transport.CloseIdleConnections()
+		}
+	})
+	return err
+}
+
+func (a *edgeAgent) buildDynamicSelfTargetPolicy(deniedHosts []string) (*dynamicSelfTargetPolicy, error) {
+	ifaceFn := a.dynamicInterfaceAddrs
+	if ifaceFn == nil {
+		ifaceFn = net.InterfaceAddrs
+	}
+	localIPs, err := snapshotDynamicInterfaceIPs(ifaceFn)
+	if err != nil {
+		return nil, err
+	}
+	denied := make(map[string]struct{}, len(deniedHosts)+2)
+	for _, h := range deniedHosts {
+		if norm, _, normErr := normalizeDynamicHostSyntax(h); normErr == nil && norm != "" {
+			denied[norm] = struct{}{}
+		}
+	}
+	if a.cfg.MasterURL != "" {
+		if parsed, parseErr := url.Parse(a.cfg.MasterURL); parseErr == nil && parsed.Hostname() != "" {
+			if norm, _, normErr := normalizeDynamicHostSyntax(parsed.Hostname()); normErr == nil && norm != "" {
+				denied[norm] = struct{}{}
+			}
+		}
+	}
+	return &dynamicSelfTargetPolicy{
+		deniedHosts:    denied,
+		localIPs:       localIPs,
+		interfaceAddrs: ifaceFn,
+	}, nil
+}
+
+func (a *edgeAgent) fetchGuardedDynamicUpstream(ctx context.Context, inbound *http.Request, initialURL *url.URL, ticket edgePlaybackTicket) (*http.Response, error) {
+	guard := ticket.DynamicGuard
+	if guard == nil || initialURL == nil {
+		return nil, errEdgeDynamicTargetDenied
+	}
+	profile, err := normalizeDynamicProfile(guard.Profile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, err)
+	}
+	limits, ok := dynamicLimitsForProfile(profile)
+	if !ok {
+		return nil, errEdgeDynamicTargetDenied
+	}
+	rules, err := normalizeDynamicDomainRules(profile, guard.DomainRules)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, err)
+	}
+	allowHTTPSDowngrade := guard.AllowHTTPSDowngrade
+	if profile == dynamicProfileSafe {
+		allowHTTPSDowngrade = false
+	}
+	policy := dynamicRedirectPolicy{
+		configured:          true,
+		available:           true,
+		profile:             profile,
+		limits:              limits,
+		domainRules:         rules,
+		allowHTTPSDowngrade: allowHTTPSDowngrade,
+	}
+	selfTargets, err := a.buildDynamicSelfTargetPolicy(guard.DeniedHosts)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, err)
+	}
+	maxIPs := limits.MaxDNSIPs
+	if maxIPs < 1 || maxIPs > maxDynamicResolvedIPCount {
+		maxIPs = maxDynamicResolvedIPCount
+	}
+	dialFn := a.dynamicDial
+	if dialFn == nil {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: -1}
+		dialFn = dialer.DialContext
+	}
+
+	var prevURL *url.URL
+	if guard.PreviousScheme != "" {
+		if guard.PreviousScheme != "http" && guard.PreviousScheme != "https" {
+			return nil, errEdgeDynamicTargetDenied
+		}
+		prevURL = &url.URL{Scheme: guard.PreviousScheme}
+	}
+	maxHops := edgeAgentMaxRedirects
+	if guard.MaxRedirects > 0 && guard.MaxRedirects < maxHops {
+		maxHops = guard.MaxRedirects
+	}
+	if !guard.AllowRedirects || !ticket.FollowRedir {
+		maxHops = 0
+	}
+
+	currentURL := initialURL
+	originAuthority := redirectHostKey(initialURL)
+	for hop := 0; hop <= maxHops; hop++ {
+		normalized, normErr := normalizeDynamicURL(currentURL.String())
+		if normErr != nil {
+			return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, normErr)
+		}
+		if reason := policy.validateTarget(prevURL, normalized, selfTargets); reason != "" {
+			return nil, fmt.Errorf("%w: %s", errEdgeDynamicTargetDenied, reason)
+		}
+		pinnedIPs, resolveErr := resolveDynamicURLIPs(ctx, a.dynamicResolver, normalized, maxIPs, selfTargets)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, resolveErr)
+		}
+		hopTransport, trErr := newDynamicTransportWithDialer(normalized, pinnedIPs, dialFn, selfTargets)
+		if trErr != nil {
+			return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, trErr)
+		}
+
+		// #nosec G704 -- normalized URL is policy-checked, DNS-pinned, and routed over a proxy-free transport bound to verified public IPs.
+		req, reqErr := http.NewRequestWithContext(ctx, inbound.Method, normalized.String(), nil)
+		if reqErr != nil {
+			hopTransport.CloseIdleConnections()
+			return nil, reqErr
+		}
+		req.Host = normalized.Host
+		req.Close = true
+		sameOrigin := redirectHostKey(normalized) == originAuthority
+		for k, v := range ticket.Headers {
+			if !sameOrigin && isSensitiveEdgeRedirectHeader(k) {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		for _, passthrough := range []string{"Range", "If-Range", "Accept"} {
+			if vals := inbound.Header.Values(passthrough); len(vals) > 0 {
+				req.Header[http.CanonicalHeaderKey(passthrough)] = append([]string(nil), vals...)
+			}
+		}
+		req.Header.Set("Accept-Encoding", "identity")
+		if req.Header.Get("User-Agent") == "" {
+			if ua := strings.TrimSpace(inbound.Header.Get("User-Agent")); ua != "" {
+				req.Header.Set("User-Agent", ua)
+			} else {
+				req.Header.Set("User-Agent", dynamicRedirectUserAgent)
+			}
+		}
+
+		resp, rtErr := hopTransport.RoundTrip(req)
+		if rtErr != nil {
+			hopTransport.CloseIdleConnections()
+			if errors.Is(rtErr, errDynamicSelfTarget) {
+				return nil, fmt.Errorf("%w: %v", errEdgeDynamicTargetDenied, rtErr)
+			}
+			return nil, rtErr
+		}
+		if isEdgeRedirectStatus(resp.StatusCode) {
+			loc := strings.TrimSpace(resp.Header.Get("Location"))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			hopTransport.CloseIdleConnections()
+			if !guard.AllowRedirects || !ticket.FollowRedir || hop >= maxHops || loc == "" {
+				return nil, fmt.Errorf("%w: redirect blocked", errEdgeDynamicTargetDenied)
+			}
+			next, parseErr := normalized.Parse(loc)
+			if parseErr != nil || (next.Scheme != "http" && next.Scheme != "https") || next.Host == "" {
+				return nil, fmt.Errorf("%w: invalid redirect location", errEdgeDynamicTargetDenied)
+			}
+			prevURL = normalized
+			currentURL = next
+			continue
+		}
+		resp.Body = &transportCloserBody{ReadCloser: resp.Body, transport: hopTransport}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("%w: too many redirects", errEdgeDynamicTargetDenied)
 }
 
 func isEdgeRedirectStatus(code int) bool {

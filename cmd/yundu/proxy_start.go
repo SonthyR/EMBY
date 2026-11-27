@@ -432,7 +432,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			trafficMeter.setShareUser(shareUser)
 			if routeUserID, isPersonalRoute := shareRouteUserFromContext(r.Context()); isPersonalRoute {
 				virtualServerID := pm.shares.personalVirtualServerID(routeUserID)
-				if pm.shares.handleInPlayerSiteSwitchRequest(w, r, routeUserID, shareUser, virtualServerID) {
+				if pm.shares.handleInPlayerSiteSwitchRequest(w, r, routeUserID, shareUser, shareSessionHash, virtualServerID) {
 					return
 				}
 			}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -24,9 +25,15 @@ import (
 )
 
 const (
-	siteIconMaxBytes     = 512 << 10 // 512 KiB
-	siteIconFetchTimeout = 12 * time.Second
+	siteIconMaxBytes          = 512 << 10 // 512 KiB
+	siteIconFetchTimeout      = 12 * time.Second
+	siteIconAutoSourcePublic  = "public_brand"
+	siteIconAutoSourceConfirm = "admin_confirmed"
 )
+
+func isValidPublicSiteIconAutoSource(source string) bool {
+	return source == siteIconAutoSourcePublic || source == siteIconAutoSourceConfirm
+}
 
 type cachedSiteIcon struct {
 	Data        []byte
@@ -241,11 +248,11 @@ func (d *DB) getEffectiveSiteIcon(siteID int64) cachedSiteIcon {
 		}
 	}
 	var customData, autoData []byte
-	var customCT, autoCT string
+	var customCT, autoCT, autoSource string
 	err := d.db.QueryRow(
-		`SELECT custom_data, custom_content_type, auto_data, auto_content_type FROM site_icons WHERE site_id=?`,
+		`SELECT custom_data, custom_content_type, auto_data, auto_content_type, auto_source FROM site_icons WHERE site_id=?`,
 		siteID,
-	).Scan(&customData, &customCT, &autoData, &autoCT)
+	).Scan(&customData, &customCT, &autoData, &autoCT, &autoSource)
 	var out cachedSiteIcon
 	switch {
 	case err == nil && len(customData) > 0 && customCT != "":
@@ -255,7 +262,7 @@ func (d *DB) getEffectiveSiteIcon(siteID int64) cachedSiteIcon {
 			Source:      "custom",
 			Hash:        siteIconDataHash(customData),
 		}
-	case err == nil && len(autoData) > 0 && autoCT != "":
+	case err == nil && len(autoData) > 0 && autoCT != "" && isValidPublicSiteIconAutoSource(autoSource):
 		out = cachedSiteIcon{
 			Data:        autoData,
 			ContentType: autoCT,
@@ -274,7 +281,7 @@ func (d *DB) hasAutoSiteIcon(siteID int64) bool {
 		return false
 	}
 	var count int
-	if err := d.db.QueryRow(`SELECT COUNT(*) FROM site_icons WHERE site_id=? AND auto_data IS NOT NULL AND length(auto_data) > 0`, siteID).Scan(&count); err != nil {
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM site_icons WHERE site_id=? AND auto_data IS NOT NULL AND length(auto_data) > 0 AND auto_source IN (?, ?)`, siteID, siteIconAutoSourcePublic, siteIconAutoSourceConfirm).Scan(&count); err != nil {
 		return false
 	}
 	return count > 0
@@ -319,22 +326,25 @@ func (d *DB) clearSiteCustomIcon(siteID int64) error {
 }
 
 func (d *DB) saveSiteAutoIcon(siteID int64, data []byte, contentType string) error {
+	return d.saveSiteAutoIconWithSource(siteID, data, contentType, siteIconAutoSourcePublic)
+}
+
+func (d *DB) saveSiteAutoIconWithSource(siteID int64, data []byte, contentType, autoSource string) error {
 	if d == nil || siteID <= 0 {
 		return errors.New("invalid site id")
+	}
+	if !isValidPublicSiteIconAutoSource(autoSource) {
+		return errors.New("invalid site icon auto source")
 	}
 	ct, ok := detectSiteIconContentType(data)
 	if !ok {
 		return errors.New("unsupported upstream icon image")
 	}
-	if contentType == "" {
-		contentType = ct
-	} else {
-		contentType = ct
-	}
+	contentType = ct
 	_, err := d.db.Exec(
-		`INSERT INTO site_icons(site_id, auto_data, auto_content_type, updated_at) VALUES(?, ?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(site_id) DO UPDATE SET auto_data=excluded.auto_data, auto_content_type=excluded.auto_content_type, updated_at=CURRENT_TIMESTAMP`,
-		siteID, data, contentType,
+		`INSERT INTO site_icons(site_id, auto_data, auto_content_type, auto_source, updated_at) VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(site_id) DO UPDATE SET auto_data=excluded.auto_data, auto_content_type=excluded.auto_content_type, auto_source=excluded.auto_source, updated_at=CURRENT_TIMESTAMP`,
+		siteID, data, contentType, autoSource,
 	)
 	if err == nil {
 		d.invalidateSiteIconCache(siteID)
@@ -342,11 +352,23 @@ func (d *DB) saveSiteAutoIcon(siteID int64, data []byte, contentType string) err
 	return err
 }
 
+func publicSiteBrandIconPaths() []string {
+	return []string{
+		"/img/u/default",
+		"/web/touchicon.png",
+		"/web/touchicon144.png",
+		"/web/assets/img/icon-transparent.png",
+		"/favicon.ico",
+		"/web/favicon.ico",
+	}
+}
+
 // newSiteIconFetchFunc builds an upstream icon fetcher sharing the site's exact
 // egressTransport (respecting edge_full), UAHeaderPolicy, and upstream headers.
-// It tries the Emby account avatar first (following up to 3 same-host redirects,
-// e.g. /Users/{uid}/Images/Primary -> /img/u/default) and falls back to Emby's
-// standard web touchicon paths.
+// When upstreamUID is empty, it queries ONLY public site-level brand icon paths.
+// When upstreamUID is explicitly supplied (admin manual fetch fallback), it
+// fetches that configured site account's avatar so the admin can preview and
+// confirm before publishing it as a site-wide icon.
 func newSiteIconFetchFunc(
 	transport http.RoundTripper,
 	target *url.URL,
@@ -354,17 +376,12 @@ func newSiteIconFetchFunc(
 	headers upstreamHeaderPolicy,
 ) func(ctx context.Context, upstreamUID, upstreamToken string) ([]byte, string, error) {
 	return func(ctx context.Context, upstreamUID, upstreamToken string) ([]byte, string, error) {
-		candidates := make([]string, 0, 4)
+		var candidates []string
 		if uid := strings.TrimSpace(upstreamUID); uid != "" {
-			candidates = append(candidates, "/Users/"+url.PathEscape(uid)+"/Images/Primary")
+			candidates = []string{"/Users/" + url.PathEscape(uid) + "/Images/Primary"}
+		} else {
+			candidates = publicSiteBrandIconPaths()
 		}
-		candidates = append(candidates,
-			"/web/touchicon.png",
-			"/web/touchicon144.png",
-			"/web/assets/img/icon-transparent.png",
-			"/favicon.ico",
-			"/web/favicon.ico",
-		)
 
 		client := &http.Client{
 			Transport: transport,
@@ -449,11 +466,12 @@ func newSiteIconFetchFunc(
 
 func isPassiveSiteAvatarPath(pathValue string) bool {
 	p := normalizeEmbyRelativePath(pathValue)
-	if p == "/img/u/default" {
-		return true
+	for _, allowed := range publicSiteBrandIconPaths() {
+		if p == allowed {
+			return true
+		}
 	}
-	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
-	return len(segs) == 4 && segs[0] == "users" && segs[1] != "" && segs[2] == "images" && segs[3] == "primary"
+	return false
 }
 
 // captureSiteAvatarFromResponse passively caches a site's brand avatar image
@@ -515,11 +533,18 @@ func captureSiteAvatarFromResponse(resp *http.Response, upstreamBasePath string,
 	}
 }
 
-// maybeAsyncFetchSiteAutoIcon triggers a one-shot background icon fetch after a
-// real login or seamless site switch when the site does not yet have a cached
-// auto icon. In edge_full mode it strictly routes through egressNodeID (never
-// leaking the master IP).
-func (rt *shareUserRuntime) maybeAsyncFetchSiteAutoIcon(siteID int64, upstreamUID, upstreamToken string, egressNodeID int64) {
+type siteIconFetchOutcome struct {
+	Data            []byte
+	ContentType     string
+	Kind            string // "public_brand" or "account_avatar"
+	RequiresConfirm bool
+}
+
+// maybeAsyncFetchSiteAutoIcon triggers a one-shot background fetch of explicit
+// public brand icons when the site does not yet have a cached icon. It NEVER
+// borrows any user's personal session or avatar, and in edge_full mode strictly
+// routes through the bound edge node.
+func (rt *shareUserRuntime) maybeAsyncFetchSiteAutoIcon(siteID int64, _ string, _ string, egressNodeID int64) {
 	if rt == nil || rt.db == nil || rt.pm == nil || siteID <= 0 {
 		return
 	}
@@ -533,45 +558,29 @@ func (rt *shareUserRuntime) maybeAsyncFetchSiteAutoIcon(siteID int64, upstreamUI
 		defer rt.db.siteIconFetchInflight.Delete(siteID)
 		ctx, cancel := context.WithTimeout(context.Background(), siteIconFetchTimeout)
 		defer cancel()
-		_, _, _ = rt.fetchAndCacheSiteIcon(ctx, siteID, upstreamUID, upstreamToken, egressNodeID, false)
+		_, _, _ = rt.fetchAndCacheSiteIcon(ctx, siteID, "", "", egressNodeID, false)
 	}()
 }
 
-// fetchAndCacheSiteIcon fetches the site's own Emby avatar/touchicon through
-// the site's configured transport and edge_full policy (fail-closed if pinned
-// edge node is offline so Master IP is never exposed).
-func (rt *shareUserRuntime) fetchAndCacheSiteIcon(
+// fetchAndCacheSiteIcon fetches the site's public brand icon (saving it when
+// found). When allowAccountPreview is true (explicit admin action in the panel)
+// and no public brand asset exists, it probes the admin's configured site
+// account avatar and returns it for explicit preview-before-publish confirmation
+// without saving it automatically or reusing any share user's live session.
+func (rt *shareUserRuntime) fetchSiteIconWithOutcome(
 	ctx context.Context,
 	siteID int64,
-	upstreamUID string,
-	upstreamToken string,
 	egressNodeID int64,
-	allowLoginFallback bool,
-) ([]byte, string, error) {
+	allowAccountPreview bool,
+) (siteIconFetchOutcome, error) {
 	if rt == nil || rt.db == nil || rt.pm == nil || siteID <= 0 {
-		return nil, "", errors.New("site runtime unavailable")
+		return siteIconFetchOutcome{}, errors.New("site runtime unavailable")
 	}
 	rt.pm.mu.RLock()
 	inst := rt.pm.proxies[siteID]
 	rt.pm.mu.RUnlock()
 	if inst == nil || inst.fetchSiteIcon == nil {
-		return nil, "", errors.New("站点未运行，无法拉取图标")
-	}
-
-	// Reuse any existing live session credentials for this site if caller didn't supply them.
-	if upstreamUID == "" {
-		rt.mu.RLock()
-		for _, entry := range rt.sessions {
-			if entry.siteID == siteID && entry.upstreamUID != "" && entry.upstreamToken != "" {
-				upstreamUID = entry.upstreamUID
-				upstreamToken = entry.upstreamToken
-				if egressNodeID == 0 {
-					egressNodeID = entry.egressNodeID
-				}
-				break
-			}
-		}
-		rt.mu.RUnlock()
+		return siteIconFetchOutcome{}, errors.New("站点未运行，无法拉取图标")
 	}
 
 	// Respect edge_full strictly (fail-closed).
@@ -579,7 +588,7 @@ func (rt *shareUserRuntime) fetchAndCacheSiteIcon(
 	if inst.Site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
 		decision, _, edgeErr := resolveEdgeFullDecision(rt.pm, inst.Site, "", egressNodeID, egressNodeID == 0)
 		if edgeErr != nil {
-			return nil, "", errors.New("当前站点绑定的从机离线或不可用，为保护源站 IP 已拦截拉取")
+			return siteIconFetchOutcome{}, errors.New("当前站点绑定的从机离线或不可用，为保护源站 IP 已拦截拉取")
 		}
 		if decision.NodeID > 0 {
 			reqCtx = withEdgeEgressTarget(reqCtx, edgeEgressTarget{
@@ -591,36 +600,67 @@ func (rt *shareUserRuntime) fetchAndCacheSiteIcon(
 		}
 	}
 
-	// If no active session exists yet and admin explicitly requested a fetch,
-	// sign in briefly with the first configured site account to read its avatar,
-	// then cleanly log out that temporary token.
-	var tempLogoutToken string
-	if upstreamUID == "" && allowLoginFallback && inst.shareLogin != nil {
-		if cands, err := rt.upstreamCredentialCandidates(siteID, 0); err == nil && len(cands) > 0 {
-			tok, uid, status, loginErr := inst.shareLogin(reqCtx, cands[0].username, cands[0].password, "yundu-icon-probe", "Yundu", "Yundu")
-			if loginErr == nil && status == http.StatusOK && tok != "" && uid != "" {
-				upstreamUID = uid
-				upstreamToken = tok
-				tempLogoutToken = tok
-			}
+	// 1. Always try explicit public site-wide brand assets first (no credentials).
+	data, ct, publicErr := inst.fetchSiteIcon(reqCtx, "", "")
+	if publicErr == nil && len(data) > 0 {
+		if err := rt.db.saveSiteAutoIconWithSource(siteID, data, ct, siteIconAutoSourcePublic); err != nil {
+			return siteIconFetchOutcome{}, err
 		}
+		return siteIconFetchOutcome{
+			Data:            data,
+			ContentType:     ct,
+			Kind:            siteIconAutoSourcePublic,
+			RequiresConfirm: false,
+		}, nil
 	}
-	if tempLogoutToken != "" && inst.shareLogout != nil {
+
+	if !allowAccountPreview || inst.shareLogin == nil {
+		return siteIconFetchOutcome{}, publicErr
+	}
+
+	// 2. Explicit admin fallback: sign in briefly with the admin's configured
+	// site account (never a random share user's live session), fetch its avatar,
+	// log out the temporary token, and return for preview + confirmation.
+	cands, err := rt.upstreamCredentialCandidates(siteID, 0)
+	if err != nil || len(cands) == 0 {
+		return siteIconFetchOutcome{}, publicErr
+	}
+	tok, uid, status, loginErr := inst.shareLogin(reqCtx, cands[0].username, cands[0].password, "yundu-icon-probe", "Yundu", "Yundu")
+	if loginErr != nil || status != http.StatusOK || tok == "" || uid == "" {
+		return siteIconFetchOutcome{}, publicErr
+	}
+	if inst.shareLogout != nil {
 		defer func() {
 			lctx, lcancel := context.WithTimeout(reqCtx, shareLogoutTimeout)
 			defer lcancel()
-			_ = inst.shareLogout(lctx, tempLogoutToken)
+			_ = inst.shareLogout(lctx, tok)
 		}()
 	}
+	avatarData, avatarCT, avatarErr := inst.fetchSiteIcon(reqCtx, uid, tok)
+	if avatarErr != nil || len(avatarData) == 0 {
+		return siteIconFetchOutcome{}, avatarErr
+	}
+	return siteIconFetchOutcome{
+		Data:            avatarData,
+		ContentType:     avatarCT,
+		Kind:            "account_avatar",
+		RequiresConfirm: true,
+	}, nil
+}
 
-	data, ct, err := inst.fetchSiteIcon(reqCtx, upstreamUID, upstreamToken)
+func (rt *shareUserRuntime) fetchAndCacheSiteIcon(
+	ctx context.Context,
+	siteID int64,
+	_ string,
+	_ string,
+	egressNodeID int64,
+	allowLoginFallback bool,
+) ([]byte, string, error) {
+	outcome, err := rt.fetchSiteIconWithOutcome(ctx, siteID, egressNodeID, allowLoginFallback)
 	if err != nil {
 		return nil, "", err
 	}
-	if err := rt.db.saveSiteAutoIcon(siteID, data, ct); err != nil {
-		return nil, "", err
-	}
-	return data, ct, nil
+	return outcome.Data, outcome.ContentType, nil
 }
 
 // handleSiteIcon serves GET/PUT/DELETE /api/sites/{id}/icon and POST /api/sites/{id}/icon/fetch.
@@ -693,18 +733,24 @@ func (a *App) handleSiteIcon(w http.ResponseWriter, r *http.Request, siteID int6
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), siteIconFetchTimeout)
 		defer cancel()
-		data, ct, err := a.pm.shares.fetchAndCacheSiteIcon(ctx, siteID, "", "", 0, true)
+		outcome, err := a.pm.shares.fetchSiteIconWithOutcome(ctx, siteID, 0, true)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		icon := a.db.getEffectiveSiteIcon(siteID)
-		a.jsonOK(w, map[string]any{
-			"ok":           true,
-			"source":       icon.Source,
-			"fetched_type": ct,
-			"hash":         siteIconDataHash(data),
-		})
+		payload := map[string]any{
+			"ok":               true,
+			"source":           icon.Source,
+			"fetched_type":     outcome.ContentType,
+			"fetched_kind":     outcome.Kind,
+			"requires_confirm": outcome.RequiresConfirm,
+			"hash":             siteIconDataHash(outcome.Data),
+		}
+		if outcome.RequiresConfirm {
+			payload["preview_data_url"] = "data:" + outcome.ContentType + ";base64," + base64.StdEncoding.EncodeToString(outcome.Data)
+		}
+		a.jsonOK(w, payload)
 
 	default:
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")

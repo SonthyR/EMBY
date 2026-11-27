@@ -49,6 +49,8 @@ UPDATE_SNAPSHOT_DIR=""
 UPDATE_SNAPSHOT_RESTORED=0
 UPDATE_SERVICE_SNAPSHOT=""
 UPDATE_SERVICE_CHANGED=0
+UPDATE_LOCK_HELD=0
+UPDATE_LOCK_DIR_FALLBACK=""
 PASSWORD_TMP_DIR=""
 PASSWORD_SNAPSHOT_DIR=""
 PASSWORD_DB_PATH=""
@@ -421,12 +423,33 @@ ensure_cosign() {
     ok "cosign ${COSIGN_VERSION} 已准备就绪（仅用于本次校验）"
 }
 
+is_legacy_unsigned_release() {
+    local version="$1" item
+    local -a legacy_list=()
+    case "$version" in
+        v1.0.0) return 0 ;;
+    esac
+    if [ -n "${MERIDIAN_LEGACY_UNSIGNED_VERSIONS:-}" ]; then
+        read -r -a legacy_list <<< "$MERIDIAN_LEGACY_UNSIGNED_VERSIONS"
+        for item in "${legacy_list[@]}"; do
+            if [ "$item" = "$version" ]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
 verify_release_signature() {
     local version="$1" checksum_file="$2" bundle_file="$3" identity
     if ! download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.bundle" "$bundle_file" 2>/dev/null; then
-        warn "该 Release 没有 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
-        return 0
+        if is_legacy_unsigned_release "$version"; then
+            warn "历史版本 ${version} 未包含 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
+            return 0
+        fi
+        fail "无法下载 Release ${version} 的 Sigstore 签名清单 (SHA256SUMS.bundle)，已拒绝跳过签名校验"
     fi
+    [ -s "$bundle_file" ] || fail "Release ${version} 的 Sigstore 签名清单为空，已拒绝继续安装"
     ensure_cosign "${bundle_file%/*}"
     identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${version}"
     "$COSIGN_BIN" verify-blob --bundle "$bundle_file" \
@@ -1223,27 +1246,136 @@ restore_previous_binary() {
     as_root mv -f "${INSTALL_DIR}/${BIN_NAME}.rollback" "${INSTALL_DIR}/${BIN_NAME}"
 }
 
+resolve_update_lock_file() {
+    local lock_dir="" instance_raw instance_hash
+    if [ -n "${MERIDIAN_UPDATE_LOCK_DIR:-}" ]; then
+        lock_dir="$MERIDIAN_UPDATE_LOCK_DIR"
+        mkdir -p -- "$lock_dir" 2>/dev/null || as_root mkdir -p -- "$lock_dir"
+    elif [ -d /run/lock ] && [ -w /run/lock ]; then
+        lock_dir="/run/lock"
+    elif [ "${EUID}" -eq 0 ] && { [ -d /run/lock ] || mkdir -p /run/lock 2>/dev/null; }; then
+        lock_dir="/run/lock"
+    elif [ -d /run ] && [ -w /run ]; then
+        lock_dir="/run"
+    else
+        lock_dir="/tmp"
+    fi
+    instance_raw="${SERVICE_NAME}|${DATA_DIR}|${INSTALL_DIR}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        instance_hash=$(printf '%s' "$instance_raw" | sha256sum | awk '{print substr($1, 1, 16)}')
+    elif command -v shasum >/dev/null 2>&1; then
+        instance_hash=$(printf '%s' "$instance_raw" | shasum -a 256 | awk '{print substr($1, 1, 16)}')
+    else
+        instance_hash=$(printf '%s' "$instance_raw" | tr -c 'A-Za-z0-9._-' '_')
+    fi
+    printf '%s/meridian-update-%s.lock\n' "$lock_dir" "$instance_hash"
+}
+
+acquire_update_lock() {
+    local lock_file
+    lock_file=$(resolve_update_lock_file)
+    if command -v flock >/dev/null 2>&1; then
+        if ! exec 9>"$lock_file" 2>/dev/null; then
+            as_root touch "$lock_file" || fail "无法创建更新实例锁文件: $lock_file"
+            as_root chmod 0666 "$lock_file" 2>/dev/null || true
+            exec 9>"$lock_file" || fail "无法打开更新实例锁文件: $lock_file"
+        fi
+        if ! flock -n 9; then
+            exec 9>&- 2>/dev/null || true
+            fail "当前实例已有更新正在进行中（锁文件: ${lock_file}），请等待完成后再试"
+        fi
+        UPDATE_LOCK_HELD=1
+        return 0
+    fi
+    UPDATE_LOCK_DIR_FALLBACK="${lock_file}.d"
+    if ! mkdir "$UPDATE_LOCK_DIR_FALLBACK" 2>/dev/null; then
+        fail "当前实例已有更新正在进行中（锁目录: ${UPDATE_LOCK_DIR_FALLBACK}），请等待完成后再试"
+    fi
+    UPDATE_LOCK_HELD=1
+}
+
+release_update_lock() {
+    if [ "$UPDATE_LOCK_HELD" != "1" ]; then
+        return 0
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 9 2>/dev/null || true
+        exec 9>&- 2>/dev/null || true
+    elif [ -n "$UPDATE_LOCK_DIR_FALLBACK" ] && [ -d "$UPDATE_LOCK_DIR_FALLBACK" ]; then
+        rmdir -- "$UPDATE_LOCK_DIR_FALLBACK" 2>/dev/null || true
+    fi
+    UPDATE_LOCK_HELD=0
+    UPDATE_LOCK_DIR_FALLBACK=""
+}
+
+stop_service_and_wait() {
+    local timeout="${1:-30}" i=0 props active_state main_pid
+    if ! is_systemd; then
+        return 0
+    fi
+    if ! as_root systemctl stop "$SERVICE_NAME"; then
+        return 1
+    fi
+    while [ "$i" -lt "$timeout" ]; do
+        props=$(as_root systemctl show -p ActiveState -p MainPID "$SERVICE_NAME" 2>/dev/null || true)
+        if [ -z "$props" ]; then
+            # Minimal mock or non-reporting unit: systemctl stop succeeded cleanly.
+            return 0
+        fi
+        active_state=$(printf '%s\n' "$props" | awk -F= '$1=="ActiveState"{print $2; exit}')
+        main_pid=$(printf '%s\n' "$props" | awk -F= '$1=="MainPID"{print $2; exit}')
+        if { [ -z "$active_state" ] || [ "$active_state" = "inactive" ] || [ "$active_state" = "failed" ]; }; then
+            if [ -z "$main_pid" ] || [ "$main_pid" = "0" ] || ! kill -0 "$main_pid" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+rollback_update_transaction() {
+    local rollback_ok=0
+    if is_systemd; then
+        if ! stop_service_and_wait 30; then
+            warn "无法确认服务 ${SERVICE_NAME} 已停止；为防止破坏数据库，已中止自动还原数据目录，请手动停止服务后使用备份恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+            return 1
+        fi
+    fi
+    if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
+        if restore_previous_binary; then
+            UPDATE_BINARY_CHANGED=0
+        else
+            warn "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
+            rollback_ok=1
+        fi
+    fi
+    if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
+        && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
+        if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
+            warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+            rollback_ok=1
+        fi
+    fi
+    if ! restore_update_systemd_service; then
+        warn "systemd 服务文件恢复失败，请在重启前手动恢复: $SERVICE_FILE"
+        rollback_ok=1
+    fi
+    return "$rollback_ok"
+}
+
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
         warn "更新中断，正在自动回滚并恢复更新前的二进制和数据状态..."
-        if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
-            restore_previous_binary || true
-        fi
-        if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
-            && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
-            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
-            fi
-        fi
-        if ! restore_update_systemd_service; then
-            warn "systemd 服务文件恢复失败，请在重启前手动恢复: $SERVICE_FILE"
-        fi
-        if is_systemd; then
-            if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
-                as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-            else
-                as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if rollback_update_transaction; then
+            if is_systemd; then
+                if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
+                    as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+                else
+                    as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+                fi
             fi
         fi
         UPDATE_TRANSACTION=0
@@ -1256,6 +1388,7 @@ cleanup_update_transaction() {
             warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $UPDATE_TMP_DIR"
         fi
     fi
+    release_update_lock
     return "$exit_code"
 }
 
@@ -2589,14 +2722,16 @@ do_update() {
         fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
     fi
 
+    acquire_update_lock
+    trap cleanup_update_transaction EXIT
+    trap abort_update_transaction INT TERM
+
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
     UPDATE_TMP_DIR="$tmp_dir"
     download_release_binary "$latest_version" "$tmp_dir"
 
     UPDATE_TRANSACTION=1
-    trap cleanup_update_transaction EXIT
-    trap abort_update_transaction INT TERM
 
     if is_systemd; then
         if service_is_active; then
@@ -2604,7 +2739,7 @@ do_update() {
         else
             should_stop_after=1
         fi
-        as_root systemctl stop "$SERVICE_NAME"
+        stop_service_and_wait 30 || fail "无法确认旧版本服务已停止，已中止更新"
     else
         ensure_no_manual_process
     fi
@@ -2635,27 +2770,24 @@ do_update() {
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
-            restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
-            UPDATE_BINARY_CHANGED=0
-            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
+            if ! rollback_update_transaction; then
+                fail "自动回滚未完全成功，请检查日志或使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             fi
-            restore_update_systemd_service || fail "systemd 服务文件回滚失败，请手动恢复 ${UPDATE_SERVICE_SNAPSHOT:-原服务文件快照}"
-            as_root systemctl restart "$SERVICE_NAME"
-            wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
+            if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
+                as_root systemctl restart "$SERVICE_NAME"
+                wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
+            fi
+            UPDATE_TRANSACTION=0
             fail "新版本启动失败，已恢复上一版本及原数据配置"
         fi
         if [ "$should_stop_after" = "1" ]; then
-            as_root systemctl stop "$SERVICE_NAME"
+            stop_service_and_wait 30 || warn "更新完成但未能停止服务 ${SERVICE_NAME}"
         fi
     else
         if ! "$current_binary" --version >/dev/null 2>&1; then
             warn "新版本二进制无法执行，正在自动回滚..."
-            restore_previous_binary || true
-            UPDATE_BINARY_CHANGED=0
-            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
-            fi
+            rollback_update_transaction || true
+            UPDATE_TRANSACTION=0
             fail "新版本无法执行，已恢复上一版本及原数据配置"
         fi
         warn "未检测到 systemd：已跳过自动健康检查，请手动加载 ${DATA_DIR}/.env 后启动"
@@ -2671,6 +2803,7 @@ do_update() {
     if ! as_root rm -rf -- "$tmp_dir"; then
         warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $tmp_dir"
     fi
+    release_update_lock
     trap - EXIT INT TERM
     setup_panel_updater || warn "版本已更新，但更新服务安装失败，可稍后重新运行 update -y"
     ok "已更新到最新版本: $latest_version"

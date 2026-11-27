@@ -401,7 +401,8 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 
 	rt.mu.RLock()
 	entry, ok := rt.sessions[tokenHash]
-	if !ok {
+	_, isRevoked := rt.revoked[tokenHash]
+	if !ok || isRevoked {
 		rt.mu.RUnlock()
 		return http.StatusUnauthorized, "登录已失效，请重新登录"
 	}
@@ -410,13 +411,27 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 		return 0, ""
 	}
 	state := rt.users[entry.userID]
+	blockReason := state.blockReasonLocked(time.Now())
 	var preferredAccount int64
-	var assigned bool
+	var targetAssigned bool
+	var oldAssigned bool
 	if state != nil {
-		preferredAccount, assigned = state.sites[targetSiteID]
+		preferredAccount, targetAssigned = state.sites[targetSiteID]
+		_, oldAssigned = state.sites[entry.siteID]
 	}
+	oldSiteID := entry.siteID
+	oldUpstreamToken := entry.upstreamToken
+	oldEgressNodeID := entry.egressNodeID
 	rt.mu.RUnlock()
-	if !assigned {
+
+	if blockReason != "" {
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, shareBlockMessage(blockReason)
+	}
+	if !targetAssigned {
+		if oldAssigned {
+			return http.StatusServiceUnavailable, "目标服务器授权已变更，已保留当前服务器会话"
+		}
 		_ = rt.revokeByHash(tokenHash)
 		return http.StatusUnauthorized, "分享账号无权访问目标服务器，请重新登录"
 	}
@@ -425,14 +440,13 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 	targetInst := rt.pm.proxies[targetSiteID]
 	rt.pm.mu.RUnlock()
 	if targetInst == nil || targetInst.shareLogin == nil {
-		return http.StatusServiceUnavailable, "目标服务器暂不可用"
+		return http.StatusServiceUnavailable, "目标服务器暂不可用，已保留当前会话"
 	}
 
 	candidates, err := rt.upstreamCredentialCandidates(targetSiteID, preferredAccount)
 	if err != nil || len(candidates) == 0 {
 		log.Printf("[%s] seamless site switch for user #%d: no upstream credentials: %v", targetInst.Site.Name, entry.userID, err)
-		_ = rt.revokeByHash(tokenHash)
-		return http.StatusUnauthorized, "目标服务器未配置可用的源站账号，请重新登录"
+		return http.StatusServiceUnavailable, "目标服务器暂未配置可用源站账号，已保留当前会话，请稍后重试"
 	}
 
 	var targetEgressNodeID int64
@@ -478,20 +492,56 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 	}
 	if newToken == "" {
 		log.Printf("[%s] seamless site switch login failed (status=%d): %v", targetInst.Site.Name, lastStatus, lastErr)
-		_ = rt.revokeByHash(tokenHash)
-		return http.StatusUnauthorized, "切换到新服务器失败，请重新登录"
+		return http.StatusServiceUnavailable, "切换到新服务器失败，已保留当前会话，请稍后重试"
+	}
+
+	cleanupNewToken := func() {
+		if newToken != "" && targetSiteID > 0 {
+			rt.logoutUpstream(targetSiteID, newToken, targetEgressNodeID)
+		}
 	}
 
 	upCipher, encErr := encryptSiteAccountSecret(newToken)
 	if encErr != nil {
 		log.Printf("[%s] seamless site switch encrypt token: %v", targetInst.Site.Name, encErr)
-		_ = rt.revokeByHash(tokenHash)
-		return http.StatusUnauthorized, "切换到新服务器失败，请重新登录"
+		cleanupNewToken()
+		return http.StatusServiceUnavailable, "切换到新服务器失败，已保留当前会话，请稍后重试"
 	}
 
-	oldSiteID := entry.siteID
-	oldUpstreamToken := entry.upstreamToken
-	oldEgressNodeID := entry.egressNodeID
+	// Re-verify the old session was not revoked or changed while upstream login was in flight.
+	rt.mu.RLock()
+	liveCur, liveExists := rt.sessions[tokenHash]
+	_, liveRevoked := rt.revoked[tokenHash]
+	liveState := rt.users[entry.userID]
+	liveBlock := liveState.blockReasonLocked(time.Now())
+	_, liveTargetAssigned := liveState.sites[targetSiteID]
+	_, liveOldAssigned := liveState.sites[oldSiteID]
+	rt.mu.RUnlock()
+
+	if !liveExists || liveRevoked || liveBlock != "" {
+		cleanupNewToken()
+		if liveBlock != "" {
+			_ = rt.revokeByHash(tokenHash)
+			return http.StatusUnauthorized, shareBlockMessage(liveBlock)
+		}
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
+	}
+	if liveCur.siteID == targetSiteID {
+		cleanupNewToken()
+		return 0, ""
+	}
+	if liveCur.siteID != oldSiteID || liveCur.upstreamToken != oldUpstreamToken {
+		cleanupNewToken()
+		return http.StatusServiceUnavailable, "会话状态已变更，请重试"
+	}
+	if !liveTargetAssigned {
+		cleanupNewToken()
+		if liveOldAssigned {
+			return http.StatusServiceUnavailable, "目标服务器授权已变更，已保留当前服务器会话"
+		}
+		_ = rt.revokeByHash(tokenHash)
+		return http.StatusUnauthorized, "分享账号无权访问目标服务器，请重新登录"
+	}
 
 	clientUID := entry.clientUID
 	if clientUID == "" {
@@ -506,16 +556,26 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 		ispGroup = rt.pm.edges.lookupISPGroup(effectiveIP)
 	}
 
-	if _, dbErr := rt.db.db.Exec(
-		`UPDATE share_user_sessions SET site_id=?, site_account_id=?, egress_node_id=?, upstream_token_ciphertext=?, upstream_user_id=?, client_user_id=CASE WHEN client_user_id='' THEN ? ELSE client_user_id END, client_ip=?, last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=?`,
-		targetSiteID, chosenAccountID, targetEgressNodeID, upCipher, newUID, clientUID, effectiveIP, tokenHash,
-	); dbErr != nil {
+	res, dbErr := rt.db.db.Exec(
+		`UPDATE share_user_sessions SET site_id=?, site_account_id=?, egress_node_id=?, upstream_token_ciphertext=?, upstream_user_id=?, client_user_id=CASE WHEN client_user_id='' THEN ? ELSE client_user_id END, client_ip=?, last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=? AND site_id=?`,
+		targetSiteID, chosenAccountID, targetEgressNodeID, upCipher, newUID, clientUID, effectiveIP, tokenHash, oldSiteID,
+	)
+	if dbErr != nil {
 		log.Printf("[%s] seamless site switch persist session: %v", targetInst.Site.Name, dbErr)
+		cleanupNewToken()
+		return http.StatusServiceUnavailable, "保存新服务器会话失败，已保留当前会话，请稍后重试"
+	}
+	if affected, affErr := res.RowsAffected(); affErr == nil && affected == 0 {
+		cleanupNewToken()
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
 	}
 
 	now := time.Now()
 	rt.mu.Lock()
-	if cur, exists := rt.sessions[tokenHash]; exists {
+	cur, exists := rt.sessions[tokenHash]
+	_, revokedNow := rt.revoked[tokenHash]
+	commitOK := exists && !revokedNow && cur.siteID == oldSiteID && cur.upstreamToken == oldUpstreamToken
+	if commitOK {
 		cur.siteID = targetSiteID
 		cur.siteAccountID = chosenAccountID
 		cur.egressNodeID = targetEgressNodeID
@@ -531,19 +591,26 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 		cur.lastHandoffAt = now
 		cur.lastSiteSwitchAt = now
 		rt.sessions[tokenHash] = cur
+		if act := rt.activity[tokenHash]; act != nil {
+			act.draining = false
+			act.drainingSince = time.Time{}
+			act.playing = false
+			act.lastPlaybackAt = time.Time{}
+			act.hasNode = false
+			act.lastNodeID = 0
+			act.lastNodeName = ""
+		}
+		delete(rt.dirtyClientIP, tokenHash)
+		rt.lastSeen[tokenHash] = now
 	}
-	if act := rt.activity[tokenHash]; act != nil {
-		act.draining = false
-		act.drainingSince = time.Time{}
-		act.playing = false
-		act.lastPlaybackAt = time.Time{}
-		act.hasNode = false
-		act.lastNodeID = 0
-		act.lastNodeName = ""
-	}
-	delete(rt.dirtyClientIP, tokenHash)
-	rt.lastSeen[tokenHash] = now
 	rt.mu.Unlock()
+
+	if !commitOK {
+		// Session was kicked or altered between DB write and memory publish.
+		_, _ = rt.db.db.Exec(`DELETE FROM share_user_sessions WHERE token_hash=? AND site_id=? AND upstream_token_ciphertext=?`, tokenHash, targetSiteID, upCipher)
+		cleanupNewToken()
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
+	}
 
 	if oldUpstreamToken != "" && oldSiteID > 0 {
 		rt.logoutUpstream(oldSiteID, oldUpstreamToken, oldEgressNodeID)

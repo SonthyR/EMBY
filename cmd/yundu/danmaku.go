@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,11 +37,12 @@ CREATE TABLE IF NOT EXISTS share_user_danmaku_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_share_user_danmaku_source ON share_user_danmaku_sources(danmaku_source_id);
 `
-	danmakuProxyTimeout     = 20 * time.Second
-	danmakuTestTimeout      = 10 * time.Second
-	danmakuMaxReqBodyBytes  = 2 << 20
-	danmakuMaxRespBodyBytes = 32 << 20
+	danmakuProxyTimeout    = 20 * time.Second
+	danmakuTestTimeout     = 10 * time.Second
+	danmakuMaxReqBodyBytes = 2 << 20
 )
+
+var danmakuMaxRespBodyBytes int64 = 32 << 20
 
 type DanmakuSource struct {
 	ID                int64  `json:"id"`
@@ -632,8 +634,38 @@ func buildDanmakuUpstreamURL(baseRaw, restPath, rawQuery string) (string, error)
 	return u.String(), nil
 }
 
+func setDanmakuSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+}
+
+func isAllowedDanmakuMediaType(rawContentType string) (string, bool) {
+	rawContentType = strings.TrimSpace(rawContentType)
+	if rawContentType == "" {
+		return "", false
+	}
+	mediaType, _, err := mime.ParseMediaType(rawContentType)
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.Split(rawContentType, ";")[0]))
+	} else {
+		mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	}
+	switch mediaType {
+	case "application/json", "application/xml", "text/xml", "text/plain":
+		return rawContentType, true
+	}
+	if strings.HasPrefix(mediaType, "application/") && (strings.HasSuffix(mediaType, "+json") || strings.HasSuffix(mediaType, "+xml")) {
+		return rawContentType, true
+	}
+	return "", false
+}
+
 // Public danmaku proxy: /dm/{source_id}/{danmaku_token}[/{rest...}]
 func (a *App) handleDanmakuProxy(w http.ResponseWriter, r *http.Request) {
+	setDanmakuSecurityHeaders(w)
 	setDanmakuCORSHeaders(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -748,22 +780,76 @@ func (a *App) handleDanmakuProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	dstHeaders := w.Header()
-	for k, vals := range resp.Header {
-		if isDanmakuHopByHopHeader(k) {
-			continue
+	maxBytes := danmakuMaxRespBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = 32 << 20
+	}
+	noBodyStatus := resp.StatusCode == http.StatusNotModified || resp.StatusCode == http.StatusNoContent || (resp.StatusCode >= 100 && resp.StatusCode < 200)
+	if resp.ContentLength > maxBytes {
+		a.jsonErr(w, http.StatusBadGateway, "弹幕上游响应超出大小限制")
+		return
+	}
+
+	rawCT := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	allowedCT, ctOK := isAllowedDanmakuMediaType(rawCT)
+	if rawCT != "" && !ctOK {
+		a.jsonErr(w, http.StatusBadGateway, "弹幕上游返回了不支持的内容类型")
+		return
+	}
+
+	var bodyBytes []byte
+	if r.Method != http.MethodHead && !noBodyStatus {
+		limited, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		if readErr != nil {
+			a.jsonErr(w, http.StatusBadGateway, "读取弹幕上游响应失败")
+			return
 		}
-		lk := strings.ToLower(k)
-		if lk == "set-cookie" || strings.HasPrefix(lk, "access-control-") {
-			continue
+		if int64(len(limited)) > maxBytes {
+			a.jsonErr(w, http.StatusBadGateway, "弹幕上游响应超出大小限制")
+			return
 		}
-		for _, v := range vals {
-			dstHeaders.Add(k, v)
+		bodyBytes = limited
+		if rawCT == "" && len(bodyBytes) > 0 {
+			if strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
+				a.jsonErr(w, http.StatusBadGateway, "弹幕上游缺少响应类型")
+				return
+			}
+			sniffed := strings.ToLower(strings.TrimSpace(http.DetectContentType(bodyBytes)))
+			if strings.HasPrefix(sniffed, "text/plain") {
+				allowedCT = "text/plain; charset=utf-8"
+			} else {
+				a.jsonErr(w, http.StatusBadGateway, "弹幕上游返回了不支持的内容类型")
+				return
+			}
 		}
 	}
+
+	dstHeaders := w.Header()
+	// Copy only explicit allowlisted headers matching the exact payload sent to the client.
+	if allowedCT != "" {
+		dstHeaders.Set("Content-Type", allowedCT)
+	}
+	if ce := strings.TrimSpace(resp.Header.Get("Content-Encoding")); ce != "" && !resp.Uncompressed {
+		dstHeaders.Set("Content-Encoding", ce)
+	}
+	for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Vary"} {
+		if vals := resp.Header.Values(name); len(vals) > 0 {
+			for _, v := range vals {
+				dstHeaders.Add(name, v)
+			}
+		}
+	}
+	if r.Method == http.MethodHead {
+		if resp.ContentLength >= 0 {
+			dstHeaders.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+		}
+	} else if !noBodyStatus {
+		dstHeaders.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+	}
+	setDanmakuSecurityHeaders(w)
 	setDanmakuCORSHeaders(w)
 	w.WriteHeader(resp.StatusCode)
-	if r.Method != http.MethodHead {
-		_, _ = io.Copy(w, io.LimitReader(resp.Body, danmakuMaxRespBodyBytes)) // #nosec G705 -- transparent API proxy response stream.
+	if r.Method != http.MethodHead && !noBodyStatus && len(bodyBytes) > 0 {
+		_, _ = w.Write(bodyBytes) // #nosec G705 -- validated non-active danmaku payload served with CSP sandbox and nosniff.
 	}
 }

@@ -290,9 +290,25 @@ func (d *DB) migrateOnce() error {
 		custom_content_type TEXT NOT NULL DEFAULT '',
 		auto_data BLOB,
 		auto_content_type TEXT NOT NULL DEFAULT '',
+		auto_source TEXT NOT NULL DEFAULT '',
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`); err != nil {
+		return err
+	}
+	var autoSourceCol int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('site_icons') WHERE name='auto_source'").Scan(&autoSourceCol); err != nil {
+		return err
+	}
+	if autoSourceCol == 0 {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE site_icons ADD COLUMN auto_source TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	// Invalidate legacy v1.7.x auto-cached icons with unknown provenance (which
+	// could have been captured from a user's personal Emby avatar), while keeping
+	// administrator-uploaded custom icons untouched.
+	if _, err := conn.ExecContext(ctx, `UPDATE site_icons SET auto_data=NULL, auto_content_type='', auto_source='' WHERE auto_source='' AND auto_data IS NOT NULL`); err != nil {
 		return err
 	}
 	var reminderColumn int

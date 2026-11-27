@@ -239,6 +239,10 @@ func sanitizeEdgeFilename(rawPath string) string {
 }
 
 func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *ProxyManager, site Site, decision edgeRouteDecision, targetURL *url.URL, headers map[string]string, clientIP string, shareUser *shareUserState, shareTokenHash string) bool {
+	return writeEdgePlaybackRedirectWithGuard(w, r, pm, site, decision, targetURL, headers, clientIP, shareUser, shareTokenHash, true, nil)
+}
+
+func writeEdgePlaybackRedirectWithGuard(w http.ResponseWriter, r *http.Request, pm *ProxyManager, site Site, decision edgeRouteDecision, targetURL *url.URL, headers map[string]string, clientIP string, shareUser *shareUserState, shareTokenHash string, followRedir bool, dynamicGuard *edgeDynamicGuardPolicy) bool {
 	if decision.NodeID <= 0 || decision.PublicURL == "" || decision.Token == "" || targetURL == nil {
 		return false
 	}
@@ -259,16 +263,17 @@ func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *Proxy
 		boundClientIP = normalizeEdgeBindIP(clientIP)
 	}
 	ticket := edgePlaybackTicket{
-		NodeID:      decision.NodeID,
-		SiteID:      site.ID,
-		ShareUserID: shareUserID,
-		TokenHash:   shareTokenHash,
-		ClientIP:    boundClientIP,
-		TargetURL:   targetURL.String(),
-		Headers:     headers,
-		SpeedMbps:   speedMbps,
-		FollowRedir: true,
-		ExpiresAt:   time.Now().Add(edgeTicketTTL).Unix(),
+		NodeID:       decision.NodeID,
+		SiteID:       site.ID,
+		ShareUserID:  shareUserID,
+		TokenHash:    shareTokenHash,
+		ClientIP:     boundClientIP,
+		TargetURL:    targetURL.String(),
+		Headers:      headers,
+		SpeedMbps:    speedMbps,
+		FollowRedir:  followRedir,
+		DynamicGuard: dynamicGuard,
+		ExpiresAt:    time.Now().Add(edgeTicketTTL).Unix(),
 	}
 	sealed, err := sealEdgePlaybackTicket(decision.Token, ticket)
 	if err != nil {
@@ -347,6 +352,32 @@ func tryRedirectToEdgeNode(
 	return writeEdgePlaybackRedirect(w, r, pm, site, decision, &upstreamURL, compact, clientIP, shareUser, shareTokenHash)
 }
 
+func buildEdgeDynamicGuardPolicy(claims dynamicCapabilityClaims, policy dynamicRedirectPolicy, selfTargets *dynamicSelfTargetPolicy) *edgeDynamicGuardPolicy {
+	if claims.Trusted {
+		return nil
+	}
+	var deniedHosts []string
+	if selfTargets != nil && len(selfTargets.deniedHosts) > 0 {
+		deniedHosts = make([]string, 0, len(selfTargets.deniedHosts))
+		for h := range selfTargets.deniedHosts {
+			deniedHosts = append(deniedHosts, h)
+		}
+	}
+	var rulesCopy []DynamicDomainRule
+	if len(policy.domainRules) > 0 {
+		rulesCopy = append([]DynamicDomainRule(nil), policy.domainRules...)
+	}
+	return &edgeDynamicGuardPolicy{
+		Profile:             policy.profile,
+		AllowHTTPSDowngrade: policy.allowHTTPSDowngrade,
+		DomainRules:         rulesCopy,
+		PreviousScheme:      claims.PreviousScheme,
+		AllowRedirects:      policy.sourceEnabled(dynamicDiscoverySourceRedirect),
+		MaxRedirects:        policy.limits.MaxRedirects,
+		DeniedHosts:         deniedHosts,
+	}
+}
+
 func tryRedirectDynamicResourceToEdgeNode(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -354,19 +385,24 @@ func tryRedirectDynamicResourceToEdgeNode(
 	site Site,
 	target *url.URL,
 	outboundHeaders http.Header,
-	requiredHeaders []dynamicCapabilityHeaderClaim,
-) bool {
+	claims dynamicCapabilityClaims,
+	policy dynamicRedirectPolicy,
+	selfTargets *dynamicSelfTargetPolicy,
+) (handled bool, deniedReason string) {
 	if pm == nil || pm.edges == nil || site.MainVideoStreamMode == mainVideoStreamModeDirect || site.EdgeRoutingMode == edgeRoutingModeMaster {
-		return false
+		return false, ""
 	}
 	if r == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
-		return false
+		return false, ""
 	}
 	edgeCtx := edgeRequestContextFrom(r.Context())
 	var decision edgeRouteDecision
 	if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
 		if !edgeCtx.edgeFullResolved {
-			return false
+			if !claims.Trusted && site.EdgePinnedNodeID > 0 {
+				return false, dynamicObservationReasonRuntimeUnavailable
+			}
+			return false, ""
 		}
 		decision = edgeCtx.edgeFullDecision
 	} else {
@@ -376,12 +412,32 @@ func tryRedirectDynamicResourceToEdgeNode(
 		if decision.NodeID == 0 && pm != nil && pm.shares != nil && edgeCtx.shareTokenHash != "" {
 			pm.shares.markMasterPlayback(edgeCtx.shareTokenHash, decision.NodeName)
 		}
-		return false
+		return false, ""
 	}
-	extraKeys := make([]string, 0, len(requiredHeaders))
-	for _, h := range requiredHeaders {
+	var guard *edgeDynamicGuardPolicy
+	followRedir := true
+	if !claims.Trusted {
+		if !pm.edges.nodeSupportsDynamicGuard(decision.NodeID) {
+			if site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+				// Bound edge_full session must keep its egress constraint and fail closed
+				// rather than falling back to Master direct dial.
+				return false, dynamicObservationReasonRuntimeUnavailable
+			}
+			return false, ""
+		}
+		guard = buildEdgeDynamicGuardPolicy(claims, policy, selfTargets)
+		followRedir = guard.AllowRedirects
+	}
+	extraKeys := make([]string, 0, len(claims.RequiredHeaders))
+	for _, h := range claims.RequiredHeaders {
 		extraKeys = append(extraKeys, h.Name)
 	}
 	compact := compactEdgeHeaders(outboundHeaders, extraKeys)
-	return writeEdgePlaybackRedirect(w, r, pm, site, decision, target, compact, edgeCtx.clientIP, edgeCtx.shareUser, edgeCtx.shareTokenHash)
+	if writeEdgePlaybackRedirectWithGuard(w, r, pm, site, decision, target, compact, edgeCtx.clientIP, edgeCtx.shareUser, edgeCtx.shareTokenHash, followRedir, guard) {
+		return true, ""
+	}
+	if !claims.Trusted && site.EdgeRoutingMode == edgeRoutingModeEdgeFull {
+		return false, dynamicObservationReasonRuntimeUnavailable
+	}
+	return false, ""
 }
