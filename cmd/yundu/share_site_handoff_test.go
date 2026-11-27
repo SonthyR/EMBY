@@ -630,3 +630,145 @@ func TestSeamlessSiteSwitchPassthroughForwardsClientUserAgent(t *testing.T) {
 	}
 	t.Fatal("expected Site B upstream logout request to pass WAF with non-Go User-Agent")
 }
+
+func TestSeamlessSiteSwitchSanitizesStaleParentAndItem500s(t *testing.T) {
+	app := newTestApp(t)
+	embyA := newFakeSeamlessEmby(t, "alpha", "uid-alpha-ulid", "srv-alpha", "tok-alpha", false)
+	var viewsShould500 atomic.Bool
+	embyB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.ToLower(strings.TrimRight(r.URL.Path, "/"))
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/users/authenticatebyname"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"AccessToken": "tok-beta-num",
+				"ServerId":    "srv-beta-num",
+				"User":        map[string]any{"Id": "uid-beta-num", "Name": "real-beta"},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/sessions/logout"):
+			// Simulate custom Emby backends (like UHD/RFC-UHD) that return 404 for /Sessions/Logout.
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(p, "/views"):
+			if viewsShould500.Load() {
+				http.Error(w, "genuine server failure", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"42","Name":"Movies"}],"TotalRecordCount":1}`))
+		case strings.Contains(p, "/items/latest"):
+			pid := r.URL.Query().Get("ParentId")
+			if pid != "" && pid != "42" {
+				http.Error(w, "FormatException: invalid numeric ParentId", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"Id":"100","Name":"Movie 1"}]`))
+		case strings.HasSuffix(p, "/items"):
+			pid := r.URL.Query().Get("ParentId")
+			if pid != "" && pid != "42" {
+				http.Error(w, "FormatException: invalid numeric ParentId", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"100","Name":"Movie 1"}],"TotalRecordCount":1}`))
+		case strings.Contains(p, "/playbackinfo") || strings.Contains(p, "/items/m01"):
+			http.Error(w, "FormatException: invalid numeric ItemId", http.StatusInternalServerError)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	t.Cleanup(embyB.Close)
+
+	siteA := startTaggedShareSite(t, app, "AlphaULID", "alpha", embyA.server.URL)
+	siteB := startTaggedShareSite(t, app, "BetaNumeric", "beta", embyB.URL)
+
+	input, err := app.normalizeShareUserInput(ShareUserInput{
+		Username:    "capy",
+		Password:    "pass1234",
+		RoutePrefix: "capy",
+		Sites:       []ShareUserSiteInput{{SiteID: siteA.ID}, {SiteID: siteB.ID}},
+	}, 0, true)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	userID, err := app.saveShareUser(0, input)
+	if err != nil {
+		t.Fatalf("saveShareUser: %v", err)
+	}
+	app.reloadShareUsers()
+	panel := newPersonalSharePanelServer(t, app)
+
+	// 1. Login on Site A (ULID backend).
+	resp, _ := doShareLogin(t, panel.URL+"/capy", "capy", "pass1234")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial login = %d", resp.StatusCode)
+	}
+
+	// 2. Switch primary site to Site B (numeric Emby backend).
+	if _, err := app.db.db.Exec(`UPDATE share_user_sites SET sort_order=1 WHERE share_user_id=? AND site_id=?`, userID, siteB.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.db.Exec(`UPDATE share_user_sites SET sort_order=2 WHERE share_user_id=? AND site_id=?`, userID, siteA.ID); err != nil {
+		t.Fatal(err)
+	}
+	app.reloadShareUsers()
+	app.pm.shares.reconcileSiteSwitch(userID, false)
+
+	doReq := func(method, reqPath string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, panel.URL+reqPath, nil)
+		req.Header.Set("User-Agent", "CapyPlayer/1.1.8")
+		req.Header.Set("X-Emby-Token", "tok-alpha")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, reqPath, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		return res.StatusCode, string(raw)
+	}
+
+	// 3. Stale ULID ParentId on /Items returns 200 empty Items object instead of 500 (no circuit-breaker trip).
+	code, body := doReq(http.MethodGet, "/capy/emby/Users/uid-alpha-ulid/Items?ParentId=c01KKC1SXSKBDHBWEC9G5M677ZA")
+	if code != http.StatusOK || !strings.Contains(body, `"Items":[]`) || !strings.Contains(body, `"TotalRecordCount":0`) {
+		t.Fatalf("stale ParentId /Items = %d %s, want 200 empty Items", code, body)
+	}
+
+	// 4. Stale ULID ParentId on /Items/Latest returns 200 empty JSON array [].
+	code, body = doReq(http.MethodGet, "/capy/emby/Users/uid-alpha-ulid/Items/Latest?ParentId=c01KKC1SXSKBDHBWEC9G5M677ZA")
+	if code != http.StatusOK || strings.TrimSpace(body) != "[]" {
+		t.Fatalf("stale ParentId /Items/Latest = %d %s, want 200 []", code, body)
+	}
+
+	// 5. Stale ULID ItemId on /PlaybackInfo and /Users/{uid}/Items/{itemId} downgrades 500 -> 404.
+	code, _ = doReq(http.MethodPost, "/capy/emby/Items/m01M29HFGQ34HTESNQT2K8NQC1T/PlaybackInfo")
+	if code != http.StatusNotFound {
+		t.Fatalf("stale ItemId /PlaybackInfo = %d, want 404", code)
+	}
+	code, _ = doReq(http.MethodGet, "/capy/emby/Users/uid-alpha-ulid/Items/m01M29HFGQ34HTESNQT2K8NQC1T")
+	if code != http.StatusNotFound {
+		t.Fatalf("stale ItemId detail = %d, want 404", code)
+	}
+
+	// 6. Valid numeric ParentId still returns real items from Site B.
+	code, body = doReq(http.MethodGet, "/capy/emby/Users/uid-alpha-ulid/Items?ParentId=42")
+	if code != http.StatusOK || !strings.Contains(body, `"Movie 1"`) {
+		t.Fatalf("valid numeric ParentId /Items = %d %s, want 200 Movie 1", code, body)
+	}
+
+	// 7. Genuine 500 on non-ID endpoints (/Views) must NOT be masked.
+	viewsShould500.Store(true)
+	code, _ = doReq(http.MethodGet, "/capy/emby/Users/uid-alpha-ulid/Views")
+	if code != http.StatusInternalServerError {
+		t.Fatalf("genuine /Views 500 = %d, want 500", code)
+	}
+
+	// 8. Upstream /Sessions/Logout returning 404 should be ignored without error.
+	app.pm.mu.RLock()
+	logoutFn := app.pm.proxies[siteB.ID].shareLogout
+	app.pm.mu.RUnlock()
+	if err := logoutFn(t.Context(), "tok-beta-num"); err != nil {
+		t.Fatalf("logout returning 404 should be silent, got: %v", err)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -528,6 +529,7 @@ func (rt *shareUserRuntime) handoffPersonalRouteSite(
 		}
 		cur.ispGroup = ispGroup
 		cur.lastHandoffAt = now
+		cur.lastSiteSwitchAt = now
 		rt.sessions[tokenHash] = cur
 	}
 	if act := rt.activity[tokenHash]; act != nil {
@@ -618,4 +620,210 @@ func (rt *shareUserRuntime) checkConcurrentStreamLimit(userID int64, tokenHash s
 
 func shareConcurrentStreamLimitMessage(limit int) string {
 	return fmt.Sprintf("同时播放路数已达上限（最多 %d 路），请先停止其他设备的播放后再试", limit)
+}
+
+const shareSiteSwitchGraceWindow = 10 * time.Minute
+
+func (rt *shareUserRuntime) isRecentSiteSwitchSession(tokenHash string, now time.Time) bool {
+	if rt == nil || tokenHash == "" {
+		return false
+	}
+	rt.mu.RLock()
+	entry, ok := rt.sessions[tokenHash]
+	rt.mu.RUnlock()
+	if !ok || entry.lastSiteSwitchAt.IsZero() {
+		return false
+	}
+	return now.Sub(entry.lastSiteSwitchAt) <= shareSiteSwitchGraceWindow
+}
+
+func normalizeEmbyRelativePath(pathValue string) string {
+	p := strings.ToLower(strings.TrimRight(pathValue, "/"))
+	p = strings.TrimPrefix(p, "/emby")
+	p = strings.TrimPrefix(p, "/jellyfin")
+	return p
+}
+
+func hasStaleEmbyIDQueryParam(rawQuery string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+	for key, values := range q {
+		switch strings.ToLower(key) {
+		case "parentid", "ancestorids", "ids", "seriesid", "seasonid",
+			"albumids", "artistids", "personids", "studioids", "genreids", "excludeitemids":
+			for _, v := range values {
+				if strings.TrimSpace(v) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+type staleEmbyFallbackKind uint8
+
+const (
+	staleEmbyFallbackNone staleEmbyFallbackKind = iota
+	staleEmbyFallbackItemsObject
+	staleEmbyFallbackJSONArray
+	staleEmbyFallbackNotFound
+)
+
+func classifyPostSiteSwitchStaleIDFallback(method, relPath, rawQuery string) staleEmbyFallbackKind {
+	p := normalizeEmbyRelativePath(relPath)
+	if p == "" {
+		return staleEmbyFallbackNone
+	}
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	isRead := method == http.MethodGet || method == http.MethodHead
+
+	// /users/{uid}/...
+	if len(segs) >= 3 && segs[0] == "users" && segs[1] != "" {
+		rest := segs[2:]
+		if isRead && len(rest) == 1 && rest[0] == "items" && hasStaleEmbyIDQueryParam(rawQuery) {
+			return staleEmbyFallbackItemsObject
+		}
+		if isRead && len(rest) == 2 && rest[0] == "items" {
+			switch rest[1] {
+			case "latest":
+				if hasStaleEmbyIDQueryParam(rawQuery) {
+					return staleEmbyFallbackJSONArray
+				}
+			case "resume":
+				if hasStaleEmbyIDQueryParam(rawQuery) {
+					return staleEmbyFallbackItemsObject
+				}
+			case "counts", "filters", "filters2", "suggestions":
+				return staleEmbyFallbackNone
+			default:
+				// /users/{uid}/items/{itemId}
+				return staleEmbyFallbackNotFound
+			}
+		}
+		if isRead && len(rest) == 3 && rest[0] == "items" && rest[1] != "" {
+			switch rest[2] {
+			case "localtrailers", "specialfeatures":
+				return staleEmbyFallbackJSONArray
+			case "intros", "additionalparts", "similar":
+				return staleEmbyFallbackItemsObject
+			}
+		}
+	}
+
+	// /items, /items/{itemId}, /items/{itemId}/...
+	if segs[0] == "items" {
+		if isRead && len(segs) == 1 && hasStaleEmbyIDQueryParam(rawQuery) {
+			return staleEmbyFallbackItemsObject
+		}
+		if len(segs) == 2 && isRead {
+			switch segs[1] {
+			case "counts", "filters", "filters2", "latest", "resume", "suggestions":
+				return staleEmbyFallbackNone
+			default:
+				return staleEmbyFallbackNotFound
+			}
+		}
+		if len(segs) >= 3 && segs[1] != "" {
+			switch segs[2] {
+			case "playbackinfo":
+				if method == http.MethodPost || isRead {
+					return staleEmbyFallbackNotFound
+				}
+			case "images":
+				if isRead {
+					return staleEmbyFallbackNotFound
+				}
+			case "similar", "intros", "additionalparts":
+				if isRead {
+					return staleEmbyFallbackItemsObject
+				}
+			case "localtrailers", "specialfeatures":
+				if isRead {
+					return staleEmbyFallbackJSONArray
+				}
+			}
+		}
+	}
+
+	// /shows/nextup, /shows/{id}/seasons, /shows/{id}/episodes, /shows/{id}/similar, /movies/{id}/similar
+	if isRead && segs[0] == "shows" {
+		if len(segs) == 2 && segs[1] == "nextup" && hasStaleEmbyIDQueryParam(rawQuery) {
+			return staleEmbyFallbackItemsObject
+		}
+		if len(segs) == 3 && segs[1] != "" && (segs[2] == "seasons" || segs[2] == "episodes" || segs[2] == "similar") {
+			return staleEmbyFallbackItemsObject
+		}
+	}
+	if isRead && segs[0] == "movies" && len(segs) == 3 && segs[1] != "" && segs[2] == "similar" {
+		return staleEmbyFallbackItemsObject
+	}
+	if isRead && segs[0] == "videos" && len(segs) >= 2 && segs[1] != "" {
+		return staleEmbyFallbackNotFound
+	}
+	return staleEmbyFallbackNone
+}
+
+// sanitizePostSiteSwitchStaleIDError prevents stale cached item/library IDs
+// from an old Emby server (e.g., ULID ParentIds sent to a numeric-ID Emby
+// server right after a seamless site switch) from returning HTTP 500/400 and
+// tripping client-side circuit breakers such as CapyPlayer's CircuitOpenException.
+func sanitizePostSiteSwitchStaleIDError(resp *http.Response, upstreamBasePath string) bool {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return false
+	}
+	if resp.StatusCode != http.StatusInternalServerError && resp.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	relPath := stripUpstreamBasePath(resp.Request.URL.Path, upstreamBasePath)
+	kind := classifyPostSiteSwitchStaleIDFallback(resp.Request.Method, relPath, resp.Request.URL.RawQuery)
+	if kind == staleEmbyFallbackNone {
+		return false
+	}
+
+	if resp.Body != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}
+
+	var (
+		newStatus int
+		payload   []byte
+	)
+	switch kind {
+	case staleEmbyFallbackItemsObject:
+		newStatus = http.StatusOK
+		payload = []byte(`{"Items":[],"TotalRecordCount":0,"StartIndex":0}`)
+	case staleEmbyFallbackJSONArray:
+		newStatus = http.StatusOK
+		payload = []byte(`[]`)
+	case staleEmbyFallbackNotFound:
+		newStatus = http.StatusNotFound
+		payload = []byte(`{"error":"item not found after site switch"}`)
+	default:
+		return false
+	}
+
+	resp.StatusCode = newStatus
+	resp.Status = fmt.Sprintf("%d %s", newStatus, http.StatusText(newStatus))
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Transfer-Encoding")
+	resp.Header.Del("ETag")
+	resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp.Header.Set("Cache-Control", "no-store")
+	if resp.Request.Method == http.MethodHead {
+		resp.Body = http.NoBody
+		resp.ContentLength = 0
+		resp.Header.Set("Content-Length", "0")
+	} else {
+		resp.Body = io.NopCloser(bytes.NewReader(payload))
+		resp.ContentLength = int64(len(payload))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(payload)))
+	}
+	return true
 }

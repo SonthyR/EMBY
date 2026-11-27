@@ -258,6 +258,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					if err := rewritePersonalShareMetadataResponse(resp, target.Path, virtualServerID, clientUID, upstreamUID); err != nil {
 						return err
 					}
+					if pm.shares.isRecentSiteSwitchSession(edgeCtx.shareTokenHash, time.Now()) {
+						sanitizePostSiteSwitchStaleIDError(resp, target.Path)
+					}
 				}
 			}
 			dynamicResponse := responseIsDynamic(resp)

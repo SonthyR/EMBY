@@ -220,9 +220,10 @@ type shareSessionEntry struct {
 	deviceID      string
 	deviceName    string
 	clientName    string
-	clientIP      string
-	ispGroup      string
-	lastHandoffAt time.Time
+	clientIP         string
+	ispGroup         string
+	lastHandoffAt    time.Time
+	lastSiteSwitchAt time.Time
 }
 
 type shareUserState struct {
@@ -499,6 +500,9 @@ func (rt *shareUserRuntime) reload() error {
 		if prev, exists := prevSessions[hash]; exists {
 			if !prev.lastHandoffAt.IsZero() {
 				entry.lastHandoffAt = prev.lastHandoffAt
+			}
+			if !prev.lastSiteSwitchAt.IsZero() {
+				entry.lastSiteSwitchAt = prev.lastSiteSwitchAt
 			}
 			if prev.ispGroup != "" && entry.ispGroup == "" {
 				entry.ispGroup = prev.ispGroup
@@ -2331,7 +2335,10 @@ func newShareLogoutFunc(transport http.RoundTripper, target *url.URL, policy UAH
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 		_ = response.Body.Close()
-		if response.StatusCode >= 400 && response.StatusCode != http.StatusUnauthorized {
+		if response.StatusCode >= 400 &&
+			response.StatusCode != http.StatusUnauthorized &&
+			response.StatusCode != http.StatusNotFound &&
+			response.StatusCode != http.StatusMethodNotAllowed {
 			return fmt.Errorf("upstream returned %d", response.StatusCode)
 		}
 		return nil
