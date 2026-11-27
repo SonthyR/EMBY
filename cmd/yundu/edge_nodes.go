@@ -46,6 +46,8 @@ const (
 	edgeNodeDefaultPort      = 19090
 	edgeInstallScriptRawBase = "https://raw.githubusercontent.com/SonthyR/EMBY/master/install.sh"
 	ispSettingNonMainlandKey = "_non_mainland"
+	ispSettingEdgeBindIPKey  = "_edge_bind_client_ip"
+	edgeIPMismatchAlertTTL   = 15 * time.Minute
 	ispStrategyPriority      = "priority"
 	ispStrategyBalance       = "balance"
 	speedtestMetricMaxAge    = 30 * 24 * time.Hour
@@ -325,6 +327,7 @@ type edgePlaybackTicket struct {
 	SiteID       int64             `json:"s"`
 	ShareUserID  int64             `json:"u,omitempty"`
 	TokenHash    string            `json:"th,omitempty"`
+	ClientIP     string            `json:"cip,omitempty"`
 	SpeedMbps    int               `json:"sp,omitempty"`
 	TargetURL    string            `json:"t"`
 	Headers      map[string]string `json:"h,omitempty"`
@@ -666,6 +669,23 @@ type ispRouteRule struct {
 	ScheduleEnd   string `json:"schedule_end,omitempty"`
 }
 
+type agentIPMismatchEvent struct {
+	ShareUserID int64  `json:"share_user_id"`
+	SiteID      int64  `json:"site_id"`
+	ExpectedIP  string `json:"expected_ip"`
+	ActualIP    string `json:"actual_ip"`
+	AtUnix      int64  `json:"at_unix"`
+}
+
+type edgeIPMismatchAlert struct {
+	NodeName     string
+	ExpectedIP   string
+	ActualIP     string
+	ActualRegion string
+	ActualISP    string
+	OccurredAt   time.Time
+}
+
 type edgeNodeRuntime struct {
 	db        *DB
 	pm        *ProxyManager
@@ -680,6 +700,8 @@ type edgeNodeRuntime struct {
 	speedMetrics     map[int64]map[string]edgeNodeSpeedMetric
 	rrCounters       map[string]*atomic.Uint64
 	blockNonMainland bool
+	edgeBindClientIP bool
+	ipMismatchAlerts map[int64]edgeIPMismatchAlert
 	ispProbe         ISPProbeSettings
 	ispProbeClaimKey [32]byte
 	pendingISPAlerts []ispProbeAlert
@@ -694,16 +716,18 @@ func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNo
 		counters[g] = &atomic.Uint64{}
 	}
 	rt := &edgeNodeRuntime{
-		db:           db,
-		pm:           pm,
-		ip2region:    ip2,
-		nodes:        make(map[int64]*edgeNodeLiveState),
-		routes:       make(map[string][]ispRouteRule),
-		blocked:      make(map[string]bool),
-		strategies:   make(map[string]string),
-		speedMetrics: make(map[int64]map[string]edgeNodeSpeedMetric),
-		rrCounters:   counters,
-		ispProbe:     defaultISPProbeSettings(),
+		db:               db,
+		pm:               pm,
+		ip2region:        ip2,
+		nodes:            make(map[int64]*edgeNodeLiveState),
+		routes:           make(map[string][]ispRouteRule),
+		blocked:          make(map[string]bool),
+		strategies:       make(map[string]string),
+		speedMetrics:     make(map[int64]map[string]edgeNodeSpeedMetric),
+		rrCounters:       counters,
+		edgeBindClientIP: true,
+		ipMismatchAlerts: make(map[int64]edgeIPMismatchAlert),
+		ispProbe:         defaultISPProbeSettings(),
 	}
 	_, _ = rand.Read(rt.ispProbeClaimKey[:])
 	if db != nil {
@@ -800,6 +824,7 @@ func (rt *edgeNodeRuntime) reload() error {
 		strategies[g] = ispStrategyPriority
 	}
 	blockNonMainland := false
+	edgeBindClientIP := true
 	if settingRows, err := rt.db.db.Query(`SELECT isp_group, block_connect, strategy FROM isp_group_settings`); err == nil {
 		for settingRows.Next() {
 			var group, strategy string
@@ -809,6 +834,8 @@ func (rt *edgeNodeRuntime) reload() error {
 					if block != 0 {
 						blockNonMainland = true
 					}
+				} else if group == ispSettingEdgeBindIPKey {
+					edgeBindClientIP = block != 0
 				} else if validISPGroup(group) {
 					if block != 0 {
 						blocked[group] = true
@@ -952,8 +979,119 @@ func (rt *edgeNodeRuntime) reload() error {
 	rt.strategies = strategies
 	rt.speedMetrics = speedMap
 	rt.blockNonMainland = blockNonMainland
+	rt.edgeBindClientIP = edgeBindClientIP
 	rt.ispProbe = ispProbeCfg
 	return nil
+}
+
+func normalizeRawIPString(raw string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return addr.Unmap().String()
+}
+
+func normalizeEdgeBindIP(raw string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return ""
+	}
+	return addr.String()
+}
+
+func (rt *edgeNodeRuntime) shouldBindEdgeClientIP() bool {
+	if rt == nil {
+		return false
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.blockNonMainland && rt.edgeBindClientIP
+}
+
+func (rt *edgeNodeRuntime) recordIPMismatchEvents(nodeName string, events []agentIPMismatchEvent, now time.Time) {
+	if rt == nil || len(events) == 0 {
+		return
+	}
+	if len(events) > 64 {
+		events = events[:64]
+	}
+	enriched := make([]struct {
+		userID int64
+		alert  edgeIPMismatchAlert
+	}, 0, len(events))
+	for _, ev := range events {
+		actualIP := normalizeRawIPString(ev.ActualIP)
+		expectedIP := normalizeRawIPString(ev.ExpectedIP)
+		if actualIP == "" {
+			continue
+		}
+		var region, isp string
+		if rt.ip2region != nil {
+			res := rt.ip2region.Lookup(actualIP)
+			region = strings.TrimSpace(res.Region)
+			isp = strings.TrimSpace(res.ISP)
+		}
+		at := now
+		if ev.AtUnix > 0 {
+			parsed := time.Unix(ev.AtUnix, 0)
+			if parsed.Before(now.Add(2*time.Minute)) && now.Sub(parsed) <= edgeIPMismatchAlertTTL {
+				at = parsed
+			}
+		}
+		log.Printf("[edge:%s] rejected playback stream (client IP mismatch, possible proxy): user=%d login_ip=%s stream_ip=%s (%s %s)",
+			nodeName, ev.ShareUserID, expectedIP, actualIP, region, isp)
+		if ev.ShareUserID > 0 {
+			enriched = append(enriched, struct {
+				userID int64
+				alert  edgeIPMismatchAlert
+			}{
+				userID: ev.ShareUserID,
+				alert: edgeIPMismatchAlert{
+					NodeName:     nodeName,
+					ExpectedIP:   expectedIP,
+					ActualIP:     actualIP,
+					ActualRegion: region,
+					ActualISP:    isp,
+					OccurredAt:   at,
+				},
+			})
+		}
+	}
+	if len(enriched) == 0 {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.ipMismatchAlerts == nil {
+		rt.ipMismatchAlerts = make(map[int64]edgeIPMismatchAlert)
+	}
+	for uid, old := range rt.ipMismatchAlerts {
+		if now.Sub(old.OccurredAt) > edgeIPMismatchAlertTTL {
+			delete(rt.ipMismatchAlerts, uid)
+		}
+	}
+	for _, item := range enriched {
+		rt.ipMismatchAlerts[item.userID] = item.alert
+	}
+}
+
+func (rt *edgeNodeRuntime) latestIPMismatchAlert(userID int64, now time.Time) *edgeIPMismatchAlert {
+	if rt == nil || userID <= 0 {
+		return nil
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	alert, ok := rt.ipMismatchAlerts[userID]
+	if !ok || now.Sub(alert.OccurredAt) > edgeIPMismatchAlertTTL {
+		return nil
+	}
+	cp := alert
+	return &cp
 }
 
 func (rt *edgeNodeRuntime) loadSpeedMetricsFromDB() map[int64]map[string]edgeNodeSpeedMetric {
@@ -2342,14 +2480,17 @@ type ispRouteGroupView struct {
 
 func (a *App) buildISPRoutesPayload() map[string]any {
 	blockNonMainland := false
+	edgeBindClientIP := true
 	if a.pm != nil && a.pm.edges != nil {
 		a.pm.edges.mu.RLock()
 		blockNonMainland = a.pm.edges.blockNonMainland
+		edgeBindClientIP = a.pm.edges.edgeBindClientIP
 		a.pm.edges.mu.RUnlock()
 	}
 	return map[string]any{
-		"block_non_mainland": blockNonMainland,
-		"groups":             a.buildISPRouteGroups(),
+		"block_non_mainland":  blockNonMainland,
+		"edge_bind_client_ip": edgeBindClientIP,
+		"groups":              a.buildISPRouteGroups(),
 	}
 }
 
@@ -2499,6 +2640,7 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var req struct {
 			BlockNonMainland *bool   `json:"block_non_mainland"`
+			EdgeBindClientIP *bool   `json:"edge_bind_client_ip"`
 			Group            string  `json:"group"`
 			Strategy         *string `json:"strategy"`
 			BlockConnect     *bool   `json:"block_connect"`
@@ -2524,7 +2666,7 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Group = strings.ToLower(strings.TrimSpace(req.Group))
 		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil || req.Strategy != nil
-		if !hasGroupOp && req.BlockNonMainland == nil && req.SchedulePatch == nil {
+		if !hasGroupOp && req.BlockNonMainland == nil && req.EdgeBindClientIP == nil && req.SchedulePatch == nil {
 			a.jsonErr(w, http.StatusBadRequest, "线路配置参数无效")
 			return
 		}
@@ -2584,6 +2726,13 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		if req.BlockNonMainland != nil {
 			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
 				ispSettingNonMainlandKey, sqliteBool(*req.BlockNonMainland)); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
+				return
+			}
+		}
+		if req.EdgeBindClientIP != nil {
+			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
+				ispSettingEdgeBindIPKey, sqliteBool(*req.EdgeBindClientIP)); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
 				return
 			}
@@ -2818,6 +2967,7 @@ type agentHeartbeatRequest struct {
 	UpgradeStatus       string                         `json:"upgrade_status,omitempty"`
 	CertFingerprint     string                         `json:"cert_fingerprint"`
 	TrafficReports      []agentTrafficReport           `json:"traffic_reports"`
+	IPMismatchEvents    []agentIPMismatchEvent         `json:"ip_mismatch_events,omitempty"`
 }
 
 type agentHeartbeatResponse struct {
@@ -2978,6 +3128,9 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var ackSpeedtestID string
 	if req.SpeedtestProgress != nil && a.speedtest != nil {
 		ackSpeedtestID = a.speedtest.applyAgentProgress(nodeID, req.SpeedtestProgress)
+	}
+	if len(req.IPMismatchEvents) > 0 {
+		a.pm.edges.recordIPMismatchEvents(nodeName, req.IPMismatchEvents, now)
 	}
 
 	a.pm.edges.mu.Lock()

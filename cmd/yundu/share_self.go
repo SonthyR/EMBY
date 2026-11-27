@@ -176,10 +176,21 @@ type shareSelfNetwork struct {
 	BlockReason   string `json:"block_reason,omitempty"`
 }
 
+type shareSelfEdgeIPAlert struct {
+	NodeName     string `json:"node_name"`
+	ExpectedIP   string `json:"expected_ip"`
+	ActualIP     string `json:"actual_ip"`
+	ActualRegion string `json:"actual_region,omitempty"`
+	ActualISP    string `json:"actual_isp,omitempty"`
+	DirectRule   string `json:"direct_rule,omitempty"`
+	OccurredAt   string `json:"occurred_at"`
+}
+
 type shareSelfView struct {
 	ShareUser
-	Servers []shareSelfSite   `json:"servers"`
-	Network *shareSelfNetwork `json:"network,omitempty"`
+	Servers     []shareSelfSite       `json:"servers"`
+	Network     *shareSelfNetwork     `json:"network,omitempty"`
+	EdgeIPAlert *shareSelfEdgeIPAlert `json:"edge_ip_alert,omitempty"`
 }
 
 type shareSelfOrderResponse struct {
@@ -218,11 +229,39 @@ func (a *App) buildShareSelfNetwork(r *http.Request) *shareSelfNetwork {
 	}
 }
 
+func (a *App) buildShareSelfDirectRule(r *http.Request) string {
+	host := strings.TrimSpace(a.routeDomain)
+	if host == "" {
+		host = strings.TrimSpace(a.panelHost)
+	}
+	if host == "" && r != nil {
+		host = requestPublicHost(r.Host)
+	}
+	host = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(host)), "*.")
+	if host == "" || host == "localhost" || normalizeRawIPString(host) != "" {
+		return ""
+	}
+	return host
+}
+
 func (a *App) buildShareSelfView(user *storedShareUser, r *http.Request) shareSelfView {
 	origin := a.shareTextOrigin(r)
 	view := shareSelfView{
 		ShareUser: a.shareUserView(user, false, origin),
 		Network:   a.buildShareSelfNetwork(r),
+	}
+	if a.pm != nil && a.pm.edges != nil {
+		if alert := a.pm.edges.latestIPMismatchAlert(user.ID, time.Now()); alert != nil {
+			view.EdgeIPAlert = &shareSelfEdgeIPAlert{
+				NodeName:     alert.NodeName,
+				ExpectedIP:   alert.ExpectedIP,
+				ActualIP:     alert.ActualIP,
+				ActualRegion: alert.ActualRegion,
+				ActualISP:    alert.ActualISP,
+				DirectRule:   a.buildShareSelfDirectRule(r),
+				OccurredAt:   alert.OccurredAt.Format(time.RFC3339),
+			}
+		}
 	}
 	if view.Status == "active" {
 		if dm := a.buildShareUserDanmakuSources(user, origin); len(dm) > 0 {

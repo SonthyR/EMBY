@@ -24,7 +24,9 @@ import { usePointerSort } from '@/composables/usePointerSort'
 
 const groups = ref<ISPRouteGroup[]>([])
 const blockNonMainland = ref(false)
+const edgeBindClientIP = ref(true)
 const savingNonMainland = ref(false)
+const savingEdgeBindIP = ref(false)
 const dbStatus = ref<IP2RegionStatus>({
   v4: { version: 'v4', downloaded: false, size_bytes: 0 },
   v6: { version: 'v6', downloaded: false, size_bytes: 0 },
@@ -52,12 +54,13 @@ function formatTimestamp(raw?: string): string {
 }
 
 async function load(silent = false) {
-  if (pointerSort.isDragging.value || savingGroup.value || savingNonMainland.value) return
+  if (pointerSort.isDragging.value || savingGroup.value || savingNonMainland.value || savingEdgeBindIP.value) return
   if (!silent) loading.value = true
   try {
     const [routeRes, ipStatus] = await Promise.all([ispRoutesApi.get(), ip2regionApi.status()])
     groups.value = routeRes.groups || []
     blockNonMainland.value = !!routeRes.block_non_mainland
+    edgeBindClientIP.value = routeRes.edge_bind_client_ip !== false
     dbStatus.value = ipStatus
     loadError.value = ''
   } catch (error) {
@@ -153,6 +156,7 @@ async function toggleBlockNonMainland(value: boolean) {
   try {
     const res = await ispRoutesApi.setBlockNonMainland(value)
     blockNonMainland.value = !!res.block_non_mainland
+    edgeBindClientIP.value = res.edge_bind_client_ip !== false
     groups.value = res.groups || []
     toast.success(value ? '已开启：海外 / 非中国大陆 IP 将禁止连接 Emby' : '已关闭海外 / 非中国大陆 IP 拦截')
   } catch (error) {
@@ -160,6 +164,22 @@ async function toggleBlockNonMainland(value: boolean) {
     await load(true)
   } finally {
     savingNonMainland.value = false
+  }
+}
+
+async function toggleEdgeBindClientIP(value: boolean) {
+  savingEdgeBindIP.value = true
+  try {
+    const res = await ispRoutesApi.setEdgeBindClientIP(value)
+    blockNonMainland.value = !!res.block_non_mainland
+    edgeBindClientIP.value = res.edge_bind_client_ip !== false
+    groups.value = res.groups || []
+    toast.success(value ? '已开启从机客户端 IP 校验（防主控直连但从机走梯子）' : '已关闭从机客户端 IP 校验')
+  } catch (error) {
+    toast.error(errorMessage(error, '保存配置失败'))
+    await load(true)
+  } finally {
+    savingEdgeBindIP.value = false
   }
 }
 
@@ -410,23 +430,42 @@ async function deleteIPDB(version: 'v4' | 'v6') {
         </div>
 
         <div class="guard-bar" :class="{ active: blockNonMainland }">
-          <div class="guard-meta">
-            <ShieldBan class="guard-icon" />
-            <div>
+          <div class="guard-main">
+            <div class="guard-meta">
+              <ShieldBan class="guard-icon" />
+              <div>
+                <div class="guard-title">
+                  <strong>禁止海外 / 非中国大陆 IP 连接 Emby</strong>
+                  <span v-if="blockNonMainland" class="blocked-chip">已开启 · 拦截非大陆</span>
+                </div>
+                <p class="faint guard-desc">
+                  拒绝来自海外及港澳台（常见代理/梯子节点）的 Emby 客户端连接（HTTP 403），防止忘关代理消耗双份流量；国内广电、教育网等小宽带仍正常走「其他」组。管理面板网页、朋友自助页、从机心跳及内网 IP 永远放行。
+                </p>
+              </div>
+            </div>
+            <UiSwitch
+              :model-value="blockNonMainland"
+              :disabled="savingNonMainland"
+              @update:model-value="toggleBlockNonMainland"
+            />
+          </div>
+
+          <div v-if="blockNonMainland" class="guard-sub">
+            <div class="guard-sub-meta">
               <div class="guard-title">
-                <strong>禁止海外 / 非中国大陆 IP 连接 Emby</strong>
-                <span v-if="blockNonMainland" class="blocked-chip">已开启 · 拦截非大陆</span>
+                <strong>从机同步校验客户端 IP（防主控直连但从机走梯子）</strong>
+                <span v-if="edgeBindClientIP" class="active-chip">已开启 · 防偷跑 & 防盗链</span>
               </div>
               <p class="faint guard-desc">
-                拒绝来自海外及港澳台（常见代理/梯子节点）的 Emby 客户端连接（HTTP 403），防止忘关代理消耗双份流量；国内广电、教育网等小宽带仍正常走「其他」组。管理面板网页、朋友自助页、从机心跳及内网 IP 永远放行。
+                主控签发 307 播放票据时加密写入已核验的大陆 IP；从机收到拉流请求若实际来源 IP 不一致（例如视频流被拐进代理或播放链接被转发），立即返回 403 拒流并在朋友自助页顶部弹出提醒（需从机升级至 v1.5.11+）。若朋友宽带存在 IPv4/IPv6 双栈混走，可关闭此项。
               </p>
             </div>
+            <UiSwitch
+              :model-value="edgeBindClientIP"
+              :disabled="savingEdgeBindIP"
+              @update:model-value="toggleEdgeBindClientIP"
+            />
           </div>
-          <UiSwitch
-            :model-value="blockNonMainland"
-            :disabled="savingNonMainland"
-            @update:model-value="toggleBlockNonMainland"
-          />
         </div>
 
         <div class="grid">
@@ -746,8 +785,11 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .faint { color: var(--text-3); }
 .mono { font-family: var(--font-mono); }
 
-.guard-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-card); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.guard-bar { display: flex; flex-direction: column; gap: 14px; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-card); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
 .guard-bar.active { border-color: color-mix(in srgb, var(--bad) 42%, var(--border)); background: color-mix(in srgb, var(--bad) 5%, var(--surface)); }
+.guard-main { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.guard-sub { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 14px; padding-left: 30px; border-top: 1px dashed color-mix(in srgb, var(--bad) 24%, var(--border)); }
+.guard-sub-meta { flex: 1; min-width: 0; }
 .guard-meta { display: flex; align-items: flex-start; gap: 12px; flex: 1; min-width: 0; }
 .guard-icon { width: 18px; height: 18px; margin-top: 2px; color: var(--text-2); flex-shrink: 0; }
 .guard-bar.active .guard-icon { color: var(--bad); }

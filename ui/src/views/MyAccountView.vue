@@ -306,6 +306,20 @@ async function changePassword() {
           </div>
         </div>
 
+        <div v-if="me.edge_ip_alert" class="net-alert">
+          <ShieldBan class="net-ico" />
+          <div class="alert-body">
+            <strong>检测到刚才播放视频时疑似走了代理 / 梯子（已被从机拦截）</strong>
+            <p>
+              {{ relativeTime(me.edge_ip_alert.occurred_at) }}在「{{ me.edge_ip_alert.node_name }}」节点拉流时，视频连接来源为「{{ [me.edge_ip_alert.actual_region, me.edge_ip_alert.actual_isp, me.edge_ip_alert.actual_ip].filter(Boolean).join(' · ') }}」，与直连登录 IP（{{ me.edge_ip_alert.expected_ip }}）不一致。请关闭代理，或在代理软件中添加直连规则后再播放。
+            </p>
+            <div v-if="me.edge_ip_alert.direct_rule" class="direct-rule-row">
+              <code class="mono">DOMAIN-SUFFIX,{{ me.edge_ip_alert.direct_rule }},DIRECT</code>
+              <UiButton variant="secondary" size="sm" @click="copy(`DOMAIN-SUFFIX,${me.edge_ip_alert.direct_rule},DIRECT`)"><Copy />复制规则</UiButton>
+            </div>
+          </div>
+        </div>
+
         <template v-if="hasPersonalRoute">
           <section class="bento-section">
             <h2>客户端固定地址</h2>
@@ -582,6 +596,20 @@ async function changePassword() {
 .net-alert .net-ico { width: 17px; height: 17px; color: var(--bad); flex: 0 0 17px; margin-top: 2px; }
 .net-alert strong { display: block; color: var(--bad); margin-bottom: 2px; }
 .net-alert p { margin: 0; color: var(--text-2); }
+.alert-body { flex: 1; min-width: 0; }
+.direct-rule-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.direct-rule-row code { font-size: 12px; color: var(--text); overflow-wrap: anywhere; }
 
 .bento-section {
   padding: 20px 22px;

@@ -238,7 +238,7 @@ func sanitizeEdgeFilename(rawPath string) string {
 	return out
 }
 
-func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *ProxyManager, site Site, decision edgeRouteDecision, targetURL *url.URL, headers map[string]string, shareUser *shareUserState, shareTokenHash string) bool {
+func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *ProxyManager, site Site, decision edgeRouteDecision, targetURL *url.URL, headers map[string]string, clientIP string, shareUser *shareUserState, shareTokenHash string) bool {
 	if decision.NodeID <= 0 || decision.PublicURL == "" || decision.Token == "" || targetURL == nil {
 		return false
 	}
@@ -254,11 +254,16 @@ func writeEdgePlaybackRedirect(w http.ResponseWriter, r *http.Request, pm *Proxy
 			}
 		}
 	}
+	var boundClientIP string
+	if pm != nil && pm.edges != nil && pm.edges.shouldBindEdgeClientIP() {
+		boundClientIP = normalizeEdgeBindIP(clientIP)
+	}
 	ticket := edgePlaybackTicket{
 		NodeID:      decision.NodeID,
 		SiteID:      site.ID,
 		ShareUserID: shareUserID,
 		TokenHash:   shareTokenHash,
+		ClientIP:    boundClientIP,
 		TargetURL:   targetURL.String(),
 		Headers:     headers,
 		SpeedMbps:   speedMbps,
@@ -339,7 +344,7 @@ func tryRedirectToEdgeNode(
 		extraKeys = append(extraKeys, k)
 	}
 	compact := compactEdgeHeaders(headers, extraKeys)
-	return writeEdgePlaybackRedirect(w, r, pm, site, decision, &upstreamURL, compact, shareUser, shareTokenHash)
+	return writeEdgePlaybackRedirect(w, r, pm, site, decision, &upstreamURL, compact, clientIP, shareUser, shareTokenHash)
 }
 
 func tryRedirectDynamicResourceToEdgeNode(
@@ -378,5 +383,5 @@ func tryRedirectDynamicResourceToEdgeNode(
 		extraKeys = append(extraKeys, h.Name)
 	}
 	compact := compactEdgeHeaders(outboundHeaders, extraKeys)
-	return writeEdgePlaybackRedirect(w, r, pm, site, decision, target, compact, edgeCtx.shareUser, edgeCtx.shareTokenHash)
+	return writeEdgePlaybackRedirect(w, r, pm, site, decision, target, compact, edgeCtx.clientIP, edgeCtx.shareUser, edgeCtx.shareTokenHash)
 }

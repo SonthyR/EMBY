@@ -78,6 +78,16 @@ export interface LiveShareSession {
   last_seen_at: string
 }
 
+export interface ShareSelfEdgeIPAlert {
+  node_name: string
+  expected_ip: string
+  actual_ip: string
+  actual_region?: string
+  actual_isp?: string
+  direct_rule?: string
+  occurred_at: string
+}
+
 export interface ShareSelfNetwork {
   client_ip: string
   region?: string
@@ -368,6 +378,7 @@ export interface ISPRouteGroup {
 
 export interface ISPRoutesResponse {
   block_non_mainland: boolean
+  edge_bind_client_ip?: boolean
   groups: ISPRouteGroup[]
 }
 

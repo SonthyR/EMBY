@@ -194,6 +194,43 @@ describe('DanmakuDrawer & MyAccountView 弹幕服务 (v1.5.10)', () => {
       route_url: 'https://emby.example.com/alice',
       note: '',
       enabled: true,
+      expires_at: '2027-01-01',
+      traffic_quota: 0,
+      traffic_used: 0,
+      status: 'active',
+      session_count: 0,
+      max_devices: 0,
+      speed_limit: 0,
+      traffic_reset_day: 0,
+      sites: [],
+      servers: [],
+      edge_ip_alert: {
+        node_name: 'RFC-JPCO',
+        expected_ip: '1.2.3.4',
+        actual_ip: '45.6.7.8',
+        actual_region: '中国 · 香港',
+        actual_isp: 'Cloudflare',
+        direct_rule: 'emby.example.com',
+        occurred_at: new Date().toISOString(),
+      },
+      created_at: '',
+      updated_at: '',
+    })
+
+    const alertWrapper = mount(MyAccountView)
+    await flushPromises()
+    expect(alertWrapper.text()).toContain('疑似走了代理 / 梯子')
+    expect(alertWrapper.text()).toContain('RFC-JPCO')
+    expect(alertWrapper.text()).toContain('DOMAIN-SUFFIX,emby.example.com,DIRECT')
+    alertWrapper.unmount()
+
+    mockMeApi.get.mockResolvedValueOnce({
+      id: 1,
+      username: 'alice',
+      route_prefix: '/alice',
+      route_url: 'https://emby.example.com/alice',
+      note: '',
+      enabled: true,
       expires_at: '2020-01-01',
       traffic_quota: 0,
       traffic_used: 0,

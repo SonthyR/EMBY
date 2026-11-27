@@ -282,6 +282,10 @@ type edgeAgent struct {
 	traffic   map[agentTrafficKey]*agentTrafficAccum
 	flushCh   chan struct{}
 
+	ipMismatchMu sync.Mutex
+	ipMismatches []agentIPMismatchEvent
+	peerIPFunc   func(*http.Request) string
+
 	probeMu      sync.RWMutex
 	probeTargets []agentProbeTarget
 	latencies    map[int64]int
@@ -670,8 +674,74 @@ func (a *edgeAgent) runSpeedtestTask(ctx context.Context, task agentSpeedtestTas
 	a.triggerSpeedtestNotify()
 }
 
+func (a *edgeAgent) clientPeerIP(r *http.Request) string {
+	if a.peerIPFunc != nil {
+		return normalizeRawIPString(a.peerIPFunc(r))
+	}
+	if ip := remoteAddressIP(r.RemoteAddr); ip != nil {
+		return normalizeRawIPString(ip.String())
+	}
+	return ""
+}
+
+func (a *edgeAgent) recordIPMismatch(shareUserID, siteID int64, expectedIP, actualIP string) {
+	if actualIP == "" {
+		return
+	}
+	a.ipMismatchMu.Lock()
+	nowUnix := time.Now().Unix()
+	updated := false
+	for i := range a.ipMismatches {
+		if a.ipMismatches[i].ShareUserID == shareUserID && a.ipMismatches[i].ActualIP == actualIP {
+			a.ipMismatches[i].ExpectedIP = expectedIP
+			a.ipMismatches[i].AtUnix = nowUnix
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		if len(a.ipMismatches) >= 64 {
+			a.ipMismatches = a.ipMismatches[1:]
+		}
+		a.ipMismatches = append(a.ipMismatches, agentIPMismatchEvent{
+			ShareUserID: shareUserID,
+			SiteID:      siteID,
+			ExpectedIP:  expectedIP,
+			ActualIP:    actualIP,
+			AtUnix:      nowUnix,
+		})
+	}
+	a.ipMismatchMu.Unlock()
+	a.triggerFlush()
+}
+
+func (a *edgeAgent) drainIPMismatchEvents() []agentIPMismatchEvent {
+	a.ipMismatchMu.Lock()
+	defer a.ipMismatchMu.Unlock()
+	if len(a.ipMismatches) == 0 {
+		return nil
+	}
+	out := a.ipMismatches
+	a.ipMismatches = nil
+	return out
+}
+
+func (a *edgeAgent) restoreIPMismatchEvents(events []agentIPMismatchEvent) {
+	if len(events) == 0 {
+		return
+	}
+	a.ipMismatchMu.Lock()
+	defer a.ipMismatchMu.Unlock()
+	combined := append(events, a.ipMismatches...)
+	if len(combined) > 64 {
+		combined = combined[len(combined)-64:]
+	}
+	a.ipMismatches = combined
+}
+
 func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	reports := a.drainTrafficReports()
+	ipMismatches := a.drainIPMismatchEvents()
 	bytesInWindow := a.windowBytes.Swap(0)
 	nowNano := time.Now().UnixNano()
 	prevNano := a.lastWindowAt.Swap(nowNano)
@@ -706,16 +776,19 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 		UpgradeStatus:     upgradeStatus,
 		CertFingerprint:   fp,
 		TrafficReports:    reports,
+		IPMismatchEvents:  ipMismatches,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		a.restoreTrafficReports(reports)
+		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
 	endpoint := a.cfg.MasterURL + "/api/agent/heartbeat"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		a.restoreTrafficReports(reports)
+		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -732,11 +805,13 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	resp, err := a.masterClient.Do(req)
 	if err != nil {
 		a.restoreTrafficReports(reports)
+		a.restoreIPMismatchEvents(ipMismatches)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		a.restoreTrafficReports(reports)
+		a.restoreIPMismatchEvents(ipMismatches)
 		return fmt.Errorf("master returned HTTP %d", resp.StatusCode)
 	}
 	var reply agentHeartbeatResponse
@@ -1191,6 +1266,16 @@ func (a *edgeAgent) handler() http.Handler {
 		if blocked, reason := a.isRequestBlocked(ticket); blocked {
 			writeShareJSONError(w, http.StatusUnauthorized, reason)
 			return
+		}
+		if ticket.ClientIP != "" {
+			expectedIP := normalizeRawIPString(ticket.ClientIP)
+			peerIP := a.clientPeerIP(r)
+			if expectedIP != "" && peerIP != expectedIP {
+				a.recordIPMismatch(ticket.ShareUserID, ticket.SiteID, expectedIP, peerIP)
+				log.Printf("edge agent: rejected stream (client IP mismatch: ticket=%s peer=%s user=%d)", expectedIP, peerIP, ticket.ShareUserID)
+				writeShareJSONError(w, http.StatusForbidden, "检测到视频播放连接来源 IP 与登录 IP 不一致，疑似开启了海外代理或梯子，请关闭代理或将从机域名加入直连规则后重试")
+				return
+			}
 		}
 
 		targetURL, err := resolveAgentTicketURL(ticket.TargetURL, subPath, r.URL.RawQuery)

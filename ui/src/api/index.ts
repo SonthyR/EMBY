@@ -22,6 +22,7 @@ import type {
   ShareAlertSettings,
   ShareRedeemCode,
   ShareRedeemCodeCreateInput,
+  ShareSelfEdgeIPAlert,
   ShareSelfNetwork,
   ShareUser,
   ShareUserInput,
@@ -196,6 +197,7 @@ export interface MyAccountServer {
 export interface MyAccount extends ShareUser {
   servers: MyAccountServer[]
   network?: ShareSelfNetwork
+  edge_ip_alert?: ShareSelfEdgeIPAlert
 }
 
 export interface MyAccountOrderResponse extends MyAccount {
@@ -349,6 +351,8 @@ export const ispRoutesApi = {
     api.put<ISPRoutesResponse>('/api/isp-routes', { group, block_connect: blockConnect }),
   setBlockNonMainland: (blockNonMainland: boolean) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { block_non_mainland: blockNonMainland }),
+  setEdgeBindClientIP: (edgeBindClientIP: boolean) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { edge_bind_client_ip: edgeBindClientIP }),
   setSchedule: (patch: ISPRouteSchedulePatch) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { schedule_patch: patch }),
 }
