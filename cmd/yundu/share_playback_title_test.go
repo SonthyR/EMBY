@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,11 +14,14 @@ import (
 )
 
 func TestPlaybackTitleReportPreservesBody(t *testing.T) {
-	const body = `{"ItemId":"episode-3","PlaySessionId":"p3","OtherField":true}`
+	const body = `{"ItemId":"episode-3","PlaySessionId":"p3","PositionTicks":0,"EventName":"Pause","OtherField":true}`
 	req := httptest.NewRequest(http.MethodPost, "/emby/Sessions/Playing/Progress", strings.NewReader(body))
 	report, ok := readPlaybackTitleReport(req)
 	if !ok || report.identity.itemID != "episode-3" || report.identity.playID != "p3" || report.start || report.stop {
 		t.Fatalf("report = %+v, parsed=%t", report, ok)
+	}
+	if report.positionSeconds == nil || *report.positionSeconds != 0 || report.paused == nil || !*report.paused {
+		t.Fatalf("zero position or pause event was lost: %+v", report)
 	}
 	forwarded, err := io.ReadAll(req.Body)
 	if err != nil || string(forwarded) != body {
@@ -30,7 +34,7 @@ func TestPlaybackTitleUsesCurrentSourceAccount(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/emby/Users/real-user/Items/ep-3" || r.Header.Get("X-Emby-Token") != "upstream-session-token" {
 			t.Errorf("unexpected metadata request: method=%s path=%s authenticated=%t", r.Method, r.URL.Path, r.Header.Get("X-Emby-Token") != "")
 		}
-		_, _ = io.WriteString(w, `{"Type":"Episode","Name":"Episode title","SeriesName":"三体","ParentIndexNumber":1,"IndexNumber":3}`)
+		_, _ = io.WriteString(w, `{"Type":"Episode","Name":"Episode title","SeriesName":"三体","ParentIndexNumber":1,"IndexNumber":3,"RunTimeTicks":27620000000}`)
 	}))
 	defer origin.Close()
 	target, err := url.Parse(origin.URL + "/emby")
@@ -38,8 +42,8 @@ func TestPlaybackTitleUsesCurrentSourceAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetch := newPlaybackTitleFetchFunc(origin.Client().Transport, target, UAHeaderPolicy{}, upstreamHeaderPolicy{})
-	if got := fetch(context.Background(), "real-user", "upstream-session-token", "ep-3", ""); got != "三体 S01E03" {
-		t.Fatalf("title = %q", got)
+	if got := fetch(context.Background(), "real-user", "upstream-session-token", "ep-3", ""); got != (playbackItemMetadata{title: "三体 S01E03", durationSeconds: 2762}) {
+		t.Fatalf("metadata = %+v", got)
 	}
 }
 
@@ -93,14 +97,14 @@ func TestPlaybackTitleDashboardThroughShareProxy(t *testing.T) {
 			_, _ = io.WriteString(w, `{"Type":"Episode","SeriesName":"三体","ParentIndexNumber":1,"IndexNumber":3}`)
 		case "/Users/real-user/Items/ep-4":
 			episode4Lookups.Add(1)
-			_, _ = io.WriteString(w, `{"Type":"Episode","SeriesName":"三体","ParentIndexNumber":1,"IndexNumber":4}`)
+			_, _ = io.WriteString(w, `{"Type":"Episode","SeriesName":"三体","ParentIndexNumber":1,"IndexNumber":4,"RunTimeTicks":27620000000}`)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer origin.Close()
 	site, base := startShareTestSite(t, app, origin.URL)
-	createShareUserForTest(t, app, site.ID, 0)
+	userID := createShareUserForTest(t, app, site.ID, 0)
 	if response, body := doShareLogin(t, base, "friend", "friend-pass"); response.StatusCode != http.StatusOK {
 		t.Fatalf("login status=%d body=%s", response.StatusCode, body)
 	}
@@ -122,13 +126,22 @@ func TestPlaybackTitleDashboardThroughShareProxy(t *testing.T) {
 			t.Fatalf("playback report status = %d", resp.StatusCode)
 		}
 	}
-	visibleTitle := func() string {
+	liveView := func() liveShareSessionView {
 		t.Helper()
 		sessions, err := app.pm.shares.listAllLiveSessions()
 		if err != nil || len(sessions) != 1 {
 			t.Fatalf("live sessions = %d, err=%v", len(sessions), err)
 		}
-		return sessions[0].NowPlayingTitle
+		return sessions[0]
+	}
+	visibleTitle := func() string { return liveView().NowPlayingTitle }
+	lastWatch := func() string {
+		t.Helper()
+		item, err := app.db.getShareUser(userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return app.shareUserView(item, false, "").LastWatchedAt
 	}
 	waitFor := func(condition func() bool, description string) {
 		t.Helper()
@@ -143,6 +156,9 @@ func TestPlaybackTitleDashboardThroughShareProxy(t *testing.T) {
 
 	const ep3 = `{"ItemId":"ep-3","PlaySessionId":"p3"}`
 	const ep4 = `{"ItemId":"ep-4","PlaySessionId":"p4"}`
+	if watched := lastWatch(); watched != "" {
+		t.Fatalf("login advanced last watched: %s", watched)
+	}
 	report("/Sessions/Playing", ep3)
 	select {
 	case <-oldLookupStarted:
@@ -159,9 +175,44 @@ func TestPlaybackTitleDashboardThroughShareProxy(t *testing.T) {
 	if title := visibleTitle(); title != "三体 S01E04" || episode4Lookups.Load() != 1 {
 		t.Fatalf("title=%q metadata calls=%d after late episode 3 events", title, episode4Lookups.Load())
 	}
+	beforePause := lastWatch()
+	beforePauseAt, err := time.Parse(time.RFC3339Nano, beforePause)
+	if err != nil {
+		t.Fatalf("no live last watched timestamp: %v", err)
+	}
+	waitFor(func() bool { return time.Now().UnixMilli() > beforePauseAt.UnixMilli() }, "watch clock")
+	report("/Sessions/Playing/Progress", `{"ItemId":"ep-4","PlaySessionId":"p4","PositionTicks":14580000000,"IsPaused":true}`)
+	paused := liveView()
+	if paused.NowPlayingPaused == nil || !*paused.NowPlayingPaused ||
+		paused.NowPlayingPositionSeconds == nil || *paused.NowPlayingPositionSeconds != 1458 || paused.NowPlayingDurationSeconds != 2762 {
+		t.Fatalf("pause and position not reported: %+v", paused)
+	}
+	if got := lastWatch(); got != beforePause {
+		t.Fatalf("pause advanced last watched from %s to %s", beforePause, got)
+	}
+	report("/Sessions/Playing/Progress", `{"ItemId":"ep-4","PlaySessionId":"p4","PositionTicks":6000000000,"IsPaused":false}`)
+	resumed := liveView()
+	if resumed.NowPlayingPaused == nil || *resumed.NowPlayingPaused ||
+		resumed.NowPlayingPositionSeconds == nil || *resumed.NowPlayingPositionSeconds != 600 {
+		t.Fatalf("resume or backward seek was lost: %+v", resumed)
+	}
+	afterResume := lastWatch()
+	if afterResume == beforePause {
+		t.Fatal("resumed playback did not advance the account timestamp")
+	}
 	report("/Sessions/Playing/Stopped", ep4)
-	if title := visibleTitle(); title != "" {
-		t.Fatalf("stopped playback shows %q", title)
+	stopped := liveView()
+	if stopped.NowPlayingTitle != "" || stopped.NowPlayingPositionSeconds != nil || stopped.NowPlayingPaused != nil || lastWatch() != afterResume {
+		t.Fatalf("stop retained playback metadata or changed last watched: %+v", stopped)
+	}
+	app.pm.shares.flush()
+	saved, err := app.db.getShareUser(userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRestart := newShareUserRuntime(app.db, nil)
+	if saved.lastWatchedMS <= beforePauseAt.UnixMilli() || afterRestart.users[userID].lastWatchedMS != saved.lastWatchedMS {
+		t.Fatalf("watch timestamp was not restored from SQLite: db=%d", saved.lastWatchedMS)
 	}
 }
 
@@ -173,14 +224,14 @@ func TestPlaybackTitlePreservesEdgeEgressAndDiscardsResultAfterSwitch(t *testing
 	release := make(chan struct{}, 1)
 	inst := &ProxyInstance{
 		Site: Site{ID: 1}, ctx: context.Background(),
-		fetchPlaybackTitle: func(ctx context.Context, _, _, _, _ string) string {
+		fetchPlaybackTitle: func(ctx context.Context, _, _, _, _ string) playbackItemMetadata {
 			target, _ := edgeEgressTargetFrom(ctx)
 			started <- target
 			select {
 			case <-release:
-				return "old source movie"
+				return playbackItemMetadata{title: "old source movie"}
 			case <-ctx.Done():
-				return ""
+				return playbackItemMetadata{}
 			}
 		},
 	}
@@ -219,7 +270,37 @@ func TestPlaybackTitlePreservesEdgeEgressAndDiscardsResultAfterSwitch(t *testing
 	}
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	if len(rt.playbackTitleSlots) > 0 || retired.title != "" || rt.activity["session"].mediaTitle.current != nil {
+	if len(rt.playbackTitleSlots) > 0 || retired.metadata != (playbackItemMetadata{}) || rt.activity["session"].mediaTitle.current != nil {
 		t.Fatal("late metadata from the previous source was applied")
+	}
+}
+
+func TestPlaybackTitleLastWatchedSchemaUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "before-last-watched.db")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO share_users(username, password_hash) VALUES('existing-viewer', 'fixture')`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`ALTER TABLE share_users DROP COLUMN last_watched_at_ms`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	upgraded, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	viewer, err := upgraded.getShareUserWhere("username=?", "existing-viewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewer.Username != "existing-viewer" || viewer.lastWatchedMS != 0 {
+		t.Fatalf("unexpected upgrade result: account=%q lastWatched=%d", viewer.Username, viewer.lastWatchedMS)
 	}
 }

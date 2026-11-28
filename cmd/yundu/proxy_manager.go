@@ -66,7 +66,7 @@ type ProxyInstance struct {
 	shareLogout          func(context.Context, string) error
 	shareLogin           func(context.Context, string, string, string, string, string) (string, string, int, error)
 	fetchSiteIcon        func(context.Context, string, string) ([]byte, string, error)
-	fetchPlaybackTitle   func(context.Context, string, string, string, string) string
+	fetchPlaybackTitle   func(context.Context, string, string, string, string) playbackItemMetadata
 }
 
 type ProxyManager struct {

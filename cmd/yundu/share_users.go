@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS share_users (
 	expires_at TEXT NOT NULL DEFAULT '',
 	traffic_quota INTEGER NOT NULL DEFAULT 0,
 	traffic_used INTEGER NOT NULL DEFAULT 0,
+	last_watched_at_ms INTEGER NOT NULL DEFAULT 0,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -93,6 +94,7 @@ func ensureShareUserSchema(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	for _, column := range []struct{ table, name, sql string }{
+		{"share_users", "last_watched_at_ms", "ALTER TABLE share_users ADD COLUMN last_watched_at_ms INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "max_devices", "ALTER TABLE share_users ADD COLUMN max_devices INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "max_concurrent_streams", "ALTER TABLE share_users ADD COLUMN max_concurrent_streams INTEGER NOT NULL DEFAULT 0"},
 		{"share_users", "traffic_reset_day", "ALTER TABLE share_users ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 0"},
@@ -238,6 +240,8 @@ type shareUserState struct {
 	expiresAt            time.Time
 	quota                int64
 	persistedUsed        int64
+	lastWatchedMS        int64
+	savedLastWatchedMS   int64
 	maxDevices           int
 	maxConcurrentStreams int
 	speedLimit           int               // Mbps, 0 = unlimited
@@ -351,11 +355,12 @@ func (rt *shareUserRuntime) reload() error {
 		username, hash, routePrefix, expires     string
 		enabled                                  bool
 		quota, used                              int64
+		lastWatchedMS                            int64
 		maxDevices, maxConcurrentStreams, resetDay int
 		speedLimit                               int
 		resetPeriod                              string
 	}
-	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, route_prefix, enabled, expires_at, traffic_quota, traffic_used, max_devices, max_concurrent_streams, traffic_reset_day, traffic_reset_period, speed_limit FROM share_users`)
+	rows, err := rt.db.db.Query(`SELECT id, username, password_hash, route_prefix, enabled, expires_at, traffic_quota, traffic_used, max_devices, max_concurrent_streams, traffic_reset_day, traffic_reset_period, speed_limit, last_watched_at_ms FROM share_users`)
 	if err != nil {
 		return err
 	}
@@ -363,7 +368,7 @@ func (rt *shareUserRuntime) reload() error {
 	for rows.Next() {
 		var item row
 		var enabled int
-		if err := rows.Scan(&item.id, &item.username, &item.hash, &item.routePrefix, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.maxConcurrentStreams, &item.resetDay, &item.resetPeriod, &item.speedLimit); err != nil {
+		if err := rows.Scan(&item.id, &item.username, &item.hash, &item.routePrefix, &enabled, &item.expires, &item.quota, &item.used, &item.maxDevices, &item.maxConcurrentStreams, &item.resetDay, &item.resetPeriod, &item.speedLimit, &item.lastWatchedMS); err != nil {
 			rows.Close()
 			return err
 		}
@@ -480,6 +485,8 @@ func (rt *shareUserRuntime) reload() error {
 		state.expiresAt = rt.db.shareExpiryTime(item.expires)
 		state.quota = item.quota
 		state.persistedUsed = item.used
+		state.lastWatchedMS = max(state.lastWatchedMS, item.lastWatchedMS)
+		state.savedLastWatchedMS = max(state.savedLastWatchedMS, item.lastWatchedMS)
 		state.maxDevices = item.maxDevices
 		state.maxConcurrentStreams = item.maxConcurrentStreams
 		state.speedLimit = item.speedLimit
@@ -2047,6 +2054,9 @@ type liveShareSessionView struct {
 	NodeName     string `json:"node_name,omitempty"`
 	Playing      bool   `json:"playing"`
 	NowPlayingTitle string `json:"now_playing_title,omitempty"`
+	NowPlayingPositionSeconds *int64 `json:"now_playing_position_seconds,omitempty"`
+	NowPlayingDurationSeconds int64  `json:"now_playing_duration_seconds,omitempty"`
+	NowPlayingPaused          *bool  `json:"now_playing_paused,omitempty"`
 	Draining     bool   `json:"draining,omitempty"`
 	LastSeenAt   string `json:"last_seen_at"`
 }
@@ -2196,7 +2206,10 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
 			if current := act.mediaTitle.current; result[i].Playing && current != nil && now.Sub(act.mediaTitle.updatedAt) < sharePlayingIdleTimeout {
-				result[i].NowPlayingTitle = current.title
+				result[i].NowPlayingTitle = current.metadata.title
+				result[i].NowPlayingPositionSeconds = current.positionSeconds
+				result[i].NowPlayingDurationSeconds = current.metadata.durationSeconds
+				result[i].NowPlayingPaused = current.paused
 			}
 			if act.lastNodeName != "" {
 				if act.lastNodeName == defaultMasterNodeName {
@@ -2533,16 +2546,23 @@ func (rt *shareUserRuntime) flush() {
 
 	for _, state := range states {
 		delta := state.pending.Swap(0)
-		if delta == 0 {
+		var lastWatchedMS int64
+		rt.mu.RLock()
+		if state.lastWatchedMS > state.savedLastWatchedMS {
+			lastWatchedMS = state.lastWatchedMS
+		}
+		rt.mu.RUnlock()
+		if delta == 0 && lastWatchedMS == 0 {
 			continue
 		}
-		if _, err := rt.db.db.Exec(`UPDATE share_users SET traffic_used=traffic_used+? WHERE id=?`, delta, state.id); err != nil {
+		if _, err := rt.db.db.Exec(`UPDATE share_users SET traffic_used=traffic_used+?, last_watched_at_ms=MAX(last_watched_at_ms, ?) WHERE id=?`, delta, lastWatchedMS, state.id); err != nil {
 			state.pending.Add(delta)
-			log.Printf("share user %d: flush traffic: %v", state.id, err)
+			log.Printf("share user %d: flush usage: %v", state.id, err)
 			continue
 		}
 		rt.mu.Lock()
 		state.persistedUsed += delta
+		state.savedLastWatchedMS = max(state.savedLastWatchedMS, lastWatchedMS)
 		rt.mu.Unlock()
 	}
 	for hash, at := range touched {

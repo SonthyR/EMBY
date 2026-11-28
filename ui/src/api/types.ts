@@ -75,6 +75,9 @@ export interface LiveShareSession {
   node_name?: string
   playing?: boolean
   now_playing_title?: string
+  now_playing_position_seconds?: number
+  now_playing_duration_seconds?: number
+  now_playing_paused?: boolean
   draining?: boolean
   created_at?: string
   last_seen_at: string
@@ -170,6 +173,7 @@ export interface ShareUser {
   danmaku_sources?: MyAccountDanmakuSource[]
   created_at: string
   updated_at: string
+  last_watched_at?: string
 }
 
 export interface ShareUserInput {

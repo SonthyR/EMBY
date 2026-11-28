@@ -16,6 +16,7 @@ const (
 	playbackTitleRetryInterval = 30 * time.Second
 	playbackTitleLookupSlots   = 8
 	playbackTitleBodyLimit     = 128 << 10
+	embyTicksPerSecond         = 10_000_000
 )
 
 type playbackTitleIdentity struct {
@@ -29,18 +30,27 @@ func (id playbackTitleIdentity) matches(other playbackTitleIdentity) bool {
 }
 
 type playbackTitleReport struct {
-	identity playbackTitleIdentity
-	start    bool
-	stop     bool
-	at       time.Time
+	identity        playbackTitleIdentity
+	start           bool
+	stop            bool
+	at              time.Time
+	positionSeconds *int64
+	paused          *bool
 }
 
 type playbackTitleReportKey struct{}
 
 type sharePlaybackTitle struct {
-	identity   playbackTitleIdentity
-	title      string
-	retryAfter time.Time
+	identity        playbackTitleIdentity
+	metadata        playbackItemMetadata
+	positionSeconds *int64
+	paused          *bool
+	retryAfter      time.Time
+}
+
+type playbackItemMetadata struct {
+	title           string
+	durationSeconds int64
 }
 
 // Guarded by shareUserRuntime.mu. The previous identity only suppresses late reports.
@@ -76,6 +86,12 @@ func (s *sharePlaybackTitleState) apply(report playbackTitleReport, at time.Time
 		if s.current.identity.playID == "" {
 			s.current.identity.playID = report.identity.playID
 		}
+		if report.positionSeconds != nil {
+			s.current.positionSeconds = report.positionSeconds
+		}
+		if report.paused != nil {
+			s.current.paused = report.paused
+		}
 		s.updatedAt = at
 		return true
 	}
@@ -85,7 +101,7 @@ func (s *sharePlaybackTitleState) apply(report playbackTitleReport, at time.Time
 	if s.current != nil {
 		s.previous = s.current.identity
 	}
-	s.current = &sharePlaybackTitle{identity: report.identity}
+	s.current = &sharePlaybackTitle{identity: report.identity, positionSeconds: report.positionSeconds, paused: report.paused}
 	s.updatedAt = at
 	return true
 }
@@ -117,16 +133,32 @@ func readPlaybackTitleReport(r *http.Request) (playbackTitleReport, bool) {
 	var body struct {
 		ItemID        string `json:"ItemId"`
 		PlaySessionID string `json:"PlaySessionId"`
+		PositionTicks *int64 `json:"PositionTicks"`
+		IsPaused      *bool  `json:"IsPaused"`
+		EventName     string `json:"EventName"`
 	}
-	if complete && json.Unmarshal(payload, &body) == nil {
-		if validPlaybackTitlePathID(body.ItemID) {
-			report.identity.itemID = body.ItemID
-		}
-		if len(body.PlaySessionID) <= progressMaxKeyComponentBytes {
-			report.identity.playID = body.PlaySessionID
+	if !complete || json.Unmarshal(payload, &body) != nil {
+		return report, report.stop
+	}
+	if validPlaybackTitlePathID(body.ItemID) {
+		report.identity.itemID = body.ItemID
+	}
+	if len(body.PlaySessionID) <= progressMaxKeyComponentBytes {
+		report.identity.playID = body.PlaySessionID
+	}
+	if body.PositionTicks != nil && *body.PositionTicks >= 0 {
+		seconds := *body.PositionTicks / embyTicksPerSecond
+		report.positionSeconds = &seconds
+	}
+	report.paused = body.IsPaused
+	if report.paused == nil {
+		switch strings.ToLower(body.EventName) {
+		case "pause", "unpause":
+			paused := strings.EqualFold(body.EventName, "pause")
+			report.paused = &paused
 		}
 	}
-	return report, report.stop || report.identity.itemID != ""
+	return report, true
 }
 
 func validPlaybackTitlePathID(id string) bool {
@@ -142,7 +174,7 @@ func validPlaybackTitlePathID(id string) bool {
 }
 
 func samePlaybackTitleSession(current, expected shareSessionEntry) bool {
-	return current.siteID == expected.siteID && current.upstreamUID == expected.upstreamUID &&
+	return current.userID == expected.userID && current.siteID == expected.siteID && current.upstreamUID == expected.upstreamUID &&
 		current.upstreamToken == expected.upstreamToken && current.loginGeneration == expected.loginGeneration &&
 		current.lastSiteSwitchAt.Equal(expected.lastSiteSwitchAt) && current.lastHandoffAt.Equal(expected.lastHandoffAt)
 }
@@ -177,13 +209,33 @@ func (rt *shareUserRuntime) preparePlaybackTitleReport(inst *ProxyInstance, toke
 func (rt *shareUserRuntime) trackPlaybackTitle(ctx context.Context, inst *ProxyInstance, tokenHash string, entry shareSessionEntry, report playbackTitleReport, userAgent string, at time.Time) {
 	rt.mu.Lock()
 	act := rt.activity[tokenHash]
-	if act == nil || !samePlaybackTitleSession(rt.sessions[tokenHash], entry) || !act.mediaTitle.apply(report, at) {
+	if act == nil || !samePlaybackTitleSession(rt.sessions[tokenHash], entry) || at.Before(act.mediaTitle.updatedAt) {
+		rt.mu.Unlock()
+		return
+	}
+	if report.identity.itemID == "" && !report.stop {
+		current := act.mediaTitle.current
+		if current != nil && at.Sub(act.mediaTitle.updatedAt) <= sharePlayingIdleTimeout &&
+			(report.identity.playID == "" || report.identity.playID == current.identity.playID) {
+			report.identity.itemID = current.identity.itemID
+		}
+	}
+	if (report.identity.itemID != "" || report.stop) && !act.mediaTitle.apply(report, at) {
 		rt.mu.Unlock()
 		return
 	}
 	current := act.mediaTitle.current
+	paused := report.paused
+	if paused == nil && current != nil && current.identity.matches(report.identity) {
+		paused = current.paused
+	}
+	if !report.stop && (paused == nil || !*paused) {
+		if user := rt.users[entry.userID]; user != nil {
+			user.lastWatchedMS = max(user.lastWatchedMS, at.UnixMilli())
+		}
+	}
 	now := time.Now()
-	if current == nil || current.title != "" || now.Before(current.retryAfter) {
+	if current == nil || !current.identity.matches(report.identity) || current.metadata != (playbackItemMetadata{}) || now.Before(current.retryAfter) {
 		rt.mu.Unlock()
 		return
 	}
@@ -200,28 +252,28 @@ func (rt *shareUserRuntime) trackPlaybackTitle(ctx context.Context, inst *ProxyI
 		defer func() { <-rt.playbackTitleSlots }()
 		lookupCtx, cancel := context.WithTimeout(ctx, playbackTitleLookupTimeout)
 		defer cancel()
-		title := inst.fetchPlaybackTitle(lookupCtx, entry.upstreamUID, entry.upstreamToken, report.identity.itemID, userAgent)
-		if title == "" || lookupCtx.Err() != nil {
+		metadata := inst.fetchPlaybackTitle(lookupCtx, entry.upstreamUID, entry.upstreamToken, report.identity.itemID, userAgent)
+		if metadata == (playbackItemMetadata{}) || lookupCtx.Err() != nil {
 			return
 		}
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
 		if act := rt.activity[tokenHash]; act != nil && act.mediaTitle.current == current && samePlaybackTitleSession(rt.sessions[tokenHash], entry) {
-			current.title = title
+			current.metadata = metadata
 		}
 	}()
 }
 
-func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, policy UAHeaderPolicy, headers upstreamHeaderPolicy) func(context.Context, string, string, string, string) string {
+func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, policy UAHeaderPolicy, headers upstreamHeaderPolicy) func(context.Context, string, string, string, string) playbackItemMetadata {
 	client := &http.Client{
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	return func(ctx context.Context, upstreamUID, token, itemID, userAgent string) string {
+	return func(ctx context.Context, upstreamUID, token, itemID, userAgent string) playbackItemMetadata {
 		if token == "" || !validPlaybackTitlePathID(upstreamUID) || !validPlaybackTitlePathID(itemID) {
-			return ""
+			return playbackItemMetadata{}
 		}
 		endpoint := *target
 		endpoint.Path = singleJoiningSlash(target.Path, "/Users/"+upstreamUID+"/Items/"+itemID)
@@ -229,7 +281,7 @@ func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, pol
 		endpoint.RawQuery = ""
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 		if err != nil {
-			return ""
+			return playbackItemMetadata{}
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Accept-Encoding", "identity")
@@ -240,16 +292,16 @@ func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, pol
 		// #nosec G704 -- the authority comes from the site configuration; validated identifiers only extend its path and redirects are disabled.
 		resp, err := client.Do(req)
 		if err != nil {
-			return ""
+			return playbackItemMetadata{}
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return ""
+			return playbackItemMetadata{}
 		}
 
 		data, err := io.ReadAll(io.LimitReader(resp.Body, playbackTitleBodyLimit+1))
 		if err != nil || len(data) > playbackTitleBodyLimit {
-			return ""
+			return playbackItemMetadata{}
 		}
 		var item struct {
 			Type              string
@@ -257,9 +309,10 @@ func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, pol
 			SeriesName        string
 			ParentIndexNumber *int
 			IndexNumber       *int
+			RunTimeTicks      int64
 		}
 		if json.Unmarshal(data, &item) != nil {
-			return ""
+			return playbackItemMetadata{}
 		}
 		title := strings.TrimSpace(item.Name)
 		if strings.EqualFold(item.Type, "Episode") {
@@ -271,8 +324,8 @@ func newPlaybackTitleFetchFunc(transport http.RoundTripper, target *url.URL, pol
 			}
 		}
 		if len(title) > 512 {
-			return ""
+			title = ""
 		}
-		return title
+		return playbackItemMetadata{title: title, durationSeconds: max(0, item.RunTimeTicks/embyTicksPerSecond)}
 	}
 }

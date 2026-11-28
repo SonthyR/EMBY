@@ -11,7 +11,7 @@ import ShareTextDialog from '@/components/share/ShareTextDialog.vue'
 import RedeemCodesPanel from '@/components/share/RedeemCodesPanel.vue'
 import { danmakuApi, shareApi, sitesApi, type DanmakuSource, type ShareStatus, type ShareUser, type Site } from '@/api'
 import { usePointerSort } from '@/composables/usePointerSort'
-import { copyText, daysUntil, dateOnly, formatBytes } from '@/utils/format'
+import { copyText, daysUntil, dateOnly, formatBytes, relativeTime } from '@/utils/format'
 import { errorMessage, toast } from '@/stores/toast'
 import { STATUS_LABEL, STATUS_TONE } from '@/components/share/shareStatus'
 
@@ -85,6 +85,20 @@ watch(
       openCreate()
       router.replace({ query: {} })
     }
+  },
+  { immediate: true },
+)
+watch(
+  () => route.query.user,
+  value => {
+    if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return
+    const id = Number(value)
+    if (!Number.isSafeInteger(id)) return
+    viewMode.value = 'users'
+    selectedId.value = id
+    const query = { ...route.query }
+    delete query.user
+    void router.replace({ query })
   },
   { immediate: true },
 )
@@ -298,6 +312,9 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
                     </span>
                   </span>
                   <span class="sub">{{ [user.route_prefix, user.note || user.sites.map(s => s.site_name).join('、')].filter(Boolean).join(' · ') }}</span>
+                  <span class="last-watch" :title="user.last_watched_at ? new Date(user.last_watched_at).toLocaleString() : undefined">
+                    最后观影 · {{ user.last_watched_at ? relativeTime(user.last_watched_at) : '暂无记录' }}
+                  </span>
                 </span>
               </span>
               <span class="status" role="cell">
@@ -477,6 +494,7 @@ const FILTERS: { key: 'all' | ShareStatus; label: string }[] = [
   font-weight: 600;
 }
 .sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.last-watch { font-size: 12px; color: var(--text-2); }
 
 .status-pill {
   display: inline-flex;

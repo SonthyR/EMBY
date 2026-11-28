@@ -86,6 +86,13 @@ onBeforeUnmount(() => {
 watch([range, siteId], loadTrend)
 
 const rate = (bps: number) => formatBytes(bps) + '/s'
+function playbackTime(seconds: number): string {
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor(seconds / 60) % 60
+  const remainder = seconds % 60
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return hours ? `${hours}:${pad(minutes)}:${pad(remainder)}` : `${pad(minutes)}:${pad(remainder)}`
+}
 function uptime(seconds: number) {
   const d = Math.floor(seconds / 86400)
   const h = Math.floor((seconds % 86400) / 3600)
@@ -119,9 +126,10 @@ const current = computed(() => {
   return { down: last?.download_bps || 0, up: last?.upload_bps || 0 }
 })
 const online = computed(() => liveSessions.value.length || shares.value.reduce((n, u) => n + (u.session_count || 0), 0))
-const playingSessions = computed(() => liveSessions.value.filter(s => s.playing))
-const playingCount = computed(() => playingSessions.value.length)
-const displayedSessions = computed(() => (showAllSessions.value ? liveSessions.value : playingSessions.value))
+const watchingSessions = computed(() => liveSessions.value.filter(s => s.playing))
+const pausedCount = computed(() => watchingSessions.value.filter(s => s.now_playing_paused).length)
+const playingCount = computed(() => watchingSessions.value.length - pausedCount.value)
+const displayedSessions = computed(() => (showAllSessions.value ? liveSessions.value : watchingSessions.value))
 const sites = computed(() => [...(snapshot.value?.live_sites || [])].sort((a, b) => (b.monthly_traffic || 0) - (a.monthly_traffic || 0)))
 const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_requests || [0])))
 </script>
@@ -155,7 +163,7 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
         </div>
         <div class="kpi-card">
           <dt>已登录设备</dt>
-          <dd class="num">{{ online }}<small>{{ playingCount ? `台 · ${playingCount} 播放中` : '台在线' }}</small></dd>
+          <dd class="num">{{ online }}<small>{{ watchingSessions.length ? `台 · ${watchingSessions.length} 观影会话` : '台在线' }}</small></dd>
         </div>
       </dl>
 
@@ -208,6 +216,7 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
               <Radio class="h-ico" />
               <span>正在观影</span>
               <span v-if="playingCount" class="pill good">{{ playingCount }} 播放中</span>
+              <span v-if="pausedCount" class="pill warn">{{ pausedCount }} 已暂停</span>
             </h2>
             <button v-if="liveSessions.length" type="button" class="live-toggle" :class="{ open: showAllSessions }" @click="showAllSessions = !showAllSessions">
               <span>{{ showAllSessions ? '仅看播放' : `全部 ${liveSessions.length}` }}</span>
@@ -220,16 +229,22 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
               <span class="dev-badge"><MonitorSmartphone /></span>
               <div class="live-main">
                 <div class="live-title">
-                  <strong class="live-user">{{ s.username }}</strong>
+                  <RouterLink class="live-user" :to="{ path: '/share', query: { user: String(s.share_user_id) } }">
+                    {{ s.username }}
+                  </RouterLink>
                   <span class="live-device">{{ s.device_name || '未知设备' }}</span>
                 </div>
-                <div v-if="s.playing && s.now_playing_title" class="live-media" :title="s.now_playing_title">
-                  {{ s.now_playing_title }}
+                <div v-if="s.playing && (s.now_playing_title || s.now_playing_position_seconds != null)" class="live-media">
+                  <span v-if="s.now_playing_title" class="live-media-title" :title="s.now_playing_title">{{ s.now_playing_title }}</span>
+                  <span v-if="s.now_playing_position_seconds != null" class="live-media-time num">
+                    {{ playbackTime(s.now_playing_position_seconds) }}{{ s.now_playing_duration_seconds ? ` / ${playbackTime(s.now_playing_duration_seconds)}` : '' }}
+                  </span>
                 </div>
                 <div class="live-tags">
                   <span v-if="s.draining" class="pill warn">观影后切换</span>
-                  <span v-else-if="s.playing" class="pill good">播放中{{ s.node_name ? ` · ${s.node_name}` : '' }}</span>
-                  <span v-else-if="s.node_name" class="pill">{{ s.node_name }}</span>
+                  <span v-if="s.playing && s.now_playing_paused" class="pill warn">已暂停{{ s.node_name ? ` · ${s.node_name}` : '' }}</span>
+                  <span v-else-if="s.playing && !s.draining" class="pill good">播放中{{ s.node_name ? ` · ${s.node_name}` : '' }}</span>
+                  <span v-else-if="!s.playing && !s.draining && s.node_name" class="pill">{{ s.node_name }}</span>
                   <span class="faint live-meta" :title="s.client_ip">
                     {{ [s.site_name, s.client_region || s.client_ip].filter(Boolean).join(' · ') }}
                   </span>
@@ -524,9 +539,12 @@ h2 {
 .dev-badge svg { width: 15px; height: 15px; }
 .live-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .live-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
-.live-user { font-weight: 600; white-space: nowrap; }
+.live-user { color: inherit; font-weight: 600; white-space: nowrap; text-decoration: none; }
+.live-user:hover, .live-user:focus-visible { text-decoration: underline; }
 .live-device { color: var(--text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.live-media { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-media { display: flex; align-items: baseline; gap: 8px; min-width: 0; font-size: 13px; }
+.live-media-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-media-time { flex-shrink: 0; color: var(--text-2); font-size: 12px; white-space: nowrap; }
 .live-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .live-meta { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }

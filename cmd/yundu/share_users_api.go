@@ -53,6 +53,7 @@ type ShareUser struct {
 	DanmakuSources   []shareSelfDanmakuSource `json:"danmaku_sources,omitempty"`
 	CreatedAt        string                   `json:"created_at"`
 	UpdatedAt        string                   `json:"updated_at"`
+	LastWatchedAt    string                   `json:"last_watched_at,omitempty"`
 }
 
 type ShareUserSiteInput struct {
@@ -81,6 +82,7 @@ type storedShareUser struct {
 	passwordCiphertext string
 	portalToken        string
 	danmakuToken       string
+	lastWatchedMS      int64
 }
 
 func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
@@ -90,8 +92,8 @@ func (d *DB) getShareUser(id int64) (*storedShareUser, error) {
 func (d *DB) getShareUserWhere(where string, arg any) (*storedShareUser, error) {
 	var item storedShareUser
 	var enabled int
-	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, max_concurrent_streams, traffic_reset_day, speed_limit, portal_token, danmaku_token, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM share_users WHERE `+where, arg).
-		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.MaxConcurrentStreams, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.danmakuToken, &item.CreatedAt, &item.UpdatedAt)
+	err := d.db.QueryRow(`SELECT id, username, password_ciphertext, route_prefix, note, enabled, expires_at, traffic_quota, traffic_used, max_devices, max_concurrent_streams, traffic_reset_day, speed_limit, portal_token, danmaku_token, COALESCE(created_at, ''), COALESCE(updated_at, ''), last_watched_at_ms FROM share_users WHERE `+where, arg).
+		Scan(&item.ID, &item.Username, &item.passwordCiphertext, &item.RoutePrefix, &item.Note, &enabled, &item.ExpiresAt, &item.TrafficQuota, &item.TrafficUsed, &item.MaxDevices, &item.MaxConcurrentStreams, &item.ResetDay, &item.SpeedLimit, &item.portalToken, &item.danmakuToken, &item.CreatedAt, &item.UpdatedAt, &item.lastWatchedMS)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +388,14 @@ func (a *App) saveShareUser(id int64, input ShareUserInput) (int64, error) {
 
 func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin string) ShareUser {
 	view := item.ShareUser
+	lastWatchedMS := item.lastWatchedMS
 	if a.pm != nil && a.pm.shares != nil {
+		rt := a.pm.shares
+		rt.mu.RLock()
+		if state := rt.users[item.ID]; state != nil {
+			lastWatchedMS = max(lastWatchedMS, state.lastWatchedMS)
+		}
+		rt.mu.RUnlock()
 		used, _ := a.pm.shares.usage(item.ID)
 		if used > view.TrafficUsed {
 			view.TrafficUsed = used
@@ -394,6 +403,9 @@ func (a *App) shareUserView(item *storedShareUser, includeSecrets bool, origin s
 		view.SessionCount = a.pm.shares.deviceCount(item.ID)
 		view.ActiveStreams = a.pm.shares.activeStreamCountForUser(item.ID, "", time.Now())
 		view.DrainingSessions = a.pm.shares.drainingCount(item.ID)
+	}
+	if lastWatchedMS > 0 {
+		view.LastWatchedAt = time.UnixMilli(lastWatchedMS).UTC().Format(time.RFC3339Nano)
 	}
 	if view.ResetDay > 0 {
 		if _, next := shareResetPeriod(time.Now().In(a.db.shareLocation()), view.ResetDay); !next.IsZero() {
