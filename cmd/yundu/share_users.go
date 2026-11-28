@@ -190,6 +190,7 @@ type shareSessionActivity struct {
 	lastNodeName   string
 	draining       bool
 	drainingSince  time.Time
+	mediaTitle     sharePlaybackTitleState
 }
 
 func (a *shareSessionActivity) isWatching(now time.Time) bool {
@@ -273,6 +274,7 @@ type shareUserRuntime struct {
 	lastSeen      map[string]time.Time
 	dirtyClientIP map[string]string
 	activity      map[string]*shareSessionActivity
+	playbackTitleSlots chan struct{}
 	drainTimer    *time.Timer
 	failures      map[string]*shareLoginFailure
 	revoking      map[int64]bool
@@ -299,6 +301,7 @@ func newShareUserRuntime(db *DB, pm *ProxyManager) *shareUserRuntime {
 		lastSeen:      make(map[string]time.Time),
 		dirtyClientIP: make(map[string]string),
 		activity:      make(map[string]*shareSessionActivity),
+		playbackTitleSlots: make(chan struct{}, playbackTitleLookupSlots),
 		failures:      make(map[string]*shareLoginFailure),
 		revoking:      make(map[int64]bool),
 		handoffLocks:  make(map[string]*sync.Mutex),
@@ -1031,6 +1034,10 @@ func (rt *shareUserRuntime) acquireRequestActivity(userID int64, tokenHash strin
 				}
 			}
 			if isStopped {
+				if report, ok := r.Context().Value(playbackTitleReportKey{}).(playbackTitleReport); ok && act.mediaTitle.ignoresStop(report, report.at) {
+					rt.mu.Unlock()
+					return
+				}
 				act.playing = false
 				if act.activeStreams == 0 {
 					act.lastPlaybackAt = time.Time{}
@@ -1436,6 +1443,10 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 				rt.dirtyClientIP[hash] = clientIP
 			}
 			rt.mu.Unlock()
+		}
+		if report, ok := readPlaybackTitleReport(r); ok {
+			report.at = now
+			r = r.WithContext(context.WithValue(r.Context(), playbackTitleReportKey{}, report))
 		}
 		finish, blocked, limit := rt.acquireRequestActivity(entry.userID, hash, r, now, true)
 		if blocked {
@@ -2035,6 +2046,7 @@ type liveShareSessionView struct {
 	ClientRegion string `json:"client_region,omitempty"`
 	NodeName     string `json:"node_name,omitempty"`
 	Playing      bool   `json:"playing"`
+	NowPlayingTitle string `json:"now_playing_title,omitempty"`
 	Draining     bool   `json:"draining,omitempty"`
 	LastSeenAt   string `json:"last_seen_at"`
 }
@@ -2183,6 +2195,9 @@ func (rt *shareUserRuntime) listAllLiveSessions() ([]liveShareSessionView, error
 		if act := rt.activity[result[i].SessionID]; act != nil {
 			result[i].Draining = act.draining
 			result[i].Playing = act.isWatching(now)
+			if current := act.mediaTitle.current; result[i].Playing && current != nil && now.Sub(act.mediaTitle.updatedAt) < sharePlayingIdleTimeout {
+				result[i].NowPlayingTitle = current.title
+			}
 			if act.lastNodeName != "" {
 				if act.lastNodeName == defaultMasterNodeName {
 					result[i].NodeName = masterName

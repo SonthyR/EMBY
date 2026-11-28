@@ -163,6 +163,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	inst.shareLogout = newShareLogoutFunc(egressTransport, target, policy, configuredHeaders)
 	inst.shareLogin = newShareLoginFunc(egressTransport, target, policy, configuredHeaders)
 	inst.fetchSiteIcon = newSiteIconFetchFunc(egressTransport, target, policy, configuredHeaders)
+	inst.fetchPlaybackTitle = newPlaybackTitleFetchFunc(egressTransport, target, policy, configuredHeaders)
 	baseTransport := egressTransport
 	if pingCacheState != nil {
 		baseTransport = &pingCacheTransport{base: baseTransport, cache: pingCacheState}
@@ -488,6 +489,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		if shareSessionHash != "" && pm.shares != nil {
 			pm.shares.applyUpstreamToken(r, shareSessionHash)
 			pm.shares.applyUpstreamUserID(r, shareSessionHash)
+			if observe := pm.shares.preparePlaybackTitleReport(inst, shareSessionHash, r); observe != nil {
+				defer func() {
+					if status := requestLogWriter.statusCode; status >= 200 && status < 300 {
+						observe()
+					}
+				}()
+			}
 		}
 		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash, edgeFullResolved, edgeFullDecision))
 		if isReservedDynamicRoute(r.URL.Path) {

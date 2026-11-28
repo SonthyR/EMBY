@@ -618,6 +618,7 @@ func (rt *shareUserRuntime) commitPersonalRouteSiteHandoff(ctx context.Context, 
 			act.drainingSince = time.Time{}
 			act.playing = false
 			act.lastPlaybackAt = time.Time{}
+			act.mediaTitle = sharePlaybackTitleState{}
 			act.hasNode = false
 			act.lastNodeID = 0
 			act.lastNodeName = ""

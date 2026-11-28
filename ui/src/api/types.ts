@@ -74,6 +74,7 @@ export interface LiveShareSession {
   client_region?: string
   node_name?: string
   playing?: boolean
+  now_playing_title?: string
   draining?: boolean
   created_at?: string
   last_seen_at: string

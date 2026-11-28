@@ -223,6 +223,9 @@ const maxRequests = computed(() => Math.max(1, ...(insights.value?.hourly_reques
                   <strong class="live-user">{{ s.username }}</strong>
                   <span class="live-device">{{ s.device_name || '未知设备' }}</span>
                 </div>
+                <div v-if="s.playing && s.now_playing_title" class="live-media" :title="s.now_playing_title">
+                  {{ s.now_playing_title }}
+                </div>
                 <div class="live-tags">
                   <span v-if="s.draining" class="pill warn">观影后切换</span>
                   <span v-else-if="s.playing" class="pill good">播放中{{ s.node_name ? ` · ${s.node_name}` : '' }}</span>
@@ -523,6 +526,7 @@ h2 {
 .live-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .live-user { font-weight: 600; white-space: nowrap; }
 .live-device { color: var(--text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-media { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .live-meta { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
