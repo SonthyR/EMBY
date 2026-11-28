@@ -52,6 +52,7 @@ type ip2regionResult struct {
 	ISPLabel      string `json:"isp_label"`
 	ISOCode       string `json:"iso_code,omitempty"`
 	NonMainlandCN bool   `json:"non_mainland_cn"`
+	MainlandCN    bool   `json:"-"`
 }
 
 func ispGroupLabel(group string) string {
@@ -209,6 +210,7 @@ func parseIP2RegionRaw(raw string) ip2regionResult {
 	}
 	found := len(regionParts) > 0 || isp != "" || isoCode != ""
 	group := classifyISPGroup(isp)
+	nonMainland := found && isNonMainlandChina(country, regionParts, isoCode)
 	return ip2regionResult{
 		Found:         found,
 		Raw:           raw,
@@ -217,7 +219,8 @@ func parseIP2RegionRaw(raw string) ip2regionResult {
 		ISPGroup:      group,
 		ISPLabel:      ispGroupLabel(group),
 		ISOCode:       isoCode,
-		NonMainlandCN: found && isNonMainlandChina(country, regionParts, isoCode),
+		NonMainlandCN: nonMainland,
+		MainlandCN:    !nonMainland && (isoCode == "CN" || country == "中国" || strings.EqualFold(country, "china")),
 	}
 }
 

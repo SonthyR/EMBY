@@ -10,6 +10,7 @@ import UiSwitch from '@/components/ui/UiSwitch.vue'
 import {
   ip2regionApi,
   ispRoutesApi,
+  type EdgeClientIPCheckMode,
   type IP2RegionLookupResult,
   type IP2RegionStatus,
   type ISPRouteGroup,
@@ -25,6 +26,12 @@ import { usePointerSort } from '@/composables/usePointerSort'
 const groups = ref<ISPRouteGroup[]>([])
 const blockNonMainland = ref(false)
 const edgeBindClientIP = ref(true)
+const edgeClientIPCheckMode = ref<EdgeClientIPCheckMode>('compatible')
+const legacyIPCheckNodes = ref(0)
+const edgeClientIPModes = [
+  { value: 'compatible', label: '兼容模式' },
+  { value: 'strict', label: '严格模式' },
+] as const
 const savingNonMainland = ref(false)
 const savingEdgeBindIP = ref(false)
 const dbStatus = ref<IP2RegionStatus>({
@@ -44,6 +51,7 @@ const testResult = ref<IP2RegionLookupResult | null>(null)
 const testError = ref('')
 
 const pointerSort = usePointerSort()
+let guardSettingsRevision = 0
 
 function formatTimestamp(raw?: string): string {
   if (!raw) return ''
@@ -55,12 +63,11 @@ function formatTimestamp(raw?: string): string {
 
 async function load(silent = false) {
   if (pointerSort.isDragging.value || savingGroup.value || savingNonMainland.value || savingEdgeBindIP.value) return
+  const guardRevision = guardSettingsRevision
   if (!silent) loading.value = true
   try {
     const [routeRes, ipStatus] = await Promise.all([ispRoutesApi.get(), ip2regionApi.status()])
-    groups.value = routeRes.groups || []
-    blockNonMainland.value = !!routeRes.block_non_mainland
-    edgeBindClientIP.value = routeRes.edge_bind_client_ip !== false
+    if (guardRevision === guardSettingsRevision) applyRouteSettings(routeRes)
     dbStatus.value = ipStatus
     loadError.value = ''
   } catch (error) {
@@ -76,6 +83,14 @@ onMounted(() => {
   timer = setInterval(() => document.visibilityState === 'visible' && load(true), 15000)
 })
 onBeforeUnmount(() => clearInterval(timer))
+
+function applyRouteSettings(response: ISPRoutesResponse) {
+  groups.value = response.groups || []
+  blockNonMainland.value = !!response.block_non_mainland
+  edgeBindClientIP.value = response.edge_bind_client_ip !== false
+  edgeClientIPCheckMode.value = response.edge_bind_client_ip_mode ?? 'compatible'
+  legacyIPCheckNodes.value = response.legacy_ip_check_nodes ?? 0
+}
 
 async function persistGroup(groupKey: string) {
   const group = groups.value.find(g => g.group === groupKey)
@@ -144,6 +159,8 @@ async function toggleNodeEnabled(groupKey: string, node: ISPRouteNode, value: bo
 }
 
 async function toggleBlockNonMainland(value: boolean) {
+  if (savingNonMainland.value || savingEdgeBindIP.value) return
+  guardSettingsRevision++
   if (value && !dbStatus.value.v4.downloaded) {
     const ok = await confirm({
       title: '尚未下载 IPv4 地区库',
@@ -155,9 +172,7 @@ async function toggleBlockNonMainland(value: boolean) {
   savingNonMainland.value = true
   try {
     const res = await ispRoutesApi.setBlockNonMainland(value)
-    blockNonMainland.value = !!res.block_non_mainland
-    edgeBindClientIP.value = res.edge_bind_client_ip !== false
-    groups.value = res.groups || []
+    applyRouteSettings(res)
     toast.success(value ? '已开启：海外 / 非中国大陆 IP 将禁止连接 Emby' : '已关闭海外 / 非中国大陆 IP 拦截')
   } catch (error) {
     toast.error(errorMessage(error, '保存配置失败'))
@@ -168,16 +183,30 @@ async function toggleBlockNonMainland(value: boolean) {
 }
 
 async function toggleEdgeBindClientIP(value: boolean) {
+  if (savingEdgeBindIP.value || savingNonMainland.value) return
+  guardSettingsRevision++
   savingEdgeBindIP.value = true
   try {
     const res = await ispRoutesApi.setEdgeBindClientIP(value)
-    blockNonMainland.value = !!res.block_non_mainland
-    edgeBindClientIP.value = res.edge_bind_client_ip !== false
-    groups.value = res.groups || []
+    applyRouteSettings(res)
     toast.success(value ? '已开启从机客户端 IP 校验（防主控直连但从机走梯子）' : '已关闭从机客户端 IP 校验')
   } catch (error) {
     toast.error(errorMessage(error, '保存配置失败'))
     await load(true)
+  } finally {
+    savingEdgeBindIP.value = false
+  }
+}
+
+async function setEdgeClientIPCheckMode(mode: EdgeClientIPCheckMode) {
+  if (mode === edgeClientIPCheckMode.value || savingEdgeBindIP.value || savingNonMainland.value) return
+  guardSettingsRevision++
+  savingEdgeBindIP.value = true
+  try {
+    const res = await ispRoutesApi.setEdgeClientIPCheckMode(mode)
+    applyRouteSettings(res)
+  } catch (error) {
+    toast.error(errorMessage(error, '保存从机客户端 IP 校验模式失败'))
   } finally {
     savingEdgeBindIP.value = false
   }
@@ -445,7 +474,7 @@ async function deleteIPDB(version: 'v4' | 'v6') {
             </div>
             <UiSwitch
               :model-value="blockNonMainland"
-              :disabled="savingNonMainland"
+              :disabled="savingNonMainland || savingEdgeBindIP"
               @update:model-value="toggleBlockNonMainland"
             />
           </div>
@@ -453,18 +482,38 @@ async function deleteIPDB(version: 'v4' | 'v6') {
           <div v-if="blockNonMainland" class="guard-sub">
             <div class="guard-sub-meta">
               <div class="guard-title">
-                <strong>从机同步校验客户端 IP（防主控直连但从机走梯子）</strong>
-                <span v-if="edgeBindClientIP" class="active-chip">已开启 · 防偷跑 & 防盗链</span>
+                <strong>从机客户端 IP 校验</strong>
               </div>
               <p class="faint guard-desc">
-                主控签发 307 播放票据时加密写入已核验的大陆 IP；从机收到拉流请求若实际来源 IP 不一致（例如视频流被拐进代理或播放链接被转发），立即返回 403 拒流并在朋友自助页顶部弹出提醒（需从机升级至 v1.5.11+）。若朋友宽带存在 IPv4/IPv6 双栈混走，可关闭此项。
+                {{ edgeClientIPCheckMode === 'compatible'
+                  ? 'IP 不同时，两端都识别为中国大陆且同属移动、电信或联通才允许播放。'
+                  : '主控与从机看到的客户端 IP 必须完全相同。' }}
+              </p>
+              <p v-if="edgeBindClientIP && edgeClientIPCheckMode === 'compatible' && legacyIPCheckNodes" class="guard-desc guard-notice">
+                {{ legacyIPCheckNodes }} 台在线从机尚不支持兼容模式，仍按严格模式校验。
               </p>
             </div>
-            <UiSwitch
-              :model-value="edgeBindClientIP"
-              :disabled="savingEdgeBindIP"
-              @update:model-value="toggleEdgeBindClientIP"
-            />
+            <div class="guard-controls">
+              <div class="seg" role="group" aria-label="从机客户端 IP 校验模式">
+                <button
+                  v-for="mode in edgeClientIPModes"
+                  :key="mode.value"
+                  type="button"
+                  :class="{ on: edgeClientIPCheckMode === mode.value }"
+                  :aria-pressed="edgeClientIPCheckMode === mode.value"
+                  :disabled="!edgeBindClientIP || savingEdgeBindIP || savingNonMainland"
+                  @click="setEdgeClientIPCheckMode(mode.value)"
+                >
+                  {{ mode.label }}
+                </button>
+              </div>
+              <UiSwitch
+                aria-label="启用从机客户端 IP 校验"
+                :model-value="edgeBindClientIP"
+                :disabled="savingEdgeBindIP || savingNonMainland"
+                @update:model-value="toggleEdgeBindClientIP"
+              />
+            </div>
           </div>
         </div>
 
@@ -790,6 +839,12 @@ async function deleteIPDB(version: 'v4' | 'v6') {
 .guard-main { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .guard-sub { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 14px; padding-left: 30px; border-top: 1px dashed color-mix(in srgb, var(--bad) 24%, var(--border)); }
 .guard-sub-meta { flex: 1; min-width: 0; }
+.guard-controls { display: inline-flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.guard-notice { color: var(--warn); }
+.guard-controls .seg button:disabled { cursor: default; }
+@media (max-width: 660px) {
+  .guard-sub { align-items: flex-start; flex-direction: column; padding-left: 0; }
+}
 .guard-meta { display: flex; align-items: flex-start; gap: 12px; flex: 1; min-width: 0; }
 .guard-icon { width: 18px; height: 18px; margin-top: 2px; color: var(--text-2); flex-shrink: 0; }
 .guard-bar.active .guard-icon { color: var(--bad); }

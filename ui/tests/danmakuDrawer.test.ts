@@ -219,7 +219,7 @@ describe('DanmakuDrawer & MyAccountView 弹幕服务 (v1.5.10)', () => {
 
     const alertWrapper = mount(MyAccountView)
     await flushPromises()
-    expect(alertWrapper.text()).toContain('疑似走了代理 / 梯子')
+    expect(alertWrapper.text()).toContain('从机因客户端 IP 不一致拦截了播放')
     expect(alertWrapper.text()).toContain('RFC-JPCO')
     expect(alertWrapper.text()).toContain('DOMAIN-SUFFIX,emby.example.com,DIRECT')
     alertWrapper.unmount()

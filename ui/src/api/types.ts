@@ -380,9 +380,13 @@ export interface ISPRouteGroup {
   nodes: ISPRouteNode[]
 }
 
+export type EdgeClientIPCheckMode = 'compatible' | 'strict'
+
 export interface ISPRoutesResponse {
   block_non_mainland: boolean
   edge_bind_client_ip?: boolean
+  edge_bind_client_ip_mode?: EdgeClientIPCheckMode
+  legacy_ip_check_nodes?: number
   groups: ISPRouteGroup[]
 }
 

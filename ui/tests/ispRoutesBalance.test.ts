@@ -8,6 +8,7 @@ const mockApi = vi.hoisted(() => ({
   setStrategy: vi.fn(),
   setGroupBlock: vi.fn(),
   setBlockNonMainland: vi.fn(),
+  setEdgeClientIPCheckMode: vi.fn(),
   ipStatus: vi.fn(),
 }))
 
@@ -18,6 +19,7 @@ vi.mock('@/api', () => ({
     setStrategy: mockApi.setStrategy,
     setGroupBlock: mockApi.setGroupBlock,
     setBlockNonMainland: mockApi.setBlockNonMainland,
+    setEdgeClientIPCheckMode: mockApi.setEdgeClientIPCheckMode,
   },
   ip2regionApi: {
     status: mockApi.ipStatus,
@@ -141,5 +143,36 @@ describe('IspRoutesView 阶梯负载均衡与策略精简 (v1.5.3)', () => {
       { node_id: 1, enabled: true, max_balance_streams: 3 },
       { node_id: 0, enabled: true },
     ])
+    wrapper.unmount()
+  })
+
+  it('默认选中兼容，提示在线旧从机，并能切换到严格模式', async () => {
+    mockApi.get.mockResolvedValue({
+      block_non_mainland: true,
+      edge_bind_client_ip: true,
+      legacy_ip_check_nodes: 2,
+      groups: [],
+    })
+    mockApi.setEdgeClientIPCheckMode.mockResolvedValue({
+      block_non_mainland: true,
+      edge_bind_client_ip: true,
+      edge_bind_client_ip_mode: 'strict',
+      legacy_ip_check_nodes: 2,
+      groups: [],
+    })
+    const wrapper = mount(IspRoutesView, { global: { stubs: { SpeedtestDrawer: true } } })
+    await flushPromises()
+    const [compatible, strict] = wrapper.findAll('.guard-controls .seg button')
+    expect(compatible.attributes('aria-pressed')).toBe('true')
+    expect(strict.attributes('aria-pressed')).toBe('false')
+    expect(wrapper.text()).toContain('2 台在线从机尚不支持兼容模式')
+
+    await strict.trigger('click')
+    await flushPromises()
+    expect(mockApi.setEdgeClientIPCheckMode).toHaveBeenCalledWith('strict')
+    expect(compatible.attributes('aria-pressed')).toBe('false')
+    expect(strict.attributes('aria-pressed')).toBe('true')
+    expect(wrapper.text()).not.toContain('2 台在线从机尚不支持兼容模式')
+    wrapper.unmount()
   })
 })

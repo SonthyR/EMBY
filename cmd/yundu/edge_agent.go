@@ -845,6 +845,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	req.Header.Set("X-Yundu-Direct-Popup", "1")
 	req.Header.Set("X-Yundu-Egress-Capable", "1")
 	req.Header.Set(edgeAgentDynamicGuardHeader, edgeAgentDynamicGuardVersion)
+	req.Header.Set(edgeIPCompatHeader, "1")
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
 
 	resp, err := a.masterClient.Do(req)
@@ -1325,15 +1326,17 @@ func (a *edgeAgent) handler() http.Handler {
 			writeShareJSONError(w, http.StatusUnauthorized, reason)
 			return
 		}
-		if ticket.ClientIP != "" {
+		switch verdict := a.checkPlaybackClientIP(r, sealed, ticket); verdict {
+		case edgeIPExactMatch:
+		case edgeIPSameCarrier:
+			log.Printf("edge agent: allowed stream with different client IP (reason=%s user=%d site=%d)", verdict, ticket.ShareUserID, ticket.SiteID)
+		default:
 			expectedIP := normalizeRawIPString(ticket.ClientIP)
 			peerIP := a.clientPeerIP(r)
-			if expectedIP != "" && peerIP != expectedIP {
 				a.recordIPMismatch(ticket.ShareUserID, ticket.SiteID, expectedIP, peerIP)
-				log.Printf("edge agent: rejected stream (client IP mismatch: ticket=%s peer=%s user=%d)", expectedIP, peerIP, ticket.ShareUserID)
-				writeShareJSONError(w, http.StatusForbidden, "检测到视频播放连接来源 IP 与登录 IP 不一致，疑似开启了海外代理或梯子，请关闭代理或将从机域名加入直连规则后重试")
+			log.Printf("edge agent: rejected stream (client IP mismatch: ticket=%s peer=%s user=%d reason=%s)", expectedIP, peerIP, ticket.ShareUserID, verdict)
+			writeShareJSONError(w, http.StatusForbidden, edgeClientIPRejectionMessage(verdict))
 				return
-			}
 		}
 
 		var targetURL *url.URL

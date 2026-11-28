@@ -280,9 +280,15 @@ func writeEdgePlaybackRedirectWithGuard(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
-	var boundClientIP string
-	if pm != nil && pm.edges != nil && pm.edges.shouldBindEdgeClientIP() {
+	var boundClientIP, ipCheckMode string
+	if pm != nil && pm.edges != nil {
+		mode := pm.edges.edgeClientIPCheckMode(decision.NodeID)
+		if mode != "" {
 		boundClientIP = normalizeEdgeBindIP(clientIP)
+			if boundClientIP != "" && mode == edgeIPModeCompatible {
+				ipCheckMode = mode
+			}
+		}
 	}
 	ticket := edgePlaybackTicket{
 		NodeID:       decision.NodeID,
@@ -290,6 +296,7 @@ func writeEdgePlaybackRedirectWithGuard(w http.ResponseWriter, r *http.Request, 
 		ShareUserID:  shareUserID,
 		TokenHash:    shareTokenHash,
 		ClientIP:     boundClientIP,
+		IPCheckMode:  ipCheckMode,
 		TargetURL:    targetURL.String(),
 		Headers:      headers,
 		SpeedMbps:    speedMbps,

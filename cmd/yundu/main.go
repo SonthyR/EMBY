@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.1"
+var appVersion = "v1.8.2"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -316,6 +316,7 @@ func main() {
 	mux.HandleFunc("/api/ip2region", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/ip2region/", cors(app.authMiddleware(app.handleIP2Region)))
 	mux.HandleFunc("/api/agent/heartbeat", app.handleAgentHeartbeat)
+	mux.HandleFunc(edgeIPCheckPath, app.handleAgentClientIPCheck)
 	mux.HandleFunc("/api/me/login", cors(app.csrfMiddleware(app.handleShareSelfLogin)))
 	mux.HandleFunc("/api/me/logout", cors(app.handleShareSelfLogout))
 	mux.HandleFunc("/api/me", cors(app.handleShareSelf))

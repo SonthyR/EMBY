@@ -314,9 +314,9 @@ async function changePassword() {
         <div v-if="me.edge_ip_alert" class="net-alert">
           <ShieldBan class="net-ico" />
           <div class="alert-body">
-            <strong>检测到刚才播放视频时疑似走了代理 / 梯子（已被从机拦截）</strong>
+            <strong>从机因客户端 IP 不一致拦截了播放</strong>
             <p>
-              {{ relativeTime(me.edge_ip_alert.occurred_at) }}在「{{ me.edge_ip_alert.node_name }}」节点拉流时，视频连接来源为「{{ [me.edge_ip_alert.actual_region, me.edge_ip_alert.actual_isp, me.edge_ip_alert.actual_ip].filter(Boolean).join(' · ') }}」，与直连登录 IP（{{ me.edge_ip_alert.expected_ip }}）不一致。请关闭代理，或在代理软件中添加直连规则后再播放。
+              {{ relativeTime(me.edge_ip_alert.occurred_at) }}在「{{ me.edge_ip_alert.node_name }}」节点拉流时，视频连接来源为「{{ [me.edge_ip_alert.actual_region, me.edge_ip_alert.actual_isp, me.edge_ip_alert.actual_ip].filter(Boolean).join(' · ') }}」，与主控签发播放链接时看到的 IP（{{ me.edge_ip_alert.expected_ip }}）不一致。如果正在使用代理，请将主控和从机的播放域名都设为直连后重试。
             </p>
             <div v-if="me.edge_ip_alert.direct_rule" class="direct-rule-row">
               <code class="mono">DOMAIN-SUFFIX,{{ me.edge_ip_alert.direct_rule }},DIRECT</code>

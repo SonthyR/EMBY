@@ -80,17 +80,19 @@ func TestEdgePlaybackClientIPBindingAndMismatchAlert(t *testing.T) {
 		t.Fatalf("enable block_non_mainland status=%d body=%s", putRec.Code, putRec.Body.String())
 	}
 	var routesPayload struct {
-		BlockNonMainland bool `json:"block_non_mainland"`
-		EdgeBindClientIP bool `json:"edge_bind_client_ip"`
+		BlockNonMainland bool   `json:"block_non_mainland"`
+		EdgeBindClientIP bool   `json:"edge_bind_client_ip"`
+		Mode             string `json:"edge_bind_client_ip_mode"`
 	}
 	_ = json.Unmarshal(putRec.Body.Bytes(), &routesPayload)
-	if !routesPayload.BlockNonMainland || !routesPayload.EdgeBindClientIP {
-		t.Fatalf("expected block_non_mainland=true and edge_bind_client_ip=true, got %+v", routesPayload)
+	if !routesPayload.BlockNonMainland || !routesPayload.EdgeBindClientIP || routesPayload.Mode != edgeIPModeCompatible {
+		t.Fatalf("expected enabled compatible mode, got %+v", routesPayload)
 	}
 
 	// Create Edge Node and local edgeAgent
 	masterMux := http.NewServeMux()
 	masterMux.HandleFunc("/api/agent/heartbeat", app.handleAgentHeartbeat)
+	masterMux.HandleFunc(edgeIPCheckPath, app.handleAgentClientIPCheck)
 	masterSrv := httptest.NewServer(masterMux)
 	defer masterSrv.Close()
 
@@ -172,13 +174,54 @@ func TestEdgePlaybackClientIPBindingAndMismatchAlert(t *testing.T) {
 		t.Fatalf("unexpected edge_ip_alert payload: %+v", meView.EdgeIPAlert)
 	}
 
-	// 4. Disabling edge_bind_client_ip turns off binding
+	// 4. The agent advertises support in its heartbeat and accepts a signed compatible ticket.
+	mode := edgeRT.edgeClientIPCheckMode(node.ID)
+	if mode != edgeIPModeCompatible {
+		t.Fatalf("expected agent heartbeat to enable compatible tickets, got %q", mode)
+	}
+	compatible, err := sealEdgePlaybackTicket(nodeToken, edgePlaybackTicket{
+		NodeID: node.ID, SiteID: site.ID, ShareUserID: user.ID,
+		TargetURL: upstream.URL + "/Videos/1/stream.mp4",
+		ClientIP:  "1.2.3.4", IPCheckMode: mode, ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatiblePath := edgeTicketPathPrefix + compatible + "/stream.mp4"
+	simulatedPeerIP = "1.2.3.5"
+	compatRec := httptest.NewRecorder()
+	agent.handler().ServeHTTP(compatRec, httptest.NewRequest(http.MethodGet, compatiblePath, nil))
+	if compatRec.Code != http.StatusOK || compatRec.Body.String() != "VIDEO-DATA" {
+		t.Fatalf("same mainland carrier failed: %d %s", compatRec.Code, compatRec.Body.String())
+	}
+	simulatedPeerIP = "45.6.7.8"
+	hitsBefore = upstreamHits.Load()
+	foreignRec := httptest.NewRecorder()
+	agent.handler().ServeHTTP(foreignRec, httptest.NewRequest(http.MethodGet, compatiblePath, nil))
+	if foreignRec.Code != http.StatusForbidden || upstreamHits.Load() != hitsBefore {
+		t.Fatalf("foreign request must be denied before upstream: %d %s", foreignRec.Code, foreignRec.Body.String())
+	}
+
+	// 5. Saving strict mode applies to new and outstanding compatible tickets.
+	strictRec := httptest.NewRecorder()
+	app.handleISPRoutes(strictRec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"edge_bind_client_ip_mode":"strict"}`)))
+	if strictRec.Code != http.StatusOK || edgeRT.edgeClientIPCheckMode(node.ID) != edgeIPModeStrict {
+		t.Fatalf("strict mode did not persist: %d %s", strictRec.Code, strictRec.Body.String())
+	}
+	simulatedPeerIP = "1.2.3.5"
+	oldTicketRec := httptest.NewRecorder()
+	agent.handler().ServeHTTP(oldTicketRec, httptest.NewRequest(http.MethodGet, compatiblePath, nil))
+	if oldTicketRec.Code != http.StatusForbidden || upstreamHits.Load() != hitsBefore {
+		t.Fatalf("existing ticket ignored strict mode: %d %s", oldTicketRec.Code, oldTicketRec.Body.String())
+	}
+
+	// 6. Disabling edge_bind_client_ip turns off binding.
 	offRec := httptest.NewRecorder()
 	app.handleISPRoutes(offRec, httptest.NewRequest(http.MethodPut, "/api/isp-routes", strings.NewReader(`{"edge_bind_client_ip":false}`)))
 	if offRec.Code != http.StatusOK {
 		t.Fatalf("disable edge_bind_client_ip status=%d body=%s", offRec.Code, offRec.Body.String())
 	}
-	if edgeRT.shouldBindEdgeClientIP() {
-		t.Fatalf("expected shouldBindEdgeClientIP() to be false after disabling")
+	if mode := edgeRT.edgeClientIPCheckMode(node.ID); mode != "" {
+		t.Fatalf("expected client IP checking to be off, got %q", mode)
 	}
 }

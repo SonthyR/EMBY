@@ -6,6 +6,7 @@ import type {
   DanmakuSourceInput,
   DanmakuTestResult,
   DashboardAnalyticsResponse,
+  EdgeClientIPCheckMode,
   EdgeAutoHTTPSInput,
   EdgeAutoHTTPSStatus,
   EdgeNode,
@@ -383,6 +384,8 @@ export const ispRoutesApi = {
     api.put<ISPRoutesResponse>('/api/isp-routes', { block_non_mainland: blockNonMainland }),
   setEdgeBindClientIP: (edgeBindClientIP: boolean) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { edge_bind_client_ip: edgeBindClientIP }),
+  setEdgeClientIPCheckMode: (mode: EdgeClientIPCheckMode) =>
+    api.put<ISPRoutesResponse>('/api/isp-routes', { edge_bind_client_ip_mode: mode }),
   setSchedule: (patch: ISPRouteSchedulePatch) =>
     api.put<ISPRoutesResponse>('/api/isp-routes', { schedule_patch: patch }),
 }

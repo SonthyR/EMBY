@@ -360,6 +360,7 @@ type edgePlaybackTicket struct {
 	ShareUserID  int64                   `json:"u,omitempty"`
 	TokenHash    string                  `json:"th,omitempty"`
 	ClientIP     string                  `json:"cip,omitempty"`
+	IPCheckMode  string                  `json:"icm,omitempty"`
 	SpeedMbps    int                     `json:"sp,omitempty"`
 	TargetURL    string                  `json:"t"`
 	Headers      map[string]string       `json:"h,omitempty"`
@@ -547,6 +548,7 @@ type edgeNodeLiveState struct {
 	supportsDirectPopup  bool
 	supportsEgress       bool
 	supportsDynamicGuard bool
+	supportsClientIPCompat bool
 	lastAgentInstance    string
 	ispHealth           map[string]*ispHealthState
 	ispProbeSeq         uint64
@@ -759,23 +761,24 @@ type edgeNodeRuntime struct {
 	pm        *ProxyManager
 	ip2region *ip2regionManager
 
-	mu               sync.RWMutex
-	master           masterNodeState
-	nodes            map[int64]*edgeNodeLiveState
-	routes           map[string][]ispRouteRule // isp_group -> ordered rules
-	blocked          map[string]bool           // isp_group -> block_connect enabled
-	strategies       map[string]string         // isp_group -> priority | auto | balance
-	speedMetrics     map[int64]map[string]edgeNodeSpeedMetric
-	rrCounters       map[string]*atomic.Uint64
-	blockNonMainland bool
-	edgeBindClientIP bool
-	ipMismatchAlerts map[int64]edgeIPMismatchAlert
-	ispProbe         ISPProbeSettings
-	ispProbeClaimKey [32]byte
-	pendingISPAlerts []ispProbeAlert
-	flushMu          sync.Mutex
-	reloadMu         sync.Mutex
-	speedReloadMu    sync.Mutex
+	mu                   sync.RWMutex
+	master               masterNodeState
+	nodes                map[int64]*edgeNodeLiveState
+	routes               map[string][]ispRouteRule // isp_group -> ordered rules
+	blocked              map[string]bool           // isp_group -> block_connect enabled
+	strategies           map[string]string         // isp_group -> priority | auto | balance
+	speedMetrics         map[int64]map[string]edgeNodeSpeedMetric
+	rrCounters           map[string]*atomic.Uint64
+	blockNonMainland     bool
+	edgeBindClientIP     bool
+	edgeBindClientIPMode string
+	ipMismatchAlerts     map[int64]edgeIPMismatchAlert
+	ispProbe             ISPProbeSettings
+	ispProbeClaimKey     [32]byte
+	pendingISPAlerts     []ispProbeAlert
+	flushMu              sync.Mutex
+	reloadMu             sync.Mutex
+	speedReloadMu        sync.Mutex
 }
 
 func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNodeRuntime {
@@ -794,6 +797,7 @@ func newEdgeNodeRuntime(db *DB, pm *ProxyManager, ip2 *ip2regionManager) *edgeNo
 		speedMetrics:     make(map[int64]map[string]edgeNodeSpeedMetric),
 		rrCounters:       counters,
 		edgeBindClientIP: true,
+		edgeBindClientIPMode: edgeIPModeCompatible,
 		ipMismatchAlerts: make(map[int64]edgeIPMismatchAlert),
 		ispProbe:         defaultISPProbeSettings(),
 	}
@@ -893,6 +897,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	}
 	blockNonMainland := false
 	edgeBindClientIP := true
+	edgeBindClientIPMode := edgeIPModeCompatible
 	if settingRows, err := rt.db.db.Query(`SELECT isp_group, block_connect, strategy FROM isp_group_settings`); err == nil {
 		for settingRows.Next() {
 			var group, strategy string
@@ -904,6 +909,11 @@ func (rt *edgeNodeRuntime) reload() error {
 					}
 				} else if group == ispSettingEdgeBindIPKey {
 					edgeBindClientIP = block != 0
+				} else if group == edgeIPModeSetting {
+					edgeBindClientIPMode = edgeIPModeStrict
+					if strategy == edgeIPModeCompatible {
+						edgeBindClientIPMode = edgeIPModeCompatible
+					}
 				} else if validISPGroup(group) {
 					if block != 0 {
 						blocked[group] = true
@@ -1048,6 +1058,7 @@ func (rt *edgeNodeRuntime) reload() error {
 	rt.speedMetrics = speedMap
 	rt.blockNonMainland = blockNonMainland
 	rt.edgeBindClientIP = edgeBindClientIP
+	rt.edgeBindClientIPMode = edgeBindClientIPMode
 	rt.ispProbe = ispProbeCfg
 	return nil
 }
@@ -1070,15 +1081,6 @@ func normalizeEdgeBindIP(raw string) string {
 		return ""
 	}
 	return addr.String()
-}
-
-func (rt *edgeNodeRuntime) shouldBindEdgeClientIP() bool {
-	if rt == nil {
-		return false
-	}
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	return rt.blockNonMainland && rt.edgeBindClientIP
 }
 
 func (rt *edgeNodeRuntime) recordIPMismatchEvents(nodeName string, events []agentIPMismatchEvent, now time.Time) {
@@ -2560,15 +2562,28 @@ type ispRouteGroupView struct {
 func (a *App) buildISPRoutesPayload() map[string]any {
 	blockNonMainland := false
 	edgeBindClientIP := true
+	edgeBindClientIPMode := edgeIPModeCompatible
+	legacyIPCheckNodes := 0
 	if a.pm != nil && a.pm.edges != nil {
 		a.pm.edges.mu.RLock()
 		blockNonMainland = a.pm.edges.blockNonMainland
 		edgeBindClientIP = a.pm.edges.edgeBindClientIP
+		if a.pm.edges.edgeBindClientIPMode != edgeIPModeCompatible {
+			edgeBindClientIPMode = edgeIPModeStrict
+		}
+		now := time.Now()
+		for _, node := range a.pm.edges.nodes {
+			if node.enabled && node.isOnline(now) && !node.supportsClientIPCompat {
+				legacyIPCheckNodes++
+			}
+		}
 		a.pm.edges.mu.RUnlock()
 	}
 	return map[string]any{
 		"block_non_mainland":  blockNonMainland,
 		"edge_bind_client_ip": edgeBindClientIP,
+		"edge_bind_client_ip_mode": edgeBindClientIPMode,
+		"legacy_ip_check_nodes":    legacyIPCheckNodes,
 		"groups":              a.buildISPRouteGroups(),
 	}
 }
@@ -2720,6 +2735,7 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			BlockNonMainland *bool   `json:"block_non_mainland"`
 			EdgeBindClientIP *bool   `json:"edge_bind_client_ip"`
+			EdgeBindClientIPMode *string `json:"edge_bind_client_ip_mode"`
 			Group            string  `json:"group"`
 			Strategy         *string `json:"strategy"`
 			BlockConnect     *bool   `json:"block_connect"`
@@ -2745,8 +2761,12 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Group = strings.ToLower(strings.TrimSpace(req.Group))
 		hasGroupOp := req.Group != "" || len(req.Nodes) > 0 || req.BlockConnect != nil || req.Strategy != nil
-		if !hasGroupOp && req.BlockNonMainland == nil && req.EdgeBindClientIP == nil && req.SchedulePatch == nil {
+		if !hasGroupOp && req.BlockNonMainland == nil && req.EdgeBindClientIP == nil && req.EdgeBindClientIPMode == nil && req.SchedulePatch == nil {
 			a.jsonErr(w, http.StatusBadRequest, "线路配置参数无效")
+			return
+		}
+		if req.EdgeBindClientIPMode != nil && *req.EdgeBindClientIPMode != edgeIPModeCompatible && *req.EdgeBindClientIPMode != edgeIPModeStrict {
+			a.jsonErr(w, http.StatusBadRequest, "无效的从机客户端 IP 校验模式")
 			return
 		}
 		if hasGroupOp && (!validISPGroup(req.Group) || (len(req.Nodes) == 0 && req.BlockConnect == nil && req.Strategy == nil)) {
@@ -2813,6 +2833,13 @@ func (a *App) handleISPRoutes(w http.ResponseWriter, r *http.Request) {
 			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET block_connect=excluded.block_connect, updated_at=CURRENT_TIMESTAMP`,
 				ispSettingEdgeBindIPKey, sqliteBool(*req.EdgeBindClientIP)); err != nil {
 				a.jsonErr(w, http.StatusInternalServerError, "保存线路配置失败")
+				return
+			}
+		}
+		if req.EdgeBindClientIPMode != nil {
+			if _, err := tx.Exec(`INSERT INTO isp_group_settings(isp_group, block_connect, strategy, updated_at) VALUES(?, 0, ?, CURRENT_TIMESTAMP) ON CONFLICT(isp_group) DO UPDATE SET strategy=excluded.strategy, updated_at=CURRENT_TIMESTAMP`,
+				edgeIPModeSetting, *req.EdgeBindClientIPMode); err != nil {
+				a.jsonErr(w, http.StatusInternalServerError, "保存从机客户端 IP 校验模式失败")
 				return
 			}
 		}
@@ -3245,6 +3272,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	node.supportsDirectPopup = req.SupportsDirectPopup || strings.TrimSpace(r.Header.Get("X-Yundu-Direct-Popup")) == "1"
 	node.supportsDynamicGuard = strings.TrimSpace(r.Header.Get(edgeAgentDynamicGuardHeader)) == edgeAgentDynamicGuardVersion
+	node.supportsClientIPCompat = strings.TrimSpace(r.Header.Get(edgeIPCompatHeader)) == "1"
 	if strings.TrimSpace(r.Header.Get("X-Yundu-Egress-Capable")) == "1" || agentVersionSupportsEgress(req.Version) {
 		node.supportsEgress = true
 	}
