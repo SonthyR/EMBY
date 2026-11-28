@@ -365,11 +365,18 @@ func (rt *shareUserRuntime) applyUpstreamToken(r *http.Request, tokenHash string
 	rewriteEmbyRequestToken(r, entry.clientToken, entry.upstreamToken)
 }
 
-// dropLocalSession removes the local session state without sending another
-// upstream /Sessions/Logout (used after client-initiated logout or after a
-// failed handoff whose old upstream token was already logged out).
-func (rt *shareUserRuntime) dropLocalSession(tokenHash string) {
+// dropLocalSession removes the source session after a failed edge handoff
+// whose old upstream token was already logged out.
+func (rt *shareUserRuntime) dropLocalSession(tokenHash string, expected shareSessionEntry) {
 	if rt == nil || tokenHash == "" {
+		return
+	}
+	rt.sessionStoreMu.Lock()
+	defer rt.sessionStoreMu.Unlock()
+	rt.mu.RLock()
+	cur, exists := rt.sessions[tokenHash]
+	rt.mu.RUnlock()
+	if !exists || !cur.sameHandoffSource(expected) {
 		return
 	}
 	if rt.db != nil {
@@ -503,76 +510,87 @@ func (rt *shareUserRuntime) maybeHandoffEdgeFull(
 	loginCancel()
 	if loginErr != nil || statusCode != http.StatusOK || newToken == "" {
 		log.Printf("[%s] edge_full handoff login via %s failed (status=%d): %v", site.Name, eval.targetDecision.NodeName, statusCode, loginErr)
-		rt.dropLocalSession(tokenHash)
+		rt.dropLocalSession(tokenHash, entry)
 		return http.StatusUnauthorized, "线路切换后重新登录失败，请重新登录"
 	}
 
 	// Guard against upstream User.Id mismatch so client cached user paths stay valid.
 	if entry.upstreamUID != "" && newUID != "" && entry.upstreamUID != newUID {
 		log.Printf("[%s] edge_full handoff aborted: upstream User.Id changed (%s -> %s)", site.Name, entry.upstreamUID, newUID)
-		if inst.shareLogout != nil {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), shareLogoutTimeout)
-			if eval.targetLockedID > 0 {
-				cleanupCtx = withEdgeEgressTarget(cleanupCtx, edgeEgressTarget{
-					NodeID:    eval.targetDecision.NodeID,
-					NodeName:  eval.targetDecision.NodeName,
-					PublicURL: eval.targetDecision.PublicURL,
-					Token:     eval.targetDecision.Token,
-				})
-			}
-			_ = inst.shareLogout(cleanupCtx, newToken)
-			cleanupCancel()
-		}
-		rt.dropLocalSession(tokenHash)
+		logoutUncommittedHandoffToken(ctx, inst, newToken, eval.targetDecision)
+		rt.dropLocalSession(tokenHash, entry)
 		return http.StatusUnauthorized, "源站账号信息已变更，请重新登录"
 	}
 
 	upCipher, encErr := encryptSiteAccountSecret(newToken)
 	if encErr != nil {
 		log.Printf("[%s] edge_full handoff encrypt token: %v", site.Name, encErr)
-		rt.dropLocalSession(tokenHash)
+		logoutUncommittedHandoffToken(ctx, inst, newToken, eval.targetDecision)
+		rt.dropLocalSession(tokenHash, entry)
 		return http.StatusUnauthorized, "线路切换失败，请重新登录"
 	}
 
-	if _, dbErr := rt.db.db.Exec(
-		`UPDATE share_user_sessions SET upstream_token_ciphertext=?, upstream_user_id=CASE WHEN upstream_user_id='' THEN ? ELSE upstream_user_id END, egress_node_id=?, client_ip=?, last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=?`,
-		upCipher, newUID, eval.targetLockedID, clientIP, tokenHash,
-	); dbErr != nil {
-		log.Printf("[%s] edge_full handoff persist session: %v", site.Name, dbErr)
-	}
-
-	now := time.Now()
 	newNodeName := eval.targetDecision.NodeName
 	if newNodeName == "" {
 		newNodeName = rt.pm.edges.masterDisplayName()
 	}
-	rt.mu.Lock()
-	if cur, exists := rt.sessions[tokenHash]; exists {
-		cur.upstreamToken = newToken
-		if cur.upstreamUID == "" && newUID != "" {
-			cur.upstreamUID = newUID
+	status, message := rt.commitEdgeFullHandoff(tokenHash, entry, newToken, newUID, upCipher, clientIP, eval.clientISPGroup, eval.targetLockedID, newNodeName)
+	if status != 0 {
+		logoutUncommittedHandoffToken(ctx, inst, newToken, eval.targetDecision)
+		return status, message
 		}
-		cur.egressNodeID = eval.targetLockedID
-		if clientIP != "" {
-			cur.clientIP = clientIP
-		}
-		cur.ispGroup = eval.clientISPGroup
-		cur.lastHandoffAt = now
-		rt.sessions[tokenHash] = cur
-	}
-	delete(rt.dirtyClientIP, tokenHash)
-	if act := rt.activity[tokenHash]; act != nil {
-		act.lastNodeName = newNodeName
-		if eval.targetLockedID > 0 {
-			act.lastNodeID = eval.targetLockedID
-		} else {
-			act.lastNodeID = 0
-		}
-		act.hasNode = true
-	}
-	rt.mu.Unlock()
 
 	log.Printf("[%s] edge_full seamless handoff (%s): %s -> %s (client_ip=%s, isp=%s)",
 		site.Name, eval.reason, oldNodeName, newNodeName, clientIP, eval.clientISPGroup)
+	return 0, ""
+}
+
+func (rt *shareUserRuntime) commitEdgeFullHandoff(tokenHash string, prior shareSessionEntry, token, uid, cipher, clientIP, ispGroup string, nodeID int64, nodeName string) (int, string) {
+	rt.sessionStoreMu.Lock()
+	defer rt.sessionStoreMu.Unlock()
+	rt.mu.RLock()
+	cur, exists := rt.sessions[tokenHash]
+	_, revoked := rt.revoked[tokenHash]
+	rt.mu.RUnlock()
+	if !exists || revoked {
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
+	}
+	if !cur.sameHandoffSource(prior) {
+		return http.StatusServiceUnavailable, "会话状态已变更，请重试"
+	}
+	res, err := rt.db.db.Exec(
+		`UPDATE share_user_sessions SET upstream_token_ciphertext=?, upstream_user_id=CASE WHEN upstream_user_id='' THEN ? ELSE upstream_user_id END, egress_node_id=?, client_ip=?, last_seen_at=CURRENT_TIMESTAMP
+		 WHERE token_hash=? AND share_user_id=? AND site_id=?
+		   AND NOT EXISTS (SELECT 1 FROM share_revoked_tokens WHERE token_hash=?)`,
+		cipher, uid, nodeID, clientIP, tokenHash, prior.userID, prior.siteID, tokenHash,
+	)
+	if err != nil {
+		log.Printf("share session #%d edge_full handoff persist: %v", prior.userID, err)
+		return http.StatusServiceUnavailable, "保存线路切换失败，请稍后重试"
+	}
+	if affected, err := res.RowsAffected(); err != nil || affected != 1 {
+		return http.StatusUnauthorized, "登录已失效，请重新登录"
+	}
+
+	rt.mu.Lock()
+	cur = rt.sessions[tokenHash]
+	cur.upstreamToken = token
+	if cur.upstreamUID == "" {
+		cur.upstreamUID = uid
+	}
+	cur.egressNodeID = nodeID
+	if clientIP != "" {
+		cur.clientIP = clientIP
+	}
+	cur.ispGroup = ispGroup
+	cur.lastHandoffAt = time.Now()
+	rt.sessions[tokenHash] = cur
+	delete(rt.dirtyClientIP, tokenHash)
+	if act := rt.activity[tokenHash]; act != nil {
+		act.lastNodeName = nodeName
+		act.lastNodeID = max(0, nodeID)
+		act.hasNode = true
+	}
+	rt.mu.Unlock()
 	return 0, ""
 }

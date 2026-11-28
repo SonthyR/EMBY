@@ -69,7 +69,7 @@ const iconHasImage = ref(false)
 const iconRev = ref(0)
 const iconBusy = ref<'upload' | 'fetch' | 'reset' | 'confirm' | ''>('')
 const iconFileInput = ref<HTMLInputElement | null>(null)
-const pendingAvatarPreview = ref<{ siteId: number; dataUrl: string; contentType: string } | null>(null)
+const pendingIconPreview = ref<{ siteId: number; dataUrl: string; contentType: string } | null>(null)
 const editing = computed(() => !!props.site)
 const caps = computed(() => props.capabilities as Record<string, any>)
 const routeDomain = computed(() => String(caps.value.route_domain || ''))
@@ -78,7 +78,7 @@ const hostAvailable = computed(() => caps.value.host_only_available !== false &&
 watch(
   () => [props.open, props.site?.id ?? 0] as const,
   async ([open]) => {
-    pendingAvatarPreview.value = null
+    pendingIconPreview.value = null
     if (!open) return
     const targetSiteID = props.site?.id ?? 0
     const s = (props.site || {}) as Record<string, any>
@@ -224,7 +224,7 @@ async function onIconFileSelected(event: Event) {
     const blob = await convertFileToIconBlob(file)
     await sitesApi.uploadIcon(targetSiteID, blob)
     if ((props.site?.id ?? 0) === targetSiteID) {
-      pendingAvatarPreview.value = null
+      pendingIconPreview.value = null
       iconSource.value = 'custom'
       iconHasImage.value = true
       iconRev.value = Date.now()
@@ -245,15 +245,15 @@ async function fetchSiteIcon() {
     const res = await sitesApi.fetchIcon(targetSiteID)
     if ((props.site?.id ?? 0) !== targetSiteID) return
     if (res.requires_confirm && res.preview_data_url) {
-      pendingAvatarPreview.value = {
+      pendingIconPreview.value = {
         siteId: targetSiteID,
         dataUrl: res.preview_data_url,
         contentType: res.fetched_type || 'image/png',
       }
-      toast.info('已拉取源站账号头像，请预览确认后设为公开站标')
+      toast.info('已通过源站账号取得图标，请预览确认后设为公开站标')
       return
     }
-    pendingAvatarPreview.value = null
+    pendingIconPreview.value = null
     iconSource.value = res.source
     iconHasImage.value = res.source !== 'default'
     iconRev.value = Date.now()
@@ -265,8 +265,8 @@ async function fetchSiteIcon() {
   }
 }
 
-async function confirmPendingAvatar() {
-  const preview = pendingAvatarPreview.value
+async function confirmPendingIcon() {
+  const preview = pendingIconPreview.value
   if (!preview || preview.siteId <= 0) return
   const targetSiteID = preview.siteId
   iconBusy.value = 'confirm'
@@ -274,7 +274,7 @@ async function confirmPendingAvatar() {
     const blob = dataURLToBlob(preview.dataUrl, preview.contentType)
     await sitesApi.uploadIcon(targetSiteID, blob)
     if ((props.site?.id ?? 0) === targetSiteID) {
-      pendingAvatarPreview.value = null
+      pendingIconPreview.value = null
       iconSource.value = 'custom'
       iconHasImage.value = true
       iconRev.value = Date.now()
@@ -294,7 +294,7 @@ async function resetSiteIcon() {
   try {
     const res = await sitesApi.deleteIcon(targetSiteID)
     if ((props.site?.id ?? 0) === targetSiteID) {
-      pendingAvatarPreview.value = null
+      pendingIconPreview.value = null
       iconSource.value = res.source
       iconHasImage.value = res.source !== 'default'
       iconRev.value = Date.now()
@@ -480,7 +480,7 @@ async function save() {
       <fieldset>
         <legend>源站</legend>
         <UiField label="站点名称" for="se-name"><input id="se-name" v-model="cfg.name" class="input" maxlength="64" :autofocus="!editing" /></UiField>
-        <UiField v-if="editing && site" label="站点图标" help="用于播放器「切服」卡片封面。系统仅自动抓取源站公开品牌图标；使用源站账号头像时需手动预览确认，也可直接上传图片。">
+        <UiField v-if="editing && site" label="站点图标" help="用于播放器「切服」卡片封面。系统仅自动抓取源站公开品牌图标；通过源站账号取得的图标需预览确认，也可直接上传图片。">
           <div class="icon-row">
             <div class="icon-preview">
               <img v-if="iconHasImage" :src="sitesApi.iconUrl(site.id, iconRev)" :alt="cfg.name" @error="iconHasImage = false" />
@@ -496,15 +496,15 @@ async function save() {
               </div>
             </div>
           </div>
-          <div v-if="pendingAvatarPreview && pendingAvatarPreview.siteId === site.id" class="icon-confirm">
+          <div v-if="pendingIconPreview && pendingIconPreview.siteId === site.id" class="icon-confirm">
             <div class="icon-preview">
-              <img :src="pendingAvatarPreview.dataUrl" alt="待确认站标预览" />
+              <img :src="pendingIconPreview.dataUrl" alt="待确认站标预览" />
             </div>
             <div class="icon-meta">
-              <span class="icon-badge">该源站未提供公开站标，已读取配置账号头像。请确认可公开作为全站图标：</span>
+              <span class="icon-badge">已通过源站账号取得图标。请确认这张图片可公开作为站标。</span>
               <div class="icon-actions">
-                <UiButton size="sm" variant="primary" :loading="iconBusy === 'confirm'" :disabled="!!iconBusy" @click="confirmPendingAvatar">确认设为站标</UiButton>
-                <UiButton size="sm" variant="ghost" :disabled="!!iconBusy" @click="pendingAvatarPreview = null">取消</UiButton>
+                <UiButton size="sm" variant="primary" :loading="iconBusy === 'confirm'" :disabled="!!iconBusy" @click="confirmPendingIcon">确认设为站标</UiButton>
+                <UiButton size="sm" variant="ghost" :disabled="!!iconBusy" @click="pendingIconPreview = null">取消</UiButton>
               </div>
             </div>
           </div>

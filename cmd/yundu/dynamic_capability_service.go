@@ -543,6 +543,39 @@ func applyDynamicCapabilityRequiredHeaders(header http.Header, claims dynamicCap
 	}
 }
 
+func (i *dynamicCapabilityIssuer) boundManifestTransport(ctx context.Context) (*edgeManifestTransport, error) {
+	target, bound := edgeEgressTargetFrom(ctx)
+	if !bound {
+		if i.site.EdgeRoutingMode != edgeRoutingModeEdgeFull {
+			return nil, nil
+		}
+		decision := edgeRequestContextFrom(ctx)
+		if !decision.edgeFullResolved {
+			return nil, errEdgeFullNodeUnavailable
+		}
+		if decision.edgeFullDecision.NodeID == 0 && i.site.EdgePinnedNodeID == 0 {
+			return nil, nil
+		}
+		return nil, errEdgeFullNodeUnavailable
+	}
+	egress, ok := i.configuredTransport.(*edgeEgressTransport)
+	if !ok || egress == nil || egress.base == nil {
+		return nil, errEdgeFullNodeUnavailable
+	}
+	return &edgeManifestTransport{egress: egress, target: target}, nil
+}
+
+func (i *dynamicCapabilityIssuer) guardedManifestTransport(bound *edgeManifestTransport, claims dynamicCapabilityClaims, selfTargets *dynamicSelfTargetPolicy) (*edgeManifestTransport, error) {
+	if i.pm == nil || i.pm.edges == nil || !i.pm.edges.nodeSupportsDynamicGuard(bound.target.NodeID) {
+		return nil, errEdgeFullNodeUnavailable
+	}
+	return &edgeManifestTransport{
+		egress: bound.egress,
+		target: bound.target,
+		guard:  buildEdgeDynamicGuardPolicy(claims, i.policy, selfTargets),
+	}, nil
+}
+
 func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) {
 	if i == nil || i.state == nil || r == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.ContentLength > 0 || len(r.TransferEncoding) > 0 || r.Body != nil && r.Body != http.NoBody || r.URL.RawPath != "" {
 		writeDynamicCapabilityUnavailable(w)
@@ -610,14 +643,35 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		previous = &url.URL{Scheme: claims.PreviousScheme}
 	}
 	authority := dynamicCanonicalAuthority(target)
+	var boundManifest *edgeManifestTransport
+	if claims.Kind == dynamicCapabilityKindManifest {
+		boundManifest, err = i.boundManifestTransport(r.Context())
+		if err != nil {
+			i.observe(claims.Source, dynamicObservationDecisionDenied, dynamicObservationReasonRuntimeUnavailable, authority)
+			newDynamicProxyError(dynamicObservationReasonRuntimeUnavailable).writeResponse(w)
+			return
+		}
+	}
 	var transport http.RoundTripper
 	var dynamicTransport *http.Transport
 	rollback := func() {}
 	commit := func() {}
 	if claims.Trusted {
 		transport = i.configuredTransport
+		if boundManifest != nil {
+			transport = boundManifest
+		}
 	} else {
 		selfTargets := i.state.runtime.selfTargets.Load()
+		var guardedManifest *edgeManifestTransport
+		if boundManifest != nil {
+			guardedManifest, err = i.guardedManifestTransport(boundManifest, claims, selfTargets)
+			if err != nil {
+				i.observe(claims.Source, dynamicObservationDecisionDenied, dynamicObservationReasonRuntimeUnavailable, authority)
+				newDynamicProxyError(dynamicObservationReasonRuntimeUnavailable).writeResponse(w)
+				return
+			}
+		}
 		if reasonCode := i.policy.validateTarget(previous, target, selfTargets); reasonCode != "" {
 			i.observe(claims.Source, dynamicObservationDecisionDenied, reasonCode, authority)
 			newDynamicProxyError(reasonCode).writeResponse(w)
@@ -638,6 +692,9 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			newDynamicProxyError(reasonCode).writeResponse(w)
 			return
 		}
+		if guardedManifest != nil {
+			transport = guardedManifest
+		} else {
 		dynamicTransport, err = i.newTransport(target, pinnedIPs, selfTargets)
 		if err != nil {
 			rollback()
@@ -652,8 +709,9 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 		defer dynamicTransport.CloseIdleConnections()
 		transport = dynamicTransport
 	}
+	}
 	defer rollback()
-	mainVideoDirect := i.site.MainVideoStreamMode == mainVideoStreamModeDirect && (claims.Kind == dynamicCapabilityKindResource || claims.Kind == dynamicCapabilityKindManifest) && len(claims.RequiredHeaders) == 0 && isMainVideoStreamURL(target)
+	mainVideoDirect := boundManifest == nil && i.site.MainVideoStreamMode == mainVideoStreamModeDirect && (claims.Kind == dynamicCapabilityKindResource || claims.Kind == dynamicCapabilityKindManifest) && len(claims.RequiredHeaders) == 0 && isMainVideoStreamURL(target)
 	if mainVideoDirect {
 		if !i.state.useCapability(token, time.Now()) {
 			writeDynamicCapabilityUnavailable(w)
@@ -768,9 +826,14 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 			dynamicState:            i.state,
 			capabilityIssuer:        i,
 			streamLeaseHeld:         true,
-			mainVideoDirect:         i.site.MainVideoStreamMode == mainVideoStreamModeDirect,
+			mainVideoDirect:         boundManifest == nil && i.site.MainVideoStreamMode == mainVideoStreamModeDirect,
 			database:                i.database,
 			siteID:                  i.siteID,
+		}
+		if boundManifest != nil {
+			follower.boundManifestTransportFactory = func(selfTargets *dynamicSelfTargetPolicy) (*edgeManifestTransport, error) {
+				return i.guardedManifestTransport(boundManifest, dynamicCapabilityClaims{}, selfTargets)
+			}
 		}
 		followRequest := outbound
 		if redirectHeaders != nil {
@@ -790,6 +853,12 @@ func (i *dynamicCapabilityIssuer) serve(w http.ResponseWriter, r *http.Request) 
 	}
 	defer rollbackDynamicResponseAuthorities(resp)
 	if claims.Kind == dynamicCapabilityKindManifest {
+		if boundManifest != nil && resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
+			_ = resp.Body.Close()
+			i.observe(claims.Source, dynamicObservationDecisionDenied, dynamicObservationReasonUnsupportedStatus, authority)
+			newDynamicProxyError(dynamicObservationReasonUnsupportedStatus).writeResponse(w)
+			return
+		}
 		inheritedHeaders := claims.RequiredHeaders
 		if len(inheritedHeaders) > 0 && (resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.String() != claims.Target) {
 			inheritedHeaders = nil

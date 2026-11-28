@@ -844,7 +844,7 @@ func (a *edgeAgent) sendHeartbeat(ctx context.Context) error {
 	}
 	req.Header.Set("X-Yundu-Direct-Popup", "1")
 	req.Header.Set("X-Yundu-Egress-Capable", "1")
-	req.Header.Set(edgeAgentDynamicGuardHeader, "1")
+	req.Header.Set(edgeAgentDynamicGuardHeader, edgeAgentDynamicGuardVersion)
 	req.Header.Set("User-Agent", "Yundu-Agent/"+appVersion)
 
 	resp, err := a.masterClient.Do(req)
@@ -1465,7 +1465,7 @@ func resolveAgentTicketURL(rawBase, subPath, clientQuery string) (*url.URL, erro
 
 func (a *edgeAgent) fetchUpstream(ctx context.Context, inbound *http.Request, initialURL *url.URL, ticket edgePlaybackTicket) (*http.Response, error) {
 	if ticket.DynamicGuard != nil {
-		return a.fetchGuardedDynamicUpstream(ctx, inbound, initialURL, ticket)
+		return a.fetchGuardedDynamicUpstream(ctx, inbound, initialURL, ticket, false)
 	}
 	currentURL := initialURL
 	originAuthority := redirectHostKey(initialURL)
@@ -1562,7 +1562,7 @@ func (a *edgeAgent) buildDynamicSelfTargetPolicy(deniedHosts []string) (*dynamic
 	}, nil
 }
 
-func (a *edgeAgent) fetchGuardedDynamicUpstream(ctx context.Context, inbound *http.Request, initialURL *url.URL, ticket edgePlaybackTicket) (*http.Response, error) {
+func (a *edgeAgent) fetchGuardedDynamicUpstream(ctx context.Context, inbound *http.Request, initialURL *url.URL, ticket edgePlaybackTicket, reportRedirect bool) (*http.Response, error) {
 	guard := ticket.DynamicGuard
 	if guard == nil || initialURL == nil {
 		return nil, errEdgeDynamicTargetDenied
@@ -1676,7 +1676,7 @@ func (a *edgeAgent) fetchGuardedDynamicUpstream(ctx context.Context, inbound *ht
 			}
 			return nil, rtErr
 		}
-		if isEdgeRedirectStatus(resp.StatusCode) {
+		if !reportRedirect && isEdgeRedirectStatus(resp.StatusCode) {
 			loc := strings.TrimSpace(resp.Header.Get("Location"))
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
@@ -1778,6 +1778,31 @@ func (a *edgeAgent) handleEgressRequest(w http.ResponseWriter, r *http.Request) 
 		writeShareJSONError(w, http.StatusBadRequest, "无效的回源地址")
 		return
 	}
+	if ticket.DynamicGuard != nil {
+		if (r.Method != http.MethodGet && r.Method != http.MethodHead) || hasUpgradeIntent(r) || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+			w.Header().Set(edgeEgressMarkerHeader, "1")
+			writeShareJSONError(w, http.StatusBadRequest, "无效的清单请求")
+			return
+		}
+		headers := make(map[string]string, len(r.Header))
+		dropTokens := connectionHeaderTokens(r.Header)
+		for name := range r.Header {
+			key := strings.ToLower(name)
+			if !strings.EqualFold(name, edgeEgressTicketHeader) && !isHopByHopHeader(key) && !dropTokens[key] {
+				headers[name] = r.Header.Get(name)
+			}
+		}
+		// The master interprets each redirect and signs the next hop separately.
+		resp, err := a.fetchGuardedDynamicUpstream(r.Context(), r, targetURL, edgePlaybackTicket{DynamicGuard: ticket.DynamicGuard, Headers: headers}, true)
+		if err != nil {
+			w.Header().Set(edgeEgressMarkerHeader, "1")
+			w.Header().Set(edgeAgentDynamicGuardHeader, edgeAgentDynamicGuardVersion)
+			writeShareJSONError(w, http.StatusBadGateway, "dynamic discovery unavailable")
+			return
+		}
+		writeEdgeEgressResponse(w, r, resp, true)
+		return
+	}
 	if hasUpgradeIntent(r) {
 		if !isWebSocketUpgrade(r) {
 			w.Header().Set(edgeEgressMarkerHeader, "1")
@@ -1824,8 +1849,11 @@ func (a *edgeAgent) handleEgressRequest(w http.ResponseWriter, r *http.Request) 
 		writeShareJSONError(w, http.StatusBadGateway, "上游暂不可用")
 		return
 	}
-	defer resp.Body.Close()
+	writeEdgeEgressResponse(w, r, resp, false)
+}
 
+func writeEdgeEgressResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, guarded bool) {
+	defer resp.Body.Close()
 	respDropTokens := connectionHeaderTokens(resp.Header)
 	dst := w.Header()
 	for k, vals := range resp.Header {
@@ -1836,6 +1864,10 @@ func (a *edgeAgent) handleEgressRequest(w http.ResponseWriter, r *http.Request) 
 		dst[k] = append([]string(nil), vals...)
 	}
 	dst.Set(edgeEgressMarkerHeader, "1")
+	dst.Del(edgeAgentDynamicGuardHeader)
+	if guarded {
+		dst.Set(edgeAgentDynamicGuardHeader, edgeAgentDynamicGuardVersion)
+	}
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
 		return

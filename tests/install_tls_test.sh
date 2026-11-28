@@ -22,6 +22,7 @@ export MERIDIAN_NGINX_CONFIG="${TEST_ROOT}/meridian-panel.conf"
 export MERIDIAN_ASSUME_YES=1
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/install.sh"
+update_lock_directory() { printf '%s\n' "${TEST_ROOT}/locks"; }
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 cat > "${INSTALL_DIR}/meridian" <<'BINARY'
 #!/usr/bin/env bash
@@ -326,6 +327,9 @@ reset_fixture
         local command_args=()
         if [ "$1" = systemctl ]; then
             printf '%s\n' "$*" >> "${TEST_ROOT}/actions"
+            if [ "$2" = show ]; then
+                printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n'
+            fi
             return 0
         fi
         for arg in "$@"; do

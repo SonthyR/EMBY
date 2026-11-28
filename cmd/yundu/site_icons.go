@@ -365,10 +365,8 @@ func publicSiteBrandIconPaths() []string {
 
 // newSiteIconFetchFunc builds an upstream icon fetcher sharing the site's exact
 // egressTransport (respecting edge_full), UAHeaderPolicy, and upstream headers.
-// When upstreamUID is empty, it queries ONLY public site-level brand icon paths.
-// When upstreamUID is explicitly supplied (admin manual fetch fallback), it
-// fetches that configured site account's avatar so the admin can preview and
-// confirm before publishing it as a site-wide icon.
+// An anonymous lookup tries the known brand icon paths. A manual account
+// lookup tries its avatar first, then those paths with the temporary token.
 func newSiteIconFetchFunc(
 	transport http.RoundTripper,
 	target *url.URL,
@@ -376,11 +374,9 @@ func newSiteIconFetchFunc(
 	headers upstreamHeaderPolicy,
 ) func(ctx context.Context, upstreamUID, upstreamToken string) ([]byte, string, error) {
 	return func(ctx context.Context, upstreamUID, upstreamToken string) ([]byte, string, error) {
-		var candidates []string
+		candidates := publicSiteBrandIconPaths()
 		if uid := strings.TrimSpace(upstreamUID); uid != "" {
-			candidates = []string{"/Users/" + url.PathEscape(uid) + "/Images/Primary"}
-		} else {
-			candidates = publicSiteBrandIconPaths()
+			candidates = append([]string{"/Users/" + url.PathEscape(uid) + "/Images/Primary"}, candidates...)
 		}
 
 		client := &http.Client{
@@ -431,6 +427,10 @@ func newSiteIconFetchFunc(
 					nextURL, parseErr := cur.Parse(loc)
 					if parseErr != nil || !strings.EqualFold(nextURL.Host, target.Host) {
 						lastErr = errors.New("rejected cross-host icon redirect")
+						break
+					}
+					if (nextURL.Scheme != "http" && nextURL.Scheme != "https") || (cur.Scheme == "https" && nextURL.Scheme != "https") {
+						lastErr = errors.New("rejected unsafe icon redirect")
 						break
 					}
 					cur = *nextURL
@@ -601,7 +601,9 @@ func (rt *shareUserRuntime) fetchSiteIconWithOutcome(
 	}
 
 	// 1. Always try explicit public site-wide brand assets first (no credentials).
-	data, ct, publicErr := inst.fetchSiteIcon(reqCtx, "", "")
+	publicCtx, cancelPublic := context.WithTimeout(reqCtx, siteIconFetchTimeout)
+	data, ct, publicErr := inst.fetchSiteIcon(publicCtx, "", "")
+	cancelPublic()
 	if publicErr == nil && len(data) > 0 {
 		if err := rt.db.saveSiteAutoIconWithSource(siteID, data, ct, siteIconAutoSourcePublic); err != nil {
 			return siteIconFetchOutcome{}, err
@@ -614,38 +616,61 @@ func (rt *shareUserRuntime) fetchSiteIconWithOutcome(
 		}, nil
 	}
 
-	if !allowAccountPreview || inst.shareLogin == nil {
-		return siteIconFetchOutcome{}, publicErr
+	if !allowAccountPreview {
+		if publicErr != nil {
+			return siteIconFetchOutcome{}, publicErr
+		}
+		return siteIconFetchOutcome{}, errors.New("未找到可用的公开图标")
+	}
+	if inst.shareLogin == nil {
+		return siteIconFetchOutcome{}, errors.New("未找到可用的公开图标，当前站点无法使用源站账号预览")
 	}
 
-	// 2. Explicit admin fallback: sign in briefly with the admin's configured
-	// site account (never a random share user's live session), fetch its avatar,
-	// log out the temporary token, and return for preview + confirmation.
+	// Use temporary credentials from the configured accounts for admin preview.
 	cands, err := rt.upstreamCredentialCandidates(siteID, 0)
-	if err != nil || len(cands) == 0 {
-		return siteIconFetchOutcome{}, publicErr
+	if errors.Is(err, errNoSavedSiteAccountCredentials) {
+		return siteIconFetchOutcome{}, errors.New("未找到可用的公开图标，且没有可用的源站账号")
 	}
-	tok, uid, status, loginErr := inst.shareLogin(reqCtx, cands[0].username, cands[0].password, "yundu-icon-probe", "Yundu", "Yundu")
-	if loginErr != nil || status != http.StatusOK || tok == "" || uid == "" {
-		return siteIconFetchOutcome{}, publicErr
+	if err != nil {
+		return siteIconFetchOutcome{}, errors.New("未找到可用的公开图标，读取已配置的源站账号失败")
 	}
-	if inst.shareLogout != nil {
-		defer func() {
-			lctx, lcancel := context.WithTimeout(reqCtx, shareLogoutTimeout)
-			defer lcancel()
-			_ = inst.shareLogout(lctx, tok)
-		}()
+	var loginStatus int
+	for _, cand := range cands {
+		token, uid, status, loginErr := inst.shareLogin(reqCtx, cand.username, cand.password, "yundu-icon-probe", "Yundu", "Yundu")
+		loginStatus = status
+		if token != "" && inst.shareLogout != nil {
+			defer func() {
+				logoutCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), shareLogoutTimeout)
+				defer cancel()
+				_ = inst.shareLogout(logoutCtx, token)
+			}()
+		}
+		if loginErr == nil && status == http.StatusOK && token != "" && uid != "" {
+			data, contentType, fetchErr := inst.fetchSiteIcon(reqCtx, uid, token)
+			if reqCtx.Err() != nil {
+				return siteIconFetchOutcome{}, errors.New("已登录源站账号，但抓取图标超时")
+			}
+			if fetchErr != nil || len(data) == 0 {
+				return siteIconFetchOutcome{}, errors.New("已登录源站账号，但未找到可用的头像或图标")
+			}
+			return siteIconFetchOutcome{
+				Data:            data,
+				ContentType:     contentType,
+				Kind:            "account_avatar",
+				RequiresConfirm: true,
+			}, nil
+		}
+		if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests {
+			break
+		}
 	}
-	avatarData, avatarCT, avatarErr := inst.fetchSiteIcon(reqCtx, uid, tok)
-	if avatarErr != nil || len(avatarData) == 0 {
-		return siteIconFetchOutcome{}, avatarErr
+	if reqCtx.Err() != nil {
+		return siteIconFetchOutcome{}, errors.New("源站账号登录失败，抓取请求已超时")
 	}
-	return siteIconFetchOutcome{
-		Data:            avatarData,
-		ContentType:     avatarCT,
-		Kind:            "account_avatar",
-		RequiresConfirm: true,
-	}, nil
+	if loginStatus >= http.StatusBadRequest {
+		return siteIconFetchOutcome{}, fmt.Errorf("源站账号登录失败（HTTP %d），请检查账号或源站状态", loginStatus)
+	}
+	return siteIconFetchOutcome{}, errors.New("源站账号登录失败，请检查账号和源站连通性")
 }
 
 func (rt *shareUserRuntime) fetchAndCacheSiteIcon(
@@ -731,7 +756,8 @@ func (a *App) handleSiteIcon(w http.ResponseWriter, r *http.Request, siteID int6
 			a.jsonErr(w, http.StatusServiceUnavailable, "站点运行时未就绪")
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), siteIconFetchTimeout)
+		// Keep time for account preview after the anonymous lookup.
+		ctx, cancel := context.WithTimeout(r.Context(), 2*siteIconFetchTimeout)
 		defer cancel()
 		outcome, err := a.pm.shares.fetchSiteIconWithOutcome(ctx, siteID, 0, true)
 		if err != nil {

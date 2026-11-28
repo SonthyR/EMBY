@@ -209,6 +209,7 @@ func (a *shareSessionActivity) isWatching(now time.Time) bool {
 }
 
 type shareSessionEntry struct {
+	loginGeneration  uint64
 	userID        int64
 	siteID        int64
 	siteAccountID int64
@@ -257,6 +258,11 @@ type shareLoginFailure struct {
 type shareUserRuntime struct {
 	db *DB
 	pm *ProxyManager
+
+	// Serialize persisted session changes with reload's snapshot and publication.
+	// A handoff takes its per-session lock first, then sessionStoreMu, then mu.
+	sessionStoreMu  sync.Mutex
+	loginGeneration uint64 // guarded by mu
 
 	mu         sync.RWMutex
 	users      map[int64]*shareUserState
@@ -335,6 +341,8 @@ func (rt *shareUserRuntime) reload() error {
 	if rt == nil || rt.db == nil {
 		return nil
 	}
+	rt.sessionStoreMu.Lock()
+	defer rt.sessionStoreMu.Unlock()
 	type row struct {
 		id                                       int64
 		username, hash, routePrefix, expires     string
@@ -507,6 +515,7 @@ func (rt *shareUserRuntime) reload() error {
 	prevSessions := rt.sessions
 	for hash, entry := range sessions {
 		if prev, exists := prevSessions[hash]; exists {
+			entry.loginGeneration = prev.loginGeneration
 			if !prev.lastHandoffAt.IsZero() {
 				entry.lastHandoffAt = prev.lastHandoffAt
 			}
@@ -919,6 +928,17 @@ func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Reques
 			}
 			return 0, http.StatusUnauthorized, shareBlockMessage(reason)
 		}
+		// Logout always targets the existing share login rather than signing in
+		// to the preferred site first. Any live handler can finish a personal
+		// route logout if its session's former proxy has already stopped.
+		if isShareClientLogoutRequest(r) {
+			if handler, ok := rt.pm.SiteHandler(entry.siteID); ok && handler != nil {
+				return entry.siteID, 0, ""
+			}
+			if activeSite > 0 {
+				return activeSite, 0, ""
+			}
+		}
 		if entry.siteID == activeSite {
 			return entry.siteID, 0, ""
 		}
@@ -926,7 +946,7 @@ func (rt *shareUserRuntime) resolveShareRouteTarget(userID int64, r *http.Reques
 			return entry.siteID, 0, ""
 		}
 		if activeSite == 0 {
-			_ = rt.revokeByHash(hash)
+			_ = rt.revokeSession(hash, &entry)
 			return 0, http.StatusServiceUnavailable, "暂无可用服务器"
 		}
 		if status, msg := rt.handoffPersonalRouteSite(withShareHandoffClientHeaders(r.Context(), r), hash, activeSite, clientIP); status != 0 {
@@ -1287,22 +1307,7 @@ func (rt *shareUserRuntime) revokeByHash(tokenHash string) error {
 	if rt == nil || rt.db == nil || tokenHash == "" {
 		return nil
 	}
-	var session shareStoredSession
-	err := rt.db.db.QueryRow(`SELECT token_hash, token_ciphertext, upstream_token_ciphertext, site_id, device_id, egress_node_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
-		Scan(&session.TokenHash, &session.ciphertext, &session.upstreamCiphertext, &session.SiteID, &session.DeviceID, &session.egressNodeID)
-	if errors.Is(err, sql.ErrNoRows) {
-		rt.mu.Lock()
-		delete(rt.sessions, tokenHash)
-		delete(rt.lastSeen, tokenHash)
-		delete(rt.dirtyClientIP, tokenHash)
-		delete(rt.activity, tokenHash)
-		rt.mu.Unlock()
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return rt.revokeOne(session)
+	return rt.revokeSession(tokenHash, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,7 +1413,7 @@ func (rt *shareUserRuntime) intercept(w http.ResponseWriter, r *http.Request, si
 		if reason != "" {
 			if state != nil {
 				if reason == "site" {
-					_ = rt.revokeByHash(hash)
+					_ = rt.revokeSession(hash, &entry)
 				} else {
 					rt.revokeAsync(entry.userID, 0, reason)
 				}
@@ -1636,6 +1641,8 @@ func truncateShareText(value string, limit int) string {
 // accounts as failover backups; when preferredAccount == 0 (auto-balance) all
 // non-expired accounts are ordered by fewest active sessions with round-robin
 // tie-breaking, followed by any expired accounts as last resort.
+var errNoSavedSiteAccountCredentials = errors.New("site has no saved account with a password")
+
 func (rt *shareUserRuntime) upstreamCredentialCandidates(siteID, preferredAccount int64) ([]shareUpstreamCandidate, error) {
 	accounts, err := rt.db.listSiteAccounts(siteID)
 	if err != nil {
@@ -1720,7 +1727,7 @@ func (rt *shareUserRuntime) upstreamCredentialCandidates(siteID, preferredAccoun
 		result = append(result, sc.cand)
 	}
 	if len(result) == 0 {
-		return nil, errors.New("site has no saved account with a password")
+		return nil, errNoSavedSiteAccountCredentials
 	}
 	return result, nil
 }
@@ -1838,22 +1845,21 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	}
 	hash := shareTokenHash(token)
 	accountID := pending.currentAccountID()
-	if _, err := rt.db.db.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, upstream_token_ciphertext, client_user_id, upstream_user_id, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, egress_node_id=excluded.egress_node_id, token_ciphertext=excluded.token_ciphertext, upstream_token_ciphertext=excluded.upstream_token_ciphertext, client_user_id=excluded.client_user_id, upstream_user_id=excluded.upstream_user_id, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
-		hash, pending.user.id, pending.siteID, accountID, pending.egressNodeID, ciphertext, "", upstreamUID, upstreamUID, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
-		return err
-	}
-	// Upstreams may hand the same token back to a device that signs in again.
-	if _, err := rt.db.db.Exec(`DELETE FROM share_revoked_tokens WHERE token_hash=?`, hash); err != nil {
-		return err
-	}
 	ispGroup := ""
 	if rt.pm != nil && rt.pm.edges != nil && pending.clientIP != "" {
 		ispGroup = rt.pm.edges.lookupISPGroup(pending.clientIP)
 	}
+	rt.sessionStoreMu.Lock()
+	if err := rt.persistRegisteredSession(pending, hash, ciphertext, upstreamUID); err != nil {
+		rt.sessionStoreMu.Unlock()
+		return err
+	}
 	rt.mu.Lock()
 	delete(rt.revoked, hash)
 	delete(rt.dirtyClientIP, hash)
+	rt.loginGeneration++
 	rt.sessions[hash] = shareSessionEntry{
+		loginGeneration: rt.loginGeneration,
 		userID:        pending.user.id,
 		siteID:        pending.siteID,
 		siteAccountID: accountID,
@@ -1875,10 +1881,29 @@ func (rt *shareUserRuntime) registerSession(pending *shareLoginPending, token st
 	}
 	maxDevices := pending.user.maxDevices
 	rt.mu.Unlock()
+	rt.sessionStoreMu.Unlock()
 	if err := rt.enforceDeviceLimit(pending.user.id, pending.siteID, hash, pending.deviceID, maxDevices); err != nil {
 		log.Printf("share user %d: device limit: %v", pending.user.id, err)
 	}
 	return nil
+}
+
+// persistRegisteredSession is called with sessionStoreMu held.
+func (rt *shareUserRuntime) persistRegisteredSession(pending *shareLoginPending, hash, ciphertext, upstreamUID string) error {
+	tx, err := rt.db.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, upstream_token_ciphertext, client_user_id, upstream_user_id, device_id, device_name, client, client_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token_hash) DO UPDATE SET share_user_id=excluded.share_user_id, site_id=excluded.site_id, site_account_id=excluded.site_account_id, egress_node_id=excluded.egress_node_id, token_ciphertext=excluded.token_ciphertext, upstream_token_ciphertext=excluded.upstream_token_ciphertext, client_user_id=excluded.client_user_id, upstream_user_id=excluded.upstream_user_id, device_id=excluded.device_id, device_name=excluded.device_name, client=excluded.client, client_ip=excluded.client_ip, last_seen_at=CURRENT_TIMESTAMP`,
+		hash, pending.user.id, pending.siteID, pending.currentAccountID(), pending.egressNodeID, ciphertext, "", upstreamUID, upstreamUID, pending.deviceID, pending.device, pending.client, pending.clientIP); err != nil {
+		return err
+	}
+	// Upstreams may hand the same token back to a device that signs in again.
+	if _, err := tx.Exec(`DELETE FROM share_revoked_tokens WHERE token_hash=?`, hash); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // enforceDeviceLimit drops the older token of a device that signed in again
@@ -2218,30 +2243,115 @@ func (rt *shareUserRuntime) revokeUserSession(userID int64, sessionID string) (b
 
 // revokeOne denylists one session's token, removes it and logs it out upstream.
 func (rt *shareUserRuntime) revokeOne(session shareStoredSession) error {
-	if _, err := rt.db.db.Exec(`INSERT INTO share_revoked_tokens(token_hash, site_id) VALUES(?,?) ON CONFLICT(token_hash) DO UPDATE SET site_id=excluded.site_id, revoked_at=CURRENT_TIMESTAMP`, session.TokenHash, session.SiteID); err != nil {
+	return rt.revokeSession(session.TokenHash, nil)
+}
+
+// Re-read the session under the store lock so a kick logs out the token that
+// actually owns the session, even if it moved to a different site meanwhile.
+func (rt *shareUserRuntime) revokeSession(tokenHash string, expected *shareSessionEntry) error {
+	rt.sessionStoreMu.Lock()
+	if expected != nil {
+		rt.mu.RLock()
+		cur, exists := rt.sessions[tokenHash]
+		rt.mu.RUnlock()
+		if !exists || !cur.sameHandoffSource(*expected) {
+			rt.sessionStoreMu.Unlock()
+			return nil
+		}
+	}
+	session, err := rt.revokeSessionLocked(tokenHash)
+	rt.sessionStoreMu.Unlock()
+	if err != nil {
 		return err
 	}
-	if _, err := rt.db.db.Exec(`DELETE FROM share_user_sessions WHERE token_hash=?`, session.TokenHash); err != nil {
-		return err
+	rt.logoutStoredShareSession(context.Background(), session)
+	return nil
+}
+
+func (rt *shareUserRuntime) revokeSessionLocked(tokenHash string) (shareStoredSession, error) {
+	session, exists, err := rt.persistSessionRevocation(tokenHash)
+	if err != nil {
+		return session, err
 	}
 	rt.mu.Lock()
-	delete(rt.sessions, session.TokenHash)
-	delete(rt.lastSeen, session.TokenHash)
-	delete(rt.dirtyClientIP, session.TokenHash)
-	delete(rt.activity, session.TokenHash)
-	rt.revoked[session.TokenHash] = session.SiteID
+	delete(rt.sessions, tokenHash)
+	delete(rt.lastSeen, tokenHash)
+	delete(rt.dirtyClientIP, tokenHash)
+	delete(rt.activity, tokenHash)
+	if exists {
+		rt.revoked[tokenHash] = session.SiteID
+	}
 	rt.mu.Unlock()
 	rt.handoffMu.Lock()
-	delete(rt.handoffLocks, session.TokenHash)
+	delete(rt.handoffLocks, tokenHash)
 	rt.handoffMu.Unlock()
+	return session, nil
+}
+
+func (rt *shareUserRuntime) logoutStoredShareSession(ctx context.Context, session shareStoredSession) {
 	activeCipher := session.upstreamCiphertext
 	if activeCipher == "" {
 		activeCipher = session.ciphertext
 	}
 	if token, err := decryptSiteAccountSecret(activeCipher); err == nil && token != "" {
-		rt.logoutUpstream(session.SiteID, token, session.egressNodeID)
+		rt.logoutUpstreamWithContext(ctx, session.SiteID, token, session.egressNodeID)
 	}
-	return nil
+}
+
+// For a registered share session the gateway owns the logout. Persist the
+// revocation before acknowledging it, then clean up its actual upstream token
+// independently of the request. Native upstream logouts still pass through.
+func (rt *shareUserRuntime) handleShareClientLogout(w http.ResponseWriter, r *http.Request, siteID int64) bool {
+	if rt == nil || !isShareClientLogoutRequest(r) {
+		return false
+	}
+	routeUserID, personal := shareRouteUserFromContext(r.Context())
+	for _, token := range embyRequestTokens(r) {
+		hash := shareTokenHash(token)
+		rt.sessionStoreMu.Lock()
+		rt.mu.RLock()
+		entry, exists := rt.sessions[hash]
+		rt.mu.RUnlock()
+		if !exists || (personal && entry.userID != routeUserID) || (!personal && entry.siteID != siteID) {
+			rt.sessionStoreMu.Unlock()
+			continue
+		}
+		session, err := rt.revokeSessionLocked(hash)
+		rt.sessionStoreMu.Unlock()
+		if err != nil {
+			log.Printf("share user #%d: persist client logout: %v", entry.userID, err)
+			writeShareJSONError(w, http.StatusServiceUnavailable, "暂时无法退出，请重试")
+		} else {
+			rt.logoutStoredShareSession(withShareHandoffClientHeaders(r.Context(), r), session)
+			w.WriteHeader(http.StatusNoContent)
+		}
+		return true
+	}
+	return false
+}
+
+// persistSessionRevocation is called with sessionStoreMu held.
+func (rt *shareUserRuntime) persistSessionRevocation(tokenHash string) (session shareStoredSession, exists bool, err error) {
+	tx, err := rt.db.db.Begin()
+	if err != nil {
+		return session, false, err
+	}
+	defer tx.Rollback()
+	err = tx.QueryRow(`SELECT token_ciphertext, upstream_token_ciphertext, site_id, egress_node_id FROM share_user_sessions WHERE token_hash=?`, tokenHash).
+		Scan(&session.ciphertext, &session.upstreamCiphertext, &session.SiteID, &session.egressNodeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return session, false, nil
+	}
+	if err != nil {
+		return session, false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO share_revoked_tokens(token_hash, site_id) VALUES(?,?) ON CONFLICT(token_hash) DO UPDATE SET site_id=excluded.site_id, revoked_at=CURRENT_TIMESTAMP`, tokenHash, session.SiteID); err != nil {
+		return session, false, err
+	}
+	if _, err := tx.Exec(`DELETE FROM share_user_sessions WHERE token_hash=?`, tokenHash); err != nil {
+		return session, false, err
+	}
+	return session, true, tx.Commit()
 }
 
 // revokeSessions deletes the user's sessions (all sites when siteID is 0, or
@@ -2296,6 +2406,10 @@ func (rt *shareUserRuntime) revokeAsync(userID, siteID int64, reason string) {
 }
 
 func (rt *shareUserRuntime) logoutUpstream(siteID int64, token string, egressNodeID int64) {
+	rt.logoutUpstreamWithContext(context.Background(), siteID, token, egressNodeID)
+}
+
+func (rt *shareUserRuntime) logoutUpstreamWithContext(ctx context.Context, siteID int64, token string, egressNodeID int64) {
 	if rt.pm == nil {
 		return
 	}
@@ -2331,7 +2445,7 @@ func (rt *shareUserRuntime) logoutUpstream(siteID int64, token string, egressNod
 	}
 	logout := inst.shareLogout
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), shareLogoutTimeout)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shareLogoutTimeout)
 		defer cancel()
 		if egressTarget != nil {
 			ctx = withEdgeEgressTarget(ctx, *egressTarget)

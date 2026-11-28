@@ -519,6 +519,9 @@ func TestV180SeamlessSwitchPreservesOldSessionAndRespectsKick(t *testing.T) {
 	pm.mu.Unlock()
 
 	seedSession := func() {
+		if _, err := db.db.Exec(`DELETE FROM share_revoked_tokens WHERE token_hash=?`, tokenHash); err != nil {
+			t.Fatalf("clear prior test session revocation: %v", err)
+		}
 		upCipher, _ := encryptSiteAccountSecret("old-tok-a")
 		if _, err := db.db.Exec(
 			`INSERT OR REPLACE INTO share_user_sessions(token_hash, share_user_id, site_id, site_account_id, egress_node_id, token_ciphertext, upstream_token_ciphertext, upstream_user_id, client_user_id, device_id, device_name, client, client_ip) VALUES(?, ?, ?, 0, 0, ?, ?, 'uid-a', 'uid-a', 'dev-1', 'TV', 'Capy', '1.2.3.4')`,

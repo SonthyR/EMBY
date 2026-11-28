@@ -422,6 +422,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		var shareUser *shareUserState
 		var shareSessionHash string
 		if pm.shares != nil {
+			if pm.shares.handleShareClientLogout(w, r, site.ID) {
+				return
+			}
 			var finishShareActivity func()
 			var handled bool
 			r, shareLogin, shareUser, shareSessionHash, finishShareActivity, handled = pm.shares.intercept(w, r, site, requestLogEntry.ClientIP)
@@ -485,9 +488,6 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		if shareSessionHash != "" && pm.shares != nil {
 			pm.shares.applyUpstreamToken(r, shareSessionHash)
 			pm.shares.applyUpstreamUserID(r, shareSessionHash)
-			if isShareClientLogoutRequest(r) {
-				defer pm.shares.dropLocalSession(shareSessionHash)
-			}
 		}
 		r = r.WithContext(withEdgeRequestContext(r.Context(), requestLogEntry.ClientIP, shareUser, shareSessionHash, edgeFullResolved, edgeFullDecision))
 		if isReservedDynamicRoute(r.URL.Path) {

@@ -47,6 +47,8 @@ UPDATE_BINARY_CHANGED=0
 UPDATE_TRANSACTION=0
 UPDATE_SNAPSHOT_DIR=""
 UPDATE_SNAPSHOT_RESTORED=0
+UPDATE_DATA_CHANGED=0
+UPDATE_SERVICE_MAY_BE_RUNNING=0
 UPDATE_SERVICE_SNAPSHOT=""
 UPDATE_SERVICE_CHANGED=0
 UPDATE_LOCK_HELD=0
@@ -214,9 +216,28 @@ snapshot_data_dir() {
     local snapshot_dir="$1"
     validate_data_dir
     as_root test -d "$DATA_DIR" || return 1
-    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$snapshot_dir"
-    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "${snapshot_dir}/data"
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$snapshot_dir" || return 1
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "${snapshot_dir}/data" || return 1
     as_root cp -a -- "$DATA_DIR"/. "${snapshot_dir}/data/"
+}
+
+verify_update_snapshot() {
+    local snapshot_dir="$1" db_path rel
+    local files=(.env)
+    db_path=$(read_env_value DB_PATH)
+    db_path=${db_path:-${DATA_DIR}/meridian.db}
+    [[ "$db_path" = /* ]] || db_path="${DATA_DIR}/${db_path}"
+    case "$db_path" in
+        "$DATA_DIR"/*)
+            rel=${db_path#"$DATA_DIR"/}
+            files+=("$rel" "${rel}-wal" "${rel}-shm")
+            ;;
+    esac
+    for rel in "${files[@]}"; do
+        if as_root test -e "${DATA_DIR}/${rel}"; then
+            as_root cmp -s -- "${DATA_DIR}/${rel}" "${snapshot_dir}/data/${rel}" || return 1
+        fi
+    done
 }
 
 restore_data_snapshot() {
@@ -1181,8 +1202,8 @@ migrate_update_systemd_service() {
     service_copy="${tmp_dir}/meridian.service.current"
     service_new="${tmp_dir}/meridian.service.new"
     UPDATE_SERVICE_SNAPSHOT="${tmp_dir}/meridian.service.before"
-    as_root cp -p -- "$SERVICE_FILE" "$UPDATE_SERVICE_SNAPSHOT"
-    as_root cp -p -- "$SERVICE_FILE" "$service_copy"
+    as_root cp -p -- "$SERVICE_FILE" "$UPDATE_SERVICE_SNAPSHOT" || return 1
+    as_root cp -p -- "$SERVICE_FILE" "$service_copy" || return 1
     configured_line=$(grep '^RestrictAddressFamilies=' "$service_copy" || true)
     legacy_line='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
     current_line="RestrictAddressFamilies=${SYSTEMD_RESTRICT_ADDRESS_FAMILIES}"
@@ -1193,9 +1214,9 @@ migrate_update_systemd_service() {
         warn "现有 systemd 网络族配置不是安装器管理的旧格式；拒绝自动覆盖: $SERVICE_FILE"
         return 1
     fi
-    sed "s/^RestrictAddressFamilies=.*/${current_line}/" "$service_copy" > "$service_new"
+    sed "s/^RestrictAddressFamilies=.*/${current_line}/" "$service_copy" > "$service_new" || return 1
     UPDATE_SERVICE_CHANGED=1
-    as_root install -o root -g root -m 0644 "$service_new" "$SERVICE_FILE"
+    as_root install -o root -g root -m 0644 "$service_new" "$SERVICE_FILE" || return 1
     as_root systemctl daemon-reload
 }
 
@@ -1204,9 +1225,9 @@ restore_update_systemd_service() {
         return 0
     fi
     [ -n "$UPDATE_SERVICE_SNAPSHOT" ] && [ -f "$UPDATE_SERVICE_SNAPSHOT" ] || return 1
-    as_root cp -p -- "$UPDATE_SERVICE_SNAPSHOT" "${SERVICE_FILE}.restore"
-    as_root mv -f -- "${SERVICE_FILE}.restore" "$SERVICE_FILE"
-    as_root systemctl daemon-reload
+    as_root cp -p -- "$UPDATE_SERVICE_SNAPSHOT" "${SERVICE_FILE}.restore" || return 1
+    as_root mv -f -- "${SERVICE_FILE}.restore" "$SERVICE_FILE" || return 1
+    as_root systemctl daemon-reload || return 1
     UPDATE_SERVICE_CHANGED=0
 }
 
@@ -1230,66 +1251,73 @@ create_backup_archive() {
     archive_tmp="${archive}.tmp.$$"
     data_parent=$(dirname -- "$DATA_DIR")
     data_base=$(basename -- "$DATA_DIR")
-    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$BACKUP_DIR"
-    if ! as_root tar -C "$data_parent" -czf "$archive_tmp" "$data_base"; then
-        as_root rm -f -- "$archive_tmp"
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$BACKUP_DIR" || return 1
+    if ! as_root tar -C "$data_parent" -czf "$archive_tmp" "$data_base" \
+        || ! as_root chmod 0600 "$archive_tmp" \
+        || ! as_root mv -f -- "$archive_tmp" "$archive"; then
+        as_root rm -f -- "$archive_tmp" || warn "无法清理未完成的备份文件: $archive_tmp"
         return 1
     fi
-    as_root chmod 0600 "$archive_tmp"
-    as_root mv -f "$archive_tmp" "$archive"
     LAST_BACKUP_PATH="$archive"
 }
 
 restore_previous_binary() {
     [ -f "$PREVIOUS_BIN" ] || return 1
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$PREVIOUS_BIN" "${INSTALL_DIR}/${BIN_NAME}.rollback"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$PREVIOUS_BIN" "${INSTALL_DIR}/${BIN_NAME}.rollback" || return 1
     as_root mv -f "${INSTALL_DIR}/${BIN_NAME}.rollback" "${INSTALL_DIR}/${BIN_NAME}"
 }
 
+update_lock_directory() {
+    if [ "$(uname -s)" = Linux ]; then
+        printf '%s\n' /run/meridian-update-locks
+    else
+        printf '%s\n' /var/run/meridian-update-locks
+    fi
+}
+
 resolve_update_lock_file() {
-    local lock_dir="" instance_raw instance_hash
-    if [ -n "${MERIDIAN_UPDATE_LOCK_DIR:-}" ]; then
-        lock_dir="$MERIDIAN_UPDATE_LOCK_DIR"
-        mkdir -p -- "$lock_dir" 2>/dev/null || as_root mkdir -p -- "$lock_dir"
-    elif [ -d /run/lock ] && [ -w /run/lock ]; then
-        lock_dir="/run/lock"
-    elif [ "${EUID}" -eq 0 ] && { [ -d /run/lock ] || mkdir -p /run/lock 2>/dev/null; }; then
-        lock_dir="/run/lock"
-    elif [ -d /run ] && [ -w /run ]; then
-        lock_dir="/run"
+    local lock_dir instance_raw instance_hash
+    lock_dir=$(update_lock_directory) || return 1
+    case "$lock_dir" in
+        "$DATA_DIR"|"$DATA_DIR"/*) return 1 ;;
+    esac
+    if is_systemd; then
+        instance_raw="systemd:${SERVICE_NAME%.service}"
     else
-        lock_dir="/tmp"
+        instance_raw=$(cd -P -- "$INSTALL_DIR" && pwd -P) || return 1
     fi
-    instance_raw="${SERVICE_NAME}|${DATA_DIR}|${INSTALL_DIR}"
-    if command -v sha256sum >/dev/null 2>&1; then
-        instance_hash=$(printf '%s' "$instance_raw" | sha256sum | awk '{print substr($1, 1, 16)}')
-    elif command -v shasum >/dev/null 2>&1; then
-        instance_hash=$(printf '%s' "$instance_raw" | shasum -a 256 | awk '{print substr($1, 1, 16)}')
-    else
-        instance_hash=$(printf '%s' "$instance_raw" | tr -c 'A-Za-z0-9._-' '_')
-    fi
-    printf '%s/meridian-update-%s.lock\n' "$lock_dir" "$instance_hash"
+    instance_hash=$(printf '%s' "$instance_raw" | sha256_file -) || return 1
+    printf '%s/%s.lock\n' "$lock_dir" "$instance_hash"
 }
 
 acquire_update_lock() {
-    local lock_file
-    lock_file=$(resolve_update_lock_file)
-    if command -v flock >/dev/null 2>&1; then
-        if ! exec 9>"$lock_file" 2>/dev/null; then
-            as_root touch "$lock_file" || fail "无法创建更新实例锁文件: $lock_file"
-            as_root chmod 0666 "$lock_file" 2>/dev/null || true
-            exec 9>"$lock_file" || fail "无法打开更新实例锁文件: $lock_file"
+    local lock_file lock_dir
+    lock_file=$(resolve_update_lock_file) || fail "无法确定实例锁路径或安装目录不存在: $INSTALL_DIR"
+    lock_dir=${lock_file%/*}
+    if as_root test -L "$lock_dir"; then
+        fail "实例锁目录不能是符号链接: $lock_dir"
+    fi
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0755 "$lock_dir" || fail "无法创建更新实例锁目录: $lock_dir"
+    if [ "$(uname -s)" = Linux ]; then
+        need_cmd flock
+        if as_root test -L "$lock_file" || { as_root test -e "$lock_file" && ! as_root test -f "$lock_file"; }; then
+            fail "实例锁必须是常规文件: $lock_file"
         fi
+        # Keep one inode under a root-owned directory. An elevated panel and
+        # a sudo-assisted CLI can both acquire flock on a read-only descriptor.
+        if ! as_root touch -- "$lock_file" || ! as_root chmod 0644 "$lock_file"; then
+            fail "无法准备更新实例锁文件: $lock_file"
+        fi
+        exec 9<"$lock_file" || fail "无法打开更新实例锁文件: $lock_file"
         if ! flock -n 9; then
-            exec 9>&- 2>/dev/null || true
+            exec 9<&-
             fail "当前实例已有更新正在进行中（锁文件: ${lock_file}），请等待完成后再试"
         fi
-        UPDATE_LOCK_HELD=1
-        return 0
-    fi
-    UPDATE_LOCK_DIR_FALLBACK="${lock_file}.d"
-    if ! mkdir "$UPDATE_LOCK_DIR_FALLBACK" 2>/dev/null; then
-        fail "当前实例已有更新正在进行中（锁目录: ${UPDATE_LOCK_DIR_FALLBACK}），请等待完成后再试"
+    else
+        UPDATE_LOCK_DIR_FALLBACK="${lock_file}.d"
+        if ! as_root mkdir -m 0700 "$UPDATE_LOCK_DIR_FALLBACK"; then
+            fail "无法取得更新实例锁目录: ${UPDATE_LOCK_DIR_FALLBACK}；请检查是否已有更新在运行"
+        fi
     fi
     UPDATE_LOCK_HELD=1
 }
@@ -1298,65 +1326,63 @@ release_update_lock() {
     if [ "$UPDATE_LOCK_HELD" != "1" ]; then
         return 0
     fi
-    if command -v flock >/dev/null 2>&1; then
-        flock -u 9 2>/dev/null || true
-        exec 9>&- 2>/dev/null || true
-    elif [ -n "$UPDATE_LOCK_DIR_FALLBACK" ] && [ -d "$UPDATE_LOCK_DIR_FALLBACK" ]; then
-        rmdir -- "$UPDATE_LOCK_DIR_FALLBACK" 2>/dev/null || true
+    if [ -n "$UPDATE_LOCK_DIR_FALLBACK" ]; then
+        as_root rmdir -- "$UPDATE_LOCK_DIR_FALLBACK" || warn "无法释放更新实例锁: $UPDATE_LOCK_DIR_FALLBACK"
+    else
+        flock -u 9 || warn "无法手动解锁，将关闭更新锁描述符"
+        exec 9<&-
     fi
     UPDATE_LOCK_HELD=0
     UPDATE_LOCK_DIR_FALLBACK=""
 }
 
 stop_service_and_wait() {
-    local timeout="${1:-30}" i=0 stop_rc=0 props active_state main_pid
+    local timeout="${1:-30}" i=0 stop_rc=0 props
     if ! is_systemd; then
         return 0
     fi
     as_root systemctl stop "$SERVICE_NAME" || stop_rc=$?
-    # Exit code 5 means the unit is not loaded; still verify ActiveState/MainPID below.
+    # An unloaded unit can return 5 from stop. Confirm its state with show.
     if [ "$stop_rc" -ne 0 ] && [ "$stop_rc" -ne 5 ]; then
         return 1
     fi
     while [ "$i" -lt "$timeout" ]; do
-        props=$(as_root systemctl show -p ActiveState -p MainPID "$SERVICE_NAME" 2>/dev/null || true)
-        if [ -z "$props" ]; then
-            # Minimal mock or non-reporting unit: systemctl stop succeeded cleanly.
-            return 0
-        fi
-        active_state=$(printf '%s\n' "$props" | awk -F= '$1=="ActiveState"{print $2; exit}')
-        main_pid=$(printf '%s\n' "$props" | awk -F= '$1=="MainPID"{print $2; exit}')
-        if { [ -z "$active_state" ] || [ "$active_state" = "inactive" ] || [ "$active_state" = "failed" ]; }; then
-            if [ -z "$main_pid" ] || [ "$main_pid" = "0" ] || ! kill -0 "$main_pid" 2>/dev/null; then
+        if props=$(as_root systemctl show --all -p LoadState -p ActiveState -p MainPID -p ControlPID "$SERVICE_NAME" 2>/dev/null) \
+            && grep -qx 'MainPID=0' <<< "$props" \
+            && grep -qx 'ControlPID=0' <<< "$props"; then
+            if grep -qx 'ActiveState=inactive' <<< "$props" && grep -Eqx 'LoadState=(loaded|not-found|masked)' <<< "$props"; then
+                return 0
+            fi
+            if grep -qx 'ActiveState=failed' <<< "$props" && grep -qx 'LoadState=loaded' <<< "$props"; then
                 return 0
             fi
         fi
-        sleep 1
         i=$((i + 1))
+        [ "$i" -ge "$timeout" ] || sleep 1
     done
     return 1
 }
 
 rollback_update_transaction() {
     local rollback_ok=0
-    if is_systemd; then
+    if [ "$UPDATE_SERVICE_MAY_BE_RUNNING" = "1" ]; then
         if ! stop_service_and_wait 30; then
             warn "无法确认服务 ${SERVICE_NAME} 已停止；为防止破坏数据库，已中止自动还原数据目录，请手动停止服务后使用备份恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             return 1
         fi
+        UPDATE_SERVICE_MAY_BE_RUNNING=0
     fi
     if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
         if restore_previous_binary; then
             UPDATE_BINARY_CHANGED=0
         else
-            warn "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
+            warn "无法恢复上一版本二进制，请检查 ${PREVIOUS_BIN} 并使用备份恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             rollback_ok=1
         fi
     fi
-    if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
-        && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
-        if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-            warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+    if [ "$UPDATE_DATA_CHANGED" = "1" ] && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
+        if [ -z "$UPDATE_SNAPSHOT_DIR" ] || ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
+            warn "数据快照恢复失败，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             rollback_ok=1
         fi
     fi
@@ -1368,16 +1394,20 @@ rollback_update_transaction() {
 }
 
 cleanup_update_transaction() {
-    local exit_code=$?
+    local exit_code=$? keep_tmp=0
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
         warn "更新中断，正在自动回滚并恢复更新前的二进制和数据状态..."
-        if rollback_update_transaction; then
-            if is_systemd; then
-                if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
-                    as_root systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-                else
-                    as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if rollback_update_transaction || rollback_update_transaction; then
+            if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
+                if ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
+                    warn "回滚文件已恢复，但旧版本服务未通过健康检查，请检查 ${SERVICE_NAME} 日志"
                 fi
+            fi
+        else
+            warn "自动回滚未完全成功，请检查日志并使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+            if [ -n "$UPDATE_SNAPSHOT_DIR" ]; then
+                keep_tmp=1
+                warn "已保留可用于手动恢复的升级暂存目录: $UPDATE_TMP_DIR"
             fi
         fi
         UPDATE_TRANSACTION=0
@@ -1385,7 +1415,7 @@ cleanup_update_transaction() {
     fi
     UPDATE_SERVICE_CHANGED=0
     UPDATE_SERVICE_SNAPSHOT=""
-    if [ -n "$UPDATE_TMP_DIR" ] && [ -d "$UPDATE_TMP_DIR" ] && [ "$UPDATE_TMP_DIR" != "/" ]; then
+    if [ "$keep_tmp" = "0" ] && [ -n "$UPDATE_TMP_DIR" ] && [ -d "$UPDATE_TMP_DIR" ] && [ "$UPDATE_TMP_DIR" != "/" ]; then
         if ! as_root rm -rf -- "$UPDATE_TMP_DIR"; then
             warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $UPDATE_TMP_DIR"
         fi
@@ -1416,22 +1446,30 @@ detect_package_manager() {
 
 install_cli_packages() {
     local manager="$1"
+    local packages=(curl ca-certificates coreutils gawk grep sed tar)
+    if [ "${2:-}" = update ]; then
+        if [ "$manager" = apk ]; then
+            packages+=(cmd:flock)
+        else
+            packages+=(util-linux)
+        fi
+    fi
     case "$manager" in
         apt)
-            as_root apt-get update
-            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates coreutils gawk grep sed tar
+            as_root apt-get update || return 1
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
             ;;
         dnf)
-            as_root dnf install -y curl ca-certificates coreutils gawk grep sed tar
+            as_root dnf install -y "${packages[@]}"
             ;;
         yum)
-            as_root yum install -y curl ca-certificates coreutils gawk grep sed tar
+            as_root yum install -y "${packages[@]}"
             ;;
         apk)
-            as_root apk add --no-cache bash curl ca-certificates coreutils gawk grep sed tar
+            as_root apk add --no-cache bash "${packages[@]}"
             ;;
         pacman)
-            as_root pacman -S --noconfirm --needed bash curl ca-certificates coreutils gawk grep sed tar
+            as_root pacman -S --noconfirm --needed bash "${packages[@]}"
             ;;
         *) return 1 ;;
     esac
@@ -1441,8 +1479,11 @@ ensure_cli_dependencies() {
     local action="${1:-install}" manager command_name
     local required=(curl awk grep cmp install mktemp sed tr)
     local missing=()
-    if [ "$action" = update ] || [ "$action" = password ]; then
+    if [ "$action" = update ] || [ "$action" = tls ] || [ "$action" = password ]; then
         required+=(tar)
+    fi
+    if [ "$action" = update ] && [ "$(uname -s)" = Linux ]; then
+        required+=(flock)
     fi
     for command_name in "${required[@]}"; do
         command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
@@ -1454,7 +1495,7 @@ ensure_cli_dependencies() {
     manager=$(detect_package_manager) \
         || fail "缺少必要命令 ${missing[*]}，且未找到受支持的包管理器"
     info "正在使用 ${manager} 补齐安装依赖: ${missing[*]}"
-    install_cli_packages "$manager" \
+    install_cli_packages "$manager" "$action" \
         || fail "自动安装基础依赖失败"
     for command_name in "${required[@]}"; do
         need_cmd "$command_name"
@@ -2439,7 +2480,7 @@ print_panel_address() {
 do_tls() (
     local domain wildcard email token port tmp_dir snapshot active=0 transaction=0 snapshot_ready=0 managed_proxy=0
     init_privilege
-    ensure_cli_dependencies update
+    ensure_cli_dependencies tls
     validate_install_dir; validate_data_dir; validate_backup_dir
     is_systemd || fail "自动配置泛域名证书需要 systemd"
     need_cmd systemd-run
@@ -2690,17 +2731,22 @@ do_install() {
     print_setup_token_notice || return 1
 }
 
-do_update() {
-    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
+do_update() (
+    local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version tmp_dir snapshot_dir
     INITIAL_SETUP_TOKEN=""
     SETUP_TOKEN_ORIGIN=""
+    LAST_BACKUP_PATH=""
     validate_install_dir
     validate_data_dir
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
-    [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
     init_privilege
     ensure_cli_dependencies update
+    trap cleanup_update_transaction EXIT
+    trap abort_update_transaction INT TERM
+    acquire_update_lock
+
+    [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
     is_systemd && [ ! -f "$SERVICE_FILE" ] \
         && fail "找不到 Meridian systemd 服务，请重新运行 install 修复安装"
     as_root test -L "$(env_file_path)" \
@@ -2708,40 +2754,35 @@ do_update() {
     validate_existing_secret_configuration || return 1
     validate_panel_endpoint_consistency \
         || fail "面板端点配置不一致；为避免更新后出现 502，请先修复面板监听端口"
-    migrate_managed_nginx_redaction \
-        || fail "Nginx URI 脱敏日志迁移失败；原配置已恢复"
-    current_version=$(get_current_version)
-    latest_version=$(resolve_latest_version)
+    current_version=$(get_current_version) || fail "无法读取已安装版本"
+    latest_version=$(resolve_latest_version) || fail "无法确定可更新的正式版本"
     if [ -n "${MERIDIAN_EXPECTED_UPDATE_VERSION:-}" ] && [ "$latest_version" != "$MERIDIAN_EXPECTED_UPDATE_VERSION" ]; then
         fail "最新版本已发生变化，请重新检查更新后再试"
     fi
+    if valid_version "$current_version" && version_gt "$current_version" "$latest_version"; then
+        fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
+    fi
+    migrate_managed_nginx_redaction \
+        || fail "Nginx URI 脱敏日志迁移失败；原配置已恢复"
     if [ "$current_version" = "$latest_version" ]; then
         setup_panel_updater || warn "更新服务安装失败，可稍后重新运行 update -y"
         ok "当前已是最新版本: $latest_version"
         return 0
     fi
-    if valid_version "$current_version" && version_gt "$current_version" "$latest_version"; then
-        fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
-    fi
-
-    acquire_update_lock
-    trap cleanup_update_transaction EXIT
-    trap abort_update_transaction INT TERM
-
-    tmp_dir=$(mktemp -d)
-    chmod 0700 "$tmp_dir"
+    tmp_dir=$(mktemp -d) || fail "无法创建升级暂存目录"
     UPDATE_TMP_DIR="$tmp_dir"
-    download_release_binary "$latest_version" "$tmp_dir"
+    chmod 0700 "$tmp_dir" || fail "无法保护升级暂存目录: $tmp_dir"
+    download_release_binary "$latest_version" "$tmp_dir" || fail "下载或验证升级程序失败"
 
     UPDATE_TRANSACTION=1
 
     if is_systemd; then
         if service_is_active; then
             UPDATE_WAS_ACTIVE=1
-        else
-            should_stop_after=1
         fi
+        UPDATE_SERVICE_MAY_BE_RUNNING=1
         stop_service_and_wait 30 || fail "无法确认旧版本服务已停止，已中止更新"
+        UPDATE_SERVICE_MAY_BE_RUNNING=0
     else
         ensure_no_manual_process
     fi
@@ -2752,66 +2793,49 @@ do_update() {
 
     # Byte-level snapshot for automatic rollback, taken while the service is
     # stopped and before any configuration key is added.
-    UPDATE_SNAPSHOT_DIR="${tmp_dir}/data-snapshot"
-    if ! snapshot_data_dir "$UPDATE_SNAPSHOT_DIR"; then
-        fail "升级前数据快照失败，现有程序未被替换"
+    snapshot_dir="${tmp_dir}/data-snapshot"
+    if ! snapshot_data_dir "$snapshot_dir" || ! verify_update_snapshot "$snapshot_dir"; then
+        fail "升级前数据快照复制或校验失败，现有数据和程序未被替换"
     fi
+    UPDATE_SNAPSHOT_DIR="$snapshot_dir"
 
-    prepare_data_and_config "$tmp_dir" || return 1
+    UPDATE_DATA_CHANGED=1
+    prepare_data_and_config "$tmp_dir" || fail "无法准备升级配置"
     if is_systemd; then
-        migrate_update_systemd_service "$tmp_dir" || return 1
+        migrate_update_systemd_service "$tmp_dir" || fail "无法迁移 systemd 服务配置"
     fi
 
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
-    as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
-    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
-    as_root mv -f "${current_binary}.new" "$current_binary"
+    if ! as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new" \
+        || ! as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"; then
+        fail "无法保留上一版本二进制"
+    fi
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new" \
+        || fail "无法暂存新版本二进制"
     UPDATE_BINARY_CHANGED=1
+    as_root mv -f "${current_binary}.new" "$current_binary" || fail "无法替换当前二进制"
 
     if is_systemd; then
-        as_root systemctl restart "$SERVICE_NAME"
-        if ! wait_for_health 20; then
-            warn "新版本健康检查失败，正在自动回滚..."
-            if ! rollback_update_transaction; then
-                fail "自动回滚未完全成功，请检查日志或使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
-            fi
-            if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
-                as_root systemctl restart "$SERVICE_NAME"
-                wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
-            fi
-            UPDATE_TRANSACTION=0
-            fail "新版本启动失败，已恢复上一版本及原数据配置"
+        UPDATE_SERVICE_MAY_BE_RUNNING=1
+        if ! as_root systemctl restart "$SERVICE_NAME" || ! wait_for_health 20; then
+            fail "新版本启动或健康检查失败，将尝试自动回滚"
         fi
-        if [ "$should_stop_after" = "1" ]; then
-            stop_service_and_wait 30 || warn "更新完成但未能停止服务 ${SERVICE_NAME}"
+        if [ "$UPDATE_WAS_ACTIVE" = "0" ]; then
+            stop_service_and_wait 30 || fail "无法恢复服务 ${SERVICE_NAME} 更新前的停止状态"
+            UPDATE_SERVICE_MAY_BE_RUNNING=0
         fi
     else
         if ! "$current_binary" --version >/dev/null 2>&1; then
-            warn "新版本二进制无法执行，正在自动回滚..."
-            rollback_update_transaction || true
-            UPDATE_TRANSACTION=0
-            fail "新版本无法执行，已恢复上一版本及原数据配置"
+            fail "新版本二进制无法执行，将尝试自动回滚"
         fi
         warn "未检测到 systemd：已跳过自动健康检查，请手动加载 ${DATA_DIR}/.env 后启动"
     fi
 
     UPDATE_TRANSACTION=0
-    UPDATE_BINARY_CHANGED=0
-    UPDATE_SERVICE_CHANGED=0
-    UPDATE_SERVICE_SNAPSHOT=""
-    UPDATE_TMP_DIR=""
-    UPDATE_SNAPSHOT_DIR=""
-    UPDATE_SNAPSHOT_RESTORED=0
-    if ! as_root rm -rf -- "$tmp_dir"; then
-        warn "无法清理更新临时目录（可能残留敏感快照），请手动删除: $tmp_dir"
-    fi
-    release_update_lock
-    trap - EXIT INT TERM
     setup_panel_updater || warn "版本已更新，但更新服务安装失败，可稍后重新运行 update -y"
     ok "已更新到最新版本: $latest_version"
     info "现有 .env、面板域名和证书均已保留；安装器管理的 Nginx 配置已按需完成 URI 日志脱敏迁移"
     [ -n "${MERIDIAN_EXPECTED_UPDATE_VERSION:-}" ] || print_setup_token_notice || return 1
-}
+)
 
 password_byte_length() {
     LC_ALL=C printf '%s' "$1" | wc -c | tr -d '[:space:]'

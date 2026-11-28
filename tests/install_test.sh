@@ -31,6 +31,8 @@ export MERIDIAN_ASSUME_YES=1
 # The path is computed so this test works from an arbitrary checkout.
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/install.sh"
+update_lock_directory() { printf '%s\n' "${TEST_ROOT}/locks"; }
+mock_stopped_systemd_unit() { printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n'; }
 # Domain workflow fixtures do not contact public DNS; the entry probe and its
 # failure modes are exercised by install_tls_test.sh.
 check_panel_https_entry() { return 0; }
@@ -662,8 +664,8 @@ exit 0
 MOCKCOSIGN
 chmod 0755 "$MOCK_COSIGN_BIN"
 COSIGN_BIN="$MOCK_COSIGN_BIN"
-export MERIDIAN_UPDATE_LOCK_DIR="${TEST_ROOT}/locks"
-mkdir -p "$MERIDIAN_UPDATE_LOCK_DIR"
+# Any snapshot retained for recovery must stay within the disposable test directory.
+export TMPDIR="$TEST_ROOT"
 get_latest_version() { printf '%s\n' "$MOCK_LATEST"; }
 detect_platform() { printf 'linux-amd64\n'; }
 download() {
@@ -989,6 +991,7 @@ if (
     service_is_active() { return 0; }
     systemctl() {
         case "$*" in
+            show*) mock_stopped_systemd_unit ;;
             *restart*) "${INSTALL_DIR}/${BIN_NAME}" >/dev/null 2>&1 || true ;; # run the new binary like systemd would
         esac
         return 0
@@ -1244,6 +1247,8 @@ mkdir -p "$update_tmp_gate" "${TEST_ROOT}/snapshot-gate"
     UPDATE_TRANSACTION=1
     UPDATE_BINARY_CHANGED=0
     UPDATE_SNAPSHOT_DIR="${TEST_ROOT}/snapshot-gate"
+    # shellcheck disable=SC2034
+    UPDATE_DATA_CHANGED=1
     UPDATE_SNAPSHOT_RESTORED=1
     UPDATE_WAS_ACTIVE=0
     false
@@ -1281,6 +1286,8 @@ mkdir -p "$update_tmp_retry" "${TEST_ROOT}/snapshot-retry"
     UPDATE_BINARY_CHANGED=0
     # shellcheck disable=SC2034
     UPDATE_SNAPSHOT_DIR="${TEST_ROOT}/snapshot-retry"
+    # shellcheck disable=SC2034
+    UPDATE_DATA_CHANGED=1
     # shellcheck disable=SC2034
     UPDATE_SNAPSHOT_RESTORED=0
     # shellcheck disable=SC2034
@@ -1326,7 +1333,12 @@ if (
     }
     is_systemd() { return 0; }
     service_is_active() { return 0; }
-    systemctl() { return 0; }
+    systemctl() {
+        case "$1" in
+            show) mock_stopped_systemd_unit ;;
+        esac
+        return 0
+    }
     wait_for_health() { return 1; }
     restore_data_snapshot() {
         local n
@@ -1570,19 +1582,29 @@ BADCOSIGN
 (
     order_dir=$(mktemp -d "${TEST_ROOT}/v180-rollback-order.XXXXXX")
     order_log="${order_dir}/order.log"
-    export MERIDIAN_UPDATE_LOCK_DIR="${order_dir}/locks"
-    mkdir -p "$MERIDIAN_UPDATE_LOCK_DIR" "${order_dir}/snap/data" "${order_dir}/data"
+    update_lock_directory() { printf '%s\n' "${order_dir}/locks"; }
+    mkdir -p "${order_dir}/snap/data" "${order_dir}/data"
     DATA_DIR="${order_dir}/data"
     UPDATE_SNAPSHOT_DIR="${order_dir}/snap"
     UPDATE_SNAPSHOT_RESTORED=0
+    # shellcheck disable=SC2034
+    UPDATE_DATA_CHANGED=1
+    # shellcheck disable=SC2034
+    UPDATE_SERVICE_MAY_BE_RUNNING=1
     UPDATE_BINARY_CHANGED=0
     UPDATE_SERVICE_CHANGED=0
-    as_root() { "$@"; }
+    as_root() {
+        if [ "$1" = systemctl ]; then
+            systemctl "${@:2}"
+        else
+            run_as_test_root "$@"
+        fi
+    }
     is_systemd() { return 0; }
     systemctl() {
         case "$*" in
             *stop*) printf 'stop\n' >> "$order_log"; return 0 ;;
-            *show*) printf 'ActiveState=inactive\nMainPID=0\n'; return 0 ;;
+            *show*) mock_stopped_systemd_unit; return 0 ;;
         esac
         return 0
     }
@@ -1598,6 +1620,8 @@ BADCOSIGN
     # If stop fails, data snapshot MUST NOT be restored.
     : > "$order_log"
     UPDATE_SNAPSHOT_RESTORED=0
+    # shellcheck disable=SC2034
+    UPDATE_SERVICE_MAY_BE_RUNNING=1
     systemctl() {
         case "$*" in
             *stop*) printf 'stop_fail\n' >> "$order_log"; return 1 ;;
@@ -1609,6 +1633,26 @@ BADCOSIGN
         exit 1
     fi
     assert_eq 'stop_fail' "$(cat "$order_log")" 'data restore must be skipped when stop fails'
+
+    systemctl() {
+        case "$1:$stop_case" in
+            stop:missing) return 5 ;;
+            stop:*) return 0 ;;
+            show:failed) mock_stopped_systemd_unit; return 1 ;;
+            show:incomplete) printf 'ActiveState=inactive\nMainPID=0\n' ;;
+            show:main-pid) printf 'LoadState=loaded\nActiveState=failed\nMainPID=1024\nControlPID=0\n' ;;
+            show:control-pid) printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=1024\n' ;;
+            show:missing) printf 'LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlPID=0\n' ;;
+        esac
+    }
+    for stop_case in empty failed incomplete main-pid control-pid; do
+        if stop_service_and_wait 1; then
+            printf 'FAIL: did not require positive stop confirmation in case %s\n' "$stop_case" >&2
+            exit 1
+        fi
+    done
+    stop_case=missing
+    stop_service_and_wait 1 || { echo 'FAIL: positively confirmed unloaded service was rejected' >&2; exit 1; }
 
     # Lock file must reside outside DATA_DIR and block concurrent acquire_update_lock.
     lock_path=$(resolve_update_lock_file)
@@ -1624,7 +1668,76 @@ BADCOSIGN
         echo 'FAIL: concurrent update lock acquisition was unexpectedly allowed' >&2
         exit 1
     fi
+    if [ "$(uname -s)" = Linux ]; then
+        if run_as_test_root flock -n "$lock_path" true; then
+            echo 'FAIL: an elevated updater acquired the CLI lock' >&2
+            exit 1
+        fi
+        assert_eq '644' "$(stat -c '%a' "$lock_path")" 'CLI can only open root-managed lock read-only'
+        assert_eq '0' "$(stat -c '%u' "$lock_path")" 'instance lock owner'
+    fi
+    # Holding the lock blocks the CLI before it inspects the installed version
+    # or touches managed Nginx, including when there might be no update to do.
+    get_current_version() { printf 'version\n' >> "$order_log"; }
+    migrate_managed_nginx_redaction() { printf 'nginx\n' >> "$order_log"; }
+    : > "$order_log"
+    if do_update > "${order_dir}/contended.log" 2>&1; then
+        echo 'FAIL: concurrent update unexpectedly succeeded' >&2
+        exit 1
+    fi
+    assert_contains "${order_dir}/contended.log" '当前实例已有更新正在进行中'
+    assert_eq '' "$(cat "$order_log")" 'version and config are accessed after taking the lock'
     release_update_lock
+)
+
+(
+    test_dir=$(mktemp -d "${TEST_ROOT}/update-snapshot-integrity.XXXXXX")
+    DATA_DIR="${test_dir}/data"
+    INSTALL_DIR="${test_dir}/bin"
+    PREVIOUS_BIN="${INSTALL_DIR}/${BIN_NAME}.previous"
+    BACKUP_DIR="${test_dir}/backup"
+    mkdir -p "$DATA_DIR" "$INSTALL_DIR"
+    cp "${TEST_ROOT}/release-binary" "${INSTALL_DIR}/${BIN_NAME}"
+    printf 'DB_PATH=%s/meridian.db\n' "$DATA_DIR" > "${DATA_DIR}/.env"
+    printf 'complete-db-before-update\n' > "${DATA_DIR}/meridian.db"
+    printf 'live-tls-state\n' > "${DATA_DIR}/tls-marker"
+
+    is_systemd() { return 1; }
+    ensure_no_manual_process() { return 0; }
+    validate_existing_secret_configuration() { return 0; }
+    validate_panel_endpoint_consistency() { return 0; }
+    migrate_managed_nginx_redaction() { return 0; }
+    get_current_version() { printf '%s\n' 'v9.9.11'; }
+    download_release_binary() { return 0; }
+    MOCK_LATEST='v9.9.12'
+    prepare_data_and_config() { printf 'prepare data\n' >> "${test_dir}/changed"; }
+    restore_update_snapshot() { printf 'restore partial data\n' >> "${test_dir}/changed"; }
+    snapshot_data_dir() {
+        mkdir -p "$1/data"
+        cp "${DATA_DIR}/.env" "$1/data/.env"
+        printf 'truncated\n' > "$1/data/meridian.db"
+        [ "$snapshot_case" = 'corruption' ]
+    }
+    for snapshot_case in copy-failure corruption; do
+        if do_update > "${test_dir}/${snapshot_case}.log" 2>&1; then
+            printf 'FAIL: accepted non-usable snapshot in case %s\n' "$snapshot_case" >&2
+            exit 1
+        fi
+        assert_contains "${test_dir}/${snapshot_case}.log" '升级前数据快照复制或校验失败'
+        [ ! -e "${test_dir}/changed" ] || { echo 'FAIL: invalid snapshot triggered data changes' >&2; exit 1; }
+        assert_eq 'complete-db-before-update' "$(cat "${DATA_DIR}/meridian.db")" 'partial snapshot preserved live DB'
+        assert_eq 'live-tls-state' "$(cat "${DATA_DIR}/tls-marker")" 'partial snapshot preserved live TLS state'
+    done
+
+    as_root() {
+        if [ "$1" = mv ]; then return 1; fi
+        run_as_test_root "$@"
+    }
+    if create_backup_archive pre-failing-rename; then
+        echo 'FAIL: backup was reported successful after archive rename failed' >&2
+        exit 1
+    fi
+    assert_eq '' "$(run_as_test_root find "$BACKUP_DIR" -name '*.tmp.*')" 'failed backup temporary archive cleanup'
 )
 
 echo 'installer tests passed'

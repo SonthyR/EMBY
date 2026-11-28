@@ -121,6 +121,24 @@ func (t *edgeEgressTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if !ok {
 		return t.base.RoundTrip(req)
 	}
+	return t.roundTripToEdge(req, target, nil, false)
+}
+
+// edgeManifestTransport owns a fixed, authenticated egress for the full
+// manifest redirect chain, even when dynamic requests isolate their context.
+type edgeManifestTransport struct {
+	egress *edgeEgressTransport
+	target edgeEgressTarget
+	guard  *edgeDynamicGuardPolicy
+}
+
+func (t *edgeManifestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.egress.roundTripToEdge(req, t.target, t.guard, true)
+}
+
+func (*edgeManifestTransport) CloseIdleConnections() {}
+
+func (t *edgeEgressTransport) roundTripToEdge(req *http.Request, target edgeEgressTarget, guard *edgeDynamicGuardPolicy, requireMarker bool) (*http.Response, error) {
 	egressEndpoint := strings.TrimRight(target.PublicURL, "/") + edgeEgressPath
 	egressURL, err := url.Parse(egressEndpoint)
 	if err != nil || (egressURL.Scheme != "http" && egressURL.Scheme != "https") || egressURL.Host == "" {
@@ -134,6 +152,7 @@ func (t *edgeEgressTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		NodeID:    target.NodeID,
 		TargetURL: req.URL.String(),
 		Host:      hostHeader,
+		DynamicGuard: guard,
 		ExpiresAt: time.Now().Add(edgeEgressTicketTTL).Unix(),
 	}
 	sealed, err := sealEdgeEgressTicket(target.Token, ticket)
@@ -150,12 +169,15 @@ func (t *edgeEgressTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if err != nil {
 		return nil, err
 	}
-	if resp.Header.Get(edgeEgressMarkerHeader) != "1" && resp.StatusCode == http.StatusNotFound {
+	missingMarker := resp.Header.Get(edgeEgressMarkerHeader) != "1" && (requireMarker || resp.StatusCode == http.StatusNotFound)
+	guardUnsupported := guard != nil && resp.Header.Get(edgeAgentDynamicGuardHeader) != edgeAgentDynamicGuardVersion
+	if missingMarker || guardUnsupported {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		return nil, errEdgeAgentEgressUnsupported
 	}
 	resp.Header.Del(edgeEgressMarkerHeader)
+	resp.Header.Del(edgeAgentDynamicGuardHeader)
 	resp.Request = req
 	return resp, nil
 }

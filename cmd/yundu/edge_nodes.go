@@ -41,6 +41,7 @@ const (
 	edgeEgressTicketHeader          = "X-Yundu-Egress-Ticket"
 	edgeEgressMarkerHeader          = "X-Yundu-Egress"
 	edgeAgentDynamicGuardHeader     = "X-Yundu-Dynamic-Guard"
+	edgeAgentDynamicGuardVersion    = "2"
 	edgeMasterTrafficBatchAckHeader = "X-Yundu-Traffic-Batch-Ack"
 	edgeTrafficBatchMaxMemory       = 512
 	edgeEgressTicketTTL             = 2 * time.Minute
@@ -263,6 +264,7 @@ type edgeEgressTicket struct {
 	NodeID    int64  `json:"n"`
 	TargetURL string `json:"t"`
 	Host      string `json:"h,omitempty"`
+	DynamicGuard *edgeDynamicGuardPolicy `json:"dg,omitempty"`
 	ExpiresAt int64  `json:"exp"`
 }
 
@@ -271,6 +273,9 @@ func sealEdgeEgressTicket(token string, ticket edgeEgressTicket) (string, error)
 		return "", errors.New("edge node token unavailable")
 	}
 	ticket.Version = 1
+	if ticket.DynamicGuard != nil {
+		ticket.Version = 2
+	}
 	plain, err := json.Marshal(ticket)
 	if err != nil {
 		return "", err
@@ -322,7 +327,7 @@ func openEdgeEgressTicket(token, encoded string) (edgeEgressTicket, error) {
 	if err := json.Unmarshal(plain, &ticket); err != nil {
 		return ticket, errors.New("corrupt egress ticket")
 	}
-	if ticket.Version != 1 || ticket.TargetURL == "" {
+	if !validEdgeTicketVersion(ticket.Version, ticket.DynamicGuard) || ticket.TargetURL == "" {
 		return ticket, errors.New("unsupported egress ticket")
 	}
 	if ticket.ExpiresAt > 0 && time.Now().Unix() > ticket.ExpiresAt {
@@ -339,6 +344,13 @@ type edgeDynamicGuardPolicy struct {
 	AllowRedirects      bool                `json:"ar,omitempty"`
 	MaxRedirects        int                 `json:"mr,omitempty"`
 	DeniedHosts         []string            `json:"dh,omitempty"`
+}
+
+// Older agents reject version 2 before interpreting the ticket's target.
+// Reject legacy envelopes containing a guard as well so rolling upgrades
+// cannot continue to rely on tickets a downgraded agent would accept.
+func validEdgeTicketVersion(version int, guard *edgeDynamicGuardPolicy) bool {
+	return version == 1 && guard == nil || version == 2 && guard != nil
 }
 
 type edgePlaybackTicket struct {
@@ -362,6 +374,9 @@ func sealEdgePlaybackTicket(token string, ticket edgePlaybackTicket) (string, er
 		return "", errors.New("edge node token unavailable")
 	}
 	ticket.Version = 1
+	if ticket.DynamicGuard != nil {
+		ticket.Version = 2
+	}
 	plain, err := json.Marshal(ticket)
 	if err != nil {
 		return "", err
@@ -413,7 +428,7 @@ func openEdgePlaybackTicket(token, encoded string) (edgePlaybackTicket, error) {
 	if err := json.Unmarshal(plain, &ticket); err != nil {
 		return ticket, errors.New("corrupt playback ticket")
 	}
-	if ticket.Version != 1 || ticket.TargetURL == "" {
+	if !validEdgeTicketVersion(ticket.Version, ticket.DynamicGuard) || ticket.TargetURL == "" {
 		return ticket, errors.New("unsupported playback ticket")
 	}
 	if ticket.ExpiresAt > 0 && time.Now().Unix() > ticket.ExpiresAt {
@@ -3229,7 +3244,7 @@ func (a *App) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		node.supportsSpeedtest = true
 	}
 	node.supportsDirectPopup = req.SupportsDirectPopup || strings.TrimSpace(r.Header.Get("X-Yundu-Direct-Popup")) == "1"
-	node.supportsDynamicGuard = strings.TrimSpace(r.Header.Get(edgeAgentDynamicGuardHeader)) == "1"
+	node.supportsDynamicGuard = strings.TrimSpace(r.Header.Get(edgeAgentDynamicGuardHeader)) == edgeAgentDynamicGuardVersion
 	if strings.TrimSpace(r.Header.Get("X-Yundu-Egress-Capable")) == "1" || agentVersionSupportsEgress(req.Version) {
 		node.supportsEgress = true
 	}

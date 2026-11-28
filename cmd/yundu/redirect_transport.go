@@ -20,6 +20,9 @@ func dynamicTransportFailureReason(err error) string {
 	if errors.Is(err, errDynamicRedirectTimeout) {
 		return dynamicObservationReasonRedirectTimeout
 	}
+	if errors.Is(err, errEdgeFullNodeUnavailable) || errors.Is(err, errEdgeAgentEgressUnsupported) {
+		return dynamicObservationReasonRuntimeUnavailable
+	}
 	var certificateVerification *tls.CertificateVerificationError
 	var recordHeader tls.RecordHeaderError
 	var unknownAuthority x509.UnknownAuthorityError
@@ -128,6 +131,11 @@ func newMainVideoDirectFallbackResponse(req *http.Request, target *url.URL) *htt
 
 type dynamicTransportFactory func(*url.URL, []net.IP, *dynamicSelfTargetPolicy) (*http.Transport, error)
 
+type dynamicRedirectTransport interface {
+	http.RoundTripper
+	CloseIdleConnections()
+}
+
 type redirectFollowTransport struct {
 	base                   http.RoundTripper
 	playbackHosts          map[string]bool
@@ -142,6 +150,7 @@ type redirectFollowTransport struct {
 	clientIPMode            string
 	upstreamHeaderPolicy    upstreamHeaderPolicy
 	dynamicTransportFactory dynamicTransportFactory
+	boundManifestTransportFactory func(*dynamicSelfTargetPolicy) (*edgeManifestTransport, error)
 	dynamicPolicy           dynamicRedirectPolicy
 	dynamicState            *dynamicSiteState
 	capabilityIssuer        *dynamicCapabilityIssuer
@@ -164,7 +173,10 @@ func shouldInternallyFollowDynamicRedirect(r *http.Request) bool {
 		isReservedDynamicRoute(path)
 }
 
-func (t *redirectFollowTransport) newDynamicTransport(target *url.URL, pinnedIPs []net.IP, selfTargets *dynamicSelfTargetPolicy) (*http.Transport, error) {
+func (t *redirectFollowTransport) newDynamicTransport(target *url.URL, pinnedIPs []net.IP, selfTargets *dynamicSelfTargetPolicy) (dynamicRedirectTransport, error) {
+	if t.boundManifestTransportFactory != nil {
+		return t.boundManifestTransportFactory(selfTargets)
+	}
 	if t.dynamicTransportFactory != nil {
 		return t.dynamicTransportFactory(target, pinnedIPs, selfTargets)
 	}
@@ -555,7 +567,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 		}
 		return true
 	}
-	var currentTransport *http.Transport
+	var currentTransport dynamicRedirectTransport
 	var streamRelease func()
 	streamLeaseHeld := t.streamLeaseHeld
 	selfTargetRetried := false
@@ -820,7 +832,7 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			t.observe(dynamicObservationDecisionAllowed, dynamicObservationReasonRedirectAllowed, authority)
 			return replaceResponseWithMainVideoRedirect(resp, normalized), nil
 		}
-		if t.followUnknownRedirects && shouldInternallyFollowDynamicRedirect(req) {
+		if t.followUnknownRedirects && (t.boundManifestTransportFactory != nil || shouldInternallyFollowDynamicRedirect(req)) {
 			if reasonCode := t.dynamicPolicy.validateTarget(req.URL, normalized, selfTargets); reasonCode != "" {
 				if retried, retryErr := retrySelfTargetWithUpstreamHeaders(reasonCode, normalized); retried {
 					if retryErr != nil {
@@ -842,6 +854,9 @@ func (t *redirectFollowTransport) roundTripDynamic(req *http.Request, resp *http
 			transport, err := t.newDynamicTransport(normalized, pinnedIPs, selfTargets)
 			if err != nil {
 				reservation.rollback()
+				if errors.Is(err, errEdgeFullNodeUnavailable) {
+					return fail(dynamicObservationReasonRuntimeUnavailable, authority)
+				}
 				if errors.Is(err, errDynamicSelfTarget) {
 					return fail(dynamicObservationReasonSelfTarget, authority)
 				}

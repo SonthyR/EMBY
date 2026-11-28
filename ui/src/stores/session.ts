@@ -9,7 +9,7 @@ export const session = reactive({
   role: 'admin' as Role,
   username: '',
   ephemeralSecret: false,
-  appVersion: 'v1.8.0',
+  appVersion: 'v1.8.1',
 })
 
 export async function checkSession() {
